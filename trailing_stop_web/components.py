@@ -147,14 +147,23 @@ def tab_navigation() -> rx.Component:
 def position_row(row: list) -> rx.Component:
     """Single position row from computed var."""
     con_id = row[0].to(int)
+    con_id_str = row[0]
     pnl_color = row[15]
     is_selected = row[16] == "true"
+    qty_usage = row[17]           # e.g., "2/3"
+    is_fully_used = row[18] == "true"
+    selected_qty = row[19]        # Selected qty for this group
+
+    # Row styling based on fully_used status
+    row_opacity = rx.cond(is_fully_used, "0.5", "1.0")
+    row_bg = rx.cond(is_fully_used, COLORS["bg_elevated"], "transparent")
 
     return rx.table.row(
         rx.table.cell(
             rx.checkbox(
                 checked=is_selected,
                 on_change=AppState.toggle_position(con_id),
+                disabled=is_fully_used,
             )
         ),
         rx.table.cell(row[1]),   # symbol
@@ -162,6 +171,26 @@ def position_row(row: list) -> rx.Component:
         rx.table.cell(row[3]),   # expiry
         rx.table.cell(row[4]),   # strike_str
         rx.table.cell(row[5]),   # quantity_str
+        rx.table.cell(
+            rx.text(
+                qty_usage,
+                color=rx.cond(is_fully_used, COLORS["error"], COLORS["success"]),
+                font_weight=rx.cond(is_fully_used, "bold", "normal"),
+            )
+        ),  # usage (e.g., "2/3")
+        # Selected Qty dropdown - shows available quantities (0 to available)
+        rx.table.cell(
+            rx.cond(
+                is_fully_used,
+                rx.text("-", color=COLORS["text_muted"]),
+                rx.select(
+                    row[21].split(","),  # qty_options as comma-separated string -> list
+                    value=selected_qty,
+                    on_change=AppState.set_position_quantity(con_id_str),
+                    size="1",
+                ),
+            )
+        ),
         rx.table.cell(row[6]),   # fill_price
         rx.table.cell(row[7]),   # bid
         rx.table.cell(row[8]),   # mid
@@ -169,6 +198,7 @@ def position_row(row: list) -> rx.Component:
         rx.table.cell(row[10]),  # last
         rx.table.cell(row[11]),  # mark
         rx.table.cell(rx.text(row[14], color=pnl_color)),  # pnl with color
+        style={"opacity": row_opacity, "background": row_bg},
     )
 
 
@@ -195,6 +225,8 @@ def portfolio_table() -> rx.Component:
                             rx.table.column_header_cell("EXPIRY"),
                             rx.table.column_header_cell("STRIKE"),
                             rx.table.column_header_cell("QTY"),
+                            rx.table.column_header_cell("USAGE"),
+                            rx.table.column_header_cell("SEL"),
                             rx.table.column_header_cell("FILL"),
                             rx.table.column_header_cell("BID"),
                             rx.table.column_header_cell("MID"),
@@ -248,7 +280,7 @@ def create_group_panel() -> rx.Component:
                 _hover={"background": COLORS["primary_dark"]},
             ),
             rx.text(
-                f"Selected: {AppState.selected_con_ids.length()}",
+                f"Selected: {AppState.selected_quantities.length()} positions",
                 size="2",
                 color=COLORS["text_muted"],
                 font_family=TYPOGRAPHY["font_family"],
@@ -272,10 +304,11 @@ def group_config_card(group: dict) -> rx.Component:
 
     return rx.box(
         rx.vstack(
-            # Header
+            # Header with name, qty and status
             rx.hstack(
                 rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
                        font_family=TYPOGRAPHY["font_family"]),
+                rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
                 rx.badge(
                     rx.cond(is_active, "ACTIVE", "INACTIVE"),
                     color_scheme=rx.cond(is_active, "green", "gray"),
@@ -309,29 +342,64 @@ def group_config_card(group: dict) -> rx.Component:
                 border_radius="6px",
                 width="100%",
             ),
-            # Prices row
+            # Prices row - Mid, Mark, Bid/Ask and P&L
             rx.hstack(
                 rx.vstack(
-                    rx.text("Spread Bid", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["spread_bid_str"], size="2", weight="bold", color=COLORS["bid"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Spread Ask", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["spread_ask_str"], size="2", weight="bold", color=COLORS["text_primary"]),
+                    rx.text("Mid", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["mid_value_str"], size="2", weight="bold", color=COLORS["text_primary"]),
                     align="center",
                     spacing="0",
                 ),
                 rx.vstack(
                     rx.text("Mark", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["mark_value_str"], size="2", color=COLORS["text_primary"]),
+                    rx.text(group["mark_value_str"], size="2", weight="bold", color=COLORS["text_primary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Bid", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["spread_bid_str"], size="2", weight="bold", color=COLORS["bid"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Ask", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["spread_ask_str"], size="2", weight="bold", color=COLORS["text_primary"]),
                     align="center",
                     spacing="0",
                 ),
                 rx.vstack(
                     rx.text("P&L", size="1", color=COLORS["text_muted"]),
                     rx.text(group["pnl_mark_str"], size="2", weight="bold", color=group["pnl_color"]),
+                    align="center",
+                    spacing="0",
+                ),
+                spacing="4",
+                width="100%",
+            ),
+            # Greeks row
+            rx.hstack(
+                rx.vstack(
+                    rx.text("Delta", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["delta_str"], size="1", weight="bold", color=COLORS["text_secondary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Gamma", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["gamma_str"], size="1", weight="bold", color=COLORS["text_secondary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Theta", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["theta_str"], size="1", weight="bold", color=COLORS["text_secondary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Vega", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["vega_str"], size="1", weight="bold", color=COLORS["text_secondary"]),
                     align="center",
                     spacing="0",
                 ),
@@ -494,10 +562,11 @@ def compact_group_card(group: dict) -> rx.Component:
 
     return rx.box(
         rx.vstack(
-            # Header with name and status
+            # Header with name, qty and status
             rx.hstack(
                 rx.text(group["name"], weight="bold", size="2", color=COLORS["primary"],
                        font_family=TYPOGRAPHY["font_family"]),
+                rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
                 rx.badge(
                     rx.cond(is_active, "ACTIVE", "IDLE"),
                     color_scheme=rx.cond(is_active, "green", "gray"),
@@ -505,21 +574,69 @@ def compact_group_card(group: dict) -> rx.Component:
                 ),
                 width="100%",
             ),
-            # Key metrics
+            # Key metrics - Mid, Mark, Bid, Ask, P&L
             rx.hstack(
                 rx.vstack(
-                    rx.text("Value", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["mark_value_str"], size="2", weight="bold", color=COLORS["text_primary"]),
+                    rx.text("Mid", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["mid_value_str"], size="1", weight="bold", color=COLORS["text_primary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Mark", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["mark_value_str"], size="1", weight="bold", color=COLORS["text_primary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Bid", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["spread_bid_str"], size="1", weight="bold", color=COLORS["bid"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Ask", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["spread_ask_str"], size="1", weight="bold", color=COLORS["text_primary"]),
                     align="center",
                     spacing="0",
                 ),
                 rx.vstack(
                     rx.text("P&L", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["pnl_mark_str"], size="2", weight="bold", color=group["pnl_color"]),
+                    rx.text(group["pnl_mark_str"], size="1", weight="bold", color=group["pnl_color"]),
                     align="center",
                     spacing="0",
                 ),
-                spacing="4",
+                spacing="2",
+                width="100%",
+            ),
+            # Greeks row
+            rx.hstack(
+                rx.vstack(
+                    rx.text("Delta", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["delta_str"], size="1", color=COLORS["text_secondary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Gamma", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["gamma_str"], size="1", color=COLORS["text_secondary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Theta", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["theta_str"], size="1", color=COLORS["text_secondary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Vega", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["vega_str"], size="1", color=COLORS["text_secondary"]),
+                    align="center",
+                    spacing="0",
+                ),
+                spacing="2",
+                width="100%",
             ),
             # HWM and Stop
             rx.hstack(

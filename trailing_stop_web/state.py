@@ -85,7 +85,8 @@ class AppState(rx.State):
 
     # Portfolio - use list[dict] for proper Reflex serialization (not dataclass)
     positions: list[dict] = []
-    selected_con_ids: list[int] = []
+    # Selected positions with quantities: {con_id_str: quantity} - JSON uses string keys
+    selected_quantities: dict[str, int] = {}
 
     # Groups
     groups: list[dict] = []
@@ -114,15 +115,19 @@ class AppState(rx.State):
         """Computed var - returns position data as simple list of lists for table.
 
         Column order: [con_id, symbol, type, expiry, strike, qty, fill_price,
-                       bid, mid, ask, last, mark, net_cost, net_value, pnl, pnl_color, is_selected]
+                       bid, mid, ask, last, mark, net_cost, net_value, pnl, pnl_color,
+                       is_selected, qty_usage_str, is_fully_used, selected_qty]
         """
         # Access refresh_tick to force recomputation on every tick
         _ = self.refresh_tick
         rows = []
         for p in self.positions:
             pnl_val = p.get("pnl", 0)
-            # Check if position is selected (computed server-side for proper reactivity)
-            is_selected = p["con_id"] in self.selected_con_ids
+            con_id_str = str(p["con_id"])
+            # Check if position is selected and get selected quantity
+            selected_qty = self.selected_quantities.get(con_id_str, 0)
+            is_selected = selected_qty > 0
+            is_fully_used = p.get("is_fully_used", False)
             row = [
                 str(p["con_id"]),       # 0
                 p["symbol"],            # 1
@@ -141,11 +146,16 @@ class AppState(rx.State):
                 p["pnl_str"],           # 14 - PnL
                 "green" if pnl_val >= 0 else "red",  # 15 - pnl_color
                 "true" if is_selected else "false",  # 16 - is_selected (as string for frontend)
+                p.get("qty_usage_str", "0/0"),       # 17 - qty_usage_str (e.g., "2/3")
+                "true" if is_fully_used else "false",  # 18 - is_fully_used
+                str(selected_qty),      # 19 - selected_qty for this group
+                str(p.get("available_qty", 0)),  # 20 - available_qty for dropdown
+                ",".join(p.get("qty_options", ["0"])),  # 21 - qty_options as comma-separated string
             ]
             rows.append(row)
         # Log first row to verify data
         if rows:
-            logger.debug(f"UI row[0]: {rows[0][1]} fill={rows[0][6]} mark={rows[0][11]} pnl={rows[0][14]} selected={rows[0][16]}")
+            logger.debug(f"UI row[0]: {rows[0][1]} fill={rows[0][6]} mark={rows[0][11]} pnl={rows[0][14]} selected={rows[0][16]} usage={rows[0][17]}")
         return rows
 
     def on_mount(self):
@@ -193,16 +203,44 @@ class AppState(rx.State):
         self._refresh_positions()
 
     def toggle_position(self, con_id):
-        """Toggle position selection."""
-        # Ensure con_id is int (may come as string from frontend)
-        con_id = int(con_id)
-        logger.debug(f"toggle_position called with con_id={con_id}, current selected={self.selected_con_ids}")
-        if con_id in self.selected_con_ids:
-            self.selected_con_ids = [c for c in self.selected_con_ids if c != con_id]
-            logger.debug(f"Removed {con_id}, now selected={self.selected_con_ids}")
+        """Toggle position selection (selects with default qty=1 or deselects)."""
+        # Ensure con_id is string for dict key
+        con_id_str = str(con_id)
+        logger.debug(f"toggle_position called with con_id={con_id_str}, current selected={self.selected_quantities}")
+
+        new_selected = dict(self.selected_quantities)
+        if con_id_str in new_selected:
+            del new_selected[con_id_str]
+            logger.debug(f"Removed {con_id_str}, now selected={new_selected}")
         else:
-            self.selected_con_ids = self.selected_con_ids + [con_id]
-            logger.debug(f"Added {con_id}, now selected={self.selected_con_ids}")
+            # Default to 1 when toggling on, will be adjusted by set_position_quantity
+            new_selected[con_id_str] = 1
+            logger.debug(f"Added {con_id_str} with qty=1, now selected={new_selected}")
+        self.selected_quantities = new_selected
+
+    def set_position_quantity(self, con_id, qty):
+        """Set the quantity for a selected position.
+
+        Args:
+            con_id: Position contract ID (can be int or str)
+            qty: Quantity to allocate (str from input, will be converted)
+        """
+        con_id_str = str(con_id)
+        try:
+            qty_int = int(qty)
+        except (ValueError, TypeError):
+            qty_int = 0
+
+        new_selected = dict(self.selected_quantities)
+        if qty_int <= 0:
+            # Remove from selection if qty is 0 or negative
+            if con_id_str in new_selected:
+                del new_selected[con_id_str]
+        else:
+            new_selected[con_id_str] = qty_int
+
+        self.selected_quantities = new_selected
+        logger.debug(f"set_position_quantity: {con_id_str}={qty_int}, now selected={new_selected}")
 
     def set_new_group_name(self, value: str):
         self.new_group_name = value
@@ -223,10 +261,10 @@ class AppState(rx.State):
             pass
 
     def create_group(self):
-        """Create a new group from selected positions."""
-        logger.info(f"create_group called: selected={self.selected_con_ids}, positions_count={len(self.positions)}")
+        """Create a new group from selected positions with quantities."""
+        logger.info(f"create_group called: selected_quantities={self.selected_quantities}, positions_count={len(self.positions)}")
 
-        if not self.selected_con_ids:
+        if not self.selected_quantities:
             self.status_message = "No positions selected"
             return
 
@@ -234,14 +272,18 @@ class AppState(rx.State):
             self.status_message = "Enter a group name"
             return
 
-        # Calculate initial value
-        value = self._calc_group_value(self.selected_con_ids)
+        # Convert string keys to int for GroupManager (it will convert back to str for JSON)
+        position_quantities = {int(k): v for k, v in self.selected_quantities.items()}
+
+        # Calculate initial value (using con_ids list for compatibility)
+        con_ids = list(position_quantities.keys())
+        value = self._calc_group_value(con_ids)
         logger.info(f"create_group: calculated value={value}, positions still={len(self.positions)}")
 
         # Create via GroupManager (persisted to JSON)
         group = GROUP_MANAGER.create(
             name=self.new_group_name.strip(),
-            con_ids=list(self.selected_con_ids),
+            position_quantities=position_quantities,
             trail_value=self.trail_percent,  # Use state default
             trail_mode="percent",  # Default mode
             stop_type=self.stop_type,
@@ -260,7 +302,7 @@ class AppState(rx.State):
         new_history = dict(self.group_price_history)
         new_history[group.id] = []
         self.group_price_history = new_history
-        self.selected_con_ids = []
+        self.selected_quantities = {}
         self.new_group_name = ""
         self.status_message = f"Group '{group.name}' created"
         logger.info(f"create_group: DONE, final positions={len(self.positions)}")
@@ -271,8 +313,10 @@ class AppState(rx.State):
         for g in GROUP_MANAGER.get_all():
             # Calculate current value (simple)
             value = self._calc_group_value(g.con_ids)
-            # Calculate detailed metrics
-            metrics = self._calc_group_metrics(g.con_ids)
+            # Calculate detailed metrics with allocated quantities
+            metrics = self._calc_group_metrics(g.con_ids, g.position_quantities)
+            # Calculate total allocated quantity
+            total_allocated_qty = sum(g.position_quantities.values())
 
             # Format trail value display based on mode
             if g.trail_mode == "percent":
@@ -285,6 +329,8 @@ class AppState(rx.State):
                 "name": g.name,
                 "con_ids": g.con_ids,
                 "positions_str": ", ".join(str(c) for c in g.con_ids),
+                "total_qty": total_allocated_qty,
+                "total_qty_str": f"{total_allocated_qty} qty",
                 # Trailing Stop config
                 "trail_enabled": g.trail_enabled,
                 "trail_mode": g.trail_mode,
@@ -322,6 +368,15 @@ class AppState(rx.State):
                 "pnl_color": "green" if metrics["pnl_mark"] >= 0 else "red",
                 "pnl_close": metrics["pnl_close"],
                 "pnl_close_str": metrics["pnl_close_str"],
+                # Greeks (aggregated for group)
+                "delta": metrics["delta"],
+                "delta_str": metrics["delta_str"],
+                "gamma": metrics["gamma"],
+                "gamma_str": metrics["gamma_str"],
+                "theta": metrics["theta"],
+                "theta_str": metrics["theta_str"],
+                "vega": metrics["vega"],
+                "vega_str": metrics["vega_str"],
             })
 
     def _calc_group_value(self, con_ids: list[int]) -> float:
@@ -333,13 +388,28 @@ class AppState(rx.State):
                 total += pos["net_value"]
         return round(total, 2)
 
-    def _calc_group_metrics(self, con_ids: list[int]) -> dict:
-        """Calculate detailed metrics for a group."""
+    def _calc_group_metrics(self, con_ids: list[int], position_quantities: dict = None) -> dict:
+        """Calculate detailed metrics for a group.
+
+        Args:
+            con_ids: List of contract IDs in the group
+            position_quantities: Optional dict mapping con_id_str -> allocated qty
+        """
         # Build leg data from positions
         legs = []
         for pos in self.positions:
             if pos["con_id"] in con_ids:
                 strike_str = pos["strike_str"]
+                # Use allocated quantity if provided, else use portfolio quantity
+                con_id_str = str(pos["con_id"])
+                if position_quantities:
+                    allocated_qty = position_quantities.get(con_id_str, abs(pos["quantity"]))
+                    # Preserve sign from portfolio position (long/short)
+                    if pos["quantity"] < 0:
+                        allocated_qty = -allocated_qty
+                else:
+                    allocated_qty = pos["quantity"]
+
                 leg = LegData(
                     con_id=pos["con_id"],
                     symbol=pos["symbol"],
@@ -347,13 +417,17 @@ class AppState(rx.State):
                     expiry=pos["expiry"] if pos["expiry"] != "-" else "",
                     strike=float(strike_str.rstrip("CP")) if strike_str not in ("-", "") else 0.0,
                     right=strike_str[-1] if strike_str not in ("-", "") and strike_str[-1] in ("C", "P") else "",
-                    quantity=pos["quantity"],
+                    quantity=allocated_qty,  # Use allocated qty
                     multiplier=pos["multiplier"],
                     fill_price=pos["fill_price"],
                     bid=pos["bid"],
                     ask=pos["ask"],
                     mid=pos["mid"],
                     mark=pos["mark"],
+                    delta=pos.get("delta", 0.0),
+                    gamma=pos.get("gamma", 0.0),
+                    theta=pos.get("theta", 0.0),
+                    vega=pos.get("vega", 0.0),
                 )
                 legs.append(leg)
 
@@ -375,12 +449,11 @@ class AppState(rx.State):
             })
 
         # Format legs as string for display (avoids nested foreach issue)
-        # Show: Type, Qty, Name, Mark, Mid, Bid/Ask
+        # Show: Qty, Name, Bid/Ask (simplified view)
         legs_lines = []
         for info in leg_infos:
             legs_lines.append(
-                f"{info['type']:5} {info['qty']:>3}  {info['name']}  "
-                f"Mark:{info['mark']} Mid:{info['mid']} Bid:{info['bid']} Ask:{info['ask']}"
+                f"{info['qty']:>3}  {info['name']}  Bid:{info['bid']} Ask:{info['ask']}"
             )
         legs_str = "\n".join(legs_lines) if legs_lines else "No legs"
 
@@ -406,6 +479,15 @@ class AppState(rx.State):
             "pnl_mid_str": metrics.pnl_mid_str,
             "pnl_close": metrics.pnl_close,
             "pnl_close_str": metrics.pnl_close_str,
+            # Greeks (aggregated for group)
+            "delta": metrics.group_delta,
+            "delta_str": metrics.delta_str,
+            "gamma": metrics.group_gamma,
+            "gamma_str": metrics.gamma_str,
+            "theta": metrics.group_theta,
+            "theta_str": metrics.theta_str,
+            "vega": metrics.group_vega,
+            "vega_str": metrics.vega_str,
         }
 
     def delete_group(self, group_id: str):
@@ -559,6 +641,8 @@ class AppState(rx.State):
     def _refresh_positions(self):
         """Refresh positions from broker - calculate all values ourselves."""
         broker_positions = BROKER.get_positions()
+        # Get usage counts from GroupManager
+        used_quantities = GROUP_MANAGER.get_used_quantities()
         result = []
         for p in broker_positions:
             # Get multiplier from contract
@@ -577,7 +661,7 @@ class AppState(rx.State):
             if fill_price <= 0:
                 fill_price = p.avg_cost / multiplier if multiplier > 0 else p.avg_cost
 
-            # Get live quote data (bid, ask, last, mid, mark) from reqMktData
+            # Get live quote data (bid, ask, last, mid, mark, greeks) from reqMktData
             quote = BROKER.get_quote_data(p.con_id)
             bid = quote["bid"]
             ask = quote["ask"]
@@ -585,6 +669,11 @@ class AppState(rx.State):
             mid = quote["mid"]
             # Mark price from ticker.markPrice, fallback to portfolio
             mark = quote["mark"] if quote["mark"] > 0 else p.market_price
+            # Greeks
+            delta = quote.get("delta", 0.0)
+            gamma = quote.get("gamma", 0.0)
+            theta = quote.get("theta", 0.0)
+            vega = quote.get("vega", 0.0)
 
             # Calculate net cost (fill_price * qty * multiplier)
             net_cost = fill_price * abs(p.quantity) * multiplier
@@ -594,6 +683,12 @@ class AppState(rx.State):
 
             # Calculate PnL
             pnl = net_value - net_cost
+
+            # Calculate quantity usage across groups
+            total_qty = abs(p.quantity)
+            used_qty = used_quantities.get(p.con_id, 0)
+            available_qty = max(0, total_qty - used_qty)
+            is_fully_used = available_qty <= 0
 
             # Format based on position type
             if p.is_combo:
@@ -645,6 +740,18 @@ class AppState(rx.State):
                 "is_combo": p.is_combo,
                 # Don't store raw combo_legs - they're not JSON serializable
                 "combo_legs": [],
+                # Quantity tracking across groups
+                "used_qty": used_qty,
+                "available_qty": available_qty,
+                "is_fully_used": is_fully_used,
+                "qty_usage_str": f"{used_qty}/{int(total_qty)}",
+                # Dropdown options for SEL (0 to available_qty as strings)
+                "qty_options": [str(i) for i in range(0, int(available_qty) + 1)] if available_qty > 0 else ["0"],
+                # Greeks
+                "delta": delta,
+                "gamma": gamma,
+                "theta": theta,
+                "vega": vega,
             })
 
         # Log first position to verify live data

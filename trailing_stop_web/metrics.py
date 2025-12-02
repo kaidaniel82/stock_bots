@@ -21,6 +21,11 @@ class LegData:
     ask: float
     mid: float
     mark: float
+    # Greeks (per contract)
+    delta: float = 0.0
+    gamma: float = 0.0
+    theta: float = 0.0
+    vega: float = 0.0
 
     @property
     def display_name(self) -> str:
@@ -67,6 +72,12 @@ class GroupMetrics:
     pnl_mid: float               # group_mid_value - total_cost
     pnl_close: float             # spread_bid - total_cost (realistic exit PnL)
 
+    # Greeks (aggregated for entire group, position-weighted)
+    group_delta: float = 0.0     # Sum of delta * qty * mult
+    group_gamma: float = 0.0     # Sum of gamma * qty * mult
+    group_theta: float = 0.0     # Sum of theta * qty * mult
+    group_vega: float = 0.0      # Sum of vega * qty * mult
+
     # Formatted strings for UI
     @property
     def mark_str(self) -> str:
@@ -100,6 +111,22 @@ class GroupMetrics:
     def pnl_close_str(self) -> str:
         return f"${self.pnl_close:.2f}"
 
+    @property
+    def delta_str(self) -> str:
+        return f"{self.group_delta:+.2f}"
+
+    @property
+    def gamma_str(self) -> str:
+        return f"{self.group_gamma:.4f}"
+
+    @property
+    def theta_str(self) -> str:
+        return f"{self.group_theta:+.2f}"
+
+    @property
+    def vega_str(self) -> str:
+        return f"{self.group_vega:+.2f}"
+
 
 def compute_group_metrics(legs: list[LegData]) -> GroupMetrics:
     """
@@ -122,6 +149,10 @@ def compute_group_metrics(legs: list[LegData]) -> GroupMetrics:
             pnl_mark=0.0,
             pnl_mid=0.0,
             pnl_close=0.0,
+            group_delta=0.0,
+            group_gamma=0.0,
+            group_theta=0.0,
+            group_vega=0.0,
         )
 
     group_mark_value = 0.0  # WITHOUT multiplier for display (like option chain)
@@ -132,6 +163,11 @@ def compute_group_metrics(legs: list[LegData]) -> GroupMetrics:
     spread_ask = 0.0  # Natural entry price - WITHOUT multiplier for display
     close_value = 0.0  # Exit value WITH multiplier for pnl_close calculation
     total_cost = 0.0
+    # Greeks aggregated (position-weighted)
+    group_delta = 0.0
+    group_gamma = 0.0
+    group_theta = 0.0
+    group_vega = 0.0
 
     for leg in legs:
         qty = leg.quantity
@@ -178,6 +214,13 @@ def compute_group_metrics(legs: list[LegData]) -> GroupMetrics:
         else:
             total_cost -= leg.fill_price * abs_qty * mult  # Credit received
 
+        # Aggregate Greeks (position-weighted: greek * qty * mult)
+        # Delta is per contract, qty can be +/-, mult is always positive
+        group_delta += leg.delta * qty * mult
+        group_gamma += leg.gamma * abs_qty * mult
+        group_theta += leg.theta * qty * mult
+        group_vega += leg.vega * abs_qty * mult
+
     # Calculate PnL (all with multiplier for position value)
     pnl_mark = mark_value_pos - total_cost
     pnl_mid = mid_value_pos - total_cost
@@ -199,4 +242,8 @@ def compute_group_metrics(legs: list[LegData]) -> GroupMetrics:
         pnl_mark=round(pnl_mark, 2),
         pnl_mid=round(pnl_mid, 2),
         pnl_close=round(pnl_close, 2),
+        group_delta=round(group_delta, 2),
+        group_gamma=round(group_gamma, 4),
+        group_theta=round(group_theta, 2),
+        group_vega=round(group_vega, 2),
     )

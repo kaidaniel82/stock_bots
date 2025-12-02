@@ -155,7 +155,7 @@ class MarketDataManager:
         return len(self._subscriptions)
 
     def get_quote_data(self, con_id: int) -> dict:
-        """Get full quote data (bid, ask, last, mid, mark) for a contract."""
+        """Get full quote data (bid, ask, last, mid, mark, greeks) for a contract."""
         import math
 
         def safe_float(val) -> float:
@@ -164,12 +164,23 @@ class MarketDataManager:
                 return 0.0
             try:
                 f = float(val)
-                return f if not math.isnan(f) and f > 0 else 0.0
+                return f if not math.isnan(f) else 0.0
+            except (ValueError, TypeError):
+                return 0.0
+
+        def safe_greek(val) -> float:
+            """Convert Greek to float, allowing negative values."""
+            if val is None:
+                return 0.0
+            try:
+                f = float(val)
+                return f if not math.isnan(f) else 0.0
             except (ValueError, TypeError):
                 return 0.0
 
         if con_id not in self._subscriptions:
-            return {"bid": 0.0, "ask": 0.0, "last": 0.0, "mid": 0.0, "mark": 0.0}
+            return {"bid": 0.0, "ask": 0.0, "last": 0.0, "mid": 0.0, "mark": 0.0,
+                    "delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
 
         ticker = self._subscriptions[con_id]
 
@@ -189,7 +200,19 @@ class MarketDataManager:
         if mark <= 0 and mid > 0:
             mark = mid
 
-        return {"bid": bid, "ask": ask, "last": last, "mid": mid, "mark": mark}
+        # Get Greeks from modelGreeks (available for options)
+        delta = 0.0
+        gamma = 0.0
+        theta = 0.0
+        vega = 0.0
+        if ticker.modelGreeks:
+            delta = safe_greek(ticker.modelGreeks.delta)
+            gamma = safe_greek(ticker.modelGreeks.gamma)
+            theta = safe_greek(ticker.modelGreeks.theta)
+            vega = safe_greek(ticker.modelGreeks.vega)
+
+        return {"bid": bid, "ask": ask, "last": last, "mid": mid, "mark": mark,
+                "delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
 
 
 class TWSBroker:
@@ -327,6 +350,11 @@ class TWSBroker:
             raw_contract=contract,
         )
         self._positions[contract.conId] = pos
+
+        # Subscribe new positions to market data automatically
+        if is_new and self._market_data and pos.raw_contract:
+            if self._market_data.subscribe(contract.conId, pos.raw_contract):
+                logger.info(f"Subscribed new position to market data: {contract.symbol} (conId={contract.conId})")
 
         # Log if enabled - always log first position for debugging
         if VERBOSE_PORTFOLIO_UPDATES:

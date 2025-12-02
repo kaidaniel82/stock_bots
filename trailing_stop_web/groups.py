@@ -18,9 +18,15 @@ class Group:
     # === BASIS ===
     id: str
     name: str
-    con_ids: list[int]           # Position ConIDs in this group
+    # Position quantities: {con_id_str: quantity} - JSON uses string keys
+    position_quantities: dict[str, int] = field(default_factory=dict)
     created_at: str = ""
     is_active: bool = False
+
+    @property
+    def con_ids(self) -> list[int]:
+        """Backwards compatibility: return list of con_ids."""
+        return [int(k) for k in self.position_quantities.keys()]
 
     # === TRAILING STOP ===
     trail_enabled: bool = True
@@ -51,11 +57,19 @@ class Group:
 
     def to_dict(self) -> dict:
         """Convert to dict for JSON serialization."""
-        return asdict(self)
+        d = asdict(self)
+        # Remove con_ids from serialization (it's a computed property)
+        # Actually asdict doesn't include properties, but let's be explicit
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "Group":
-        """Create from dict."""
+        """Create from dict. Supports old format (con_ids) for backwards compat."""
+        # Handle old format: con_ids as list
+        if "con_ids" in data and "position_quantities" not in data:
+            # Convert old format to new format (1 qty per position)
+            con_ids = data.pop("con_ids")
+            data["position_quantities"] = {str(cid): 1 for cid in con_ids}
         return cls(**data)
 
 
@@ -113,7 +127,7 @@ class GroupManager:
     def create(
         self,
         name: str,
-        con_ids: list[int],
+        position_quantities: dict[int, int],  # {con_id: quantity}
         trail_value: float = 10.0,
         trail_mode: str = "percent",
         trigger_price_type: str = "mark",
@@ -123,14 +137,22 @@ class GroupManager:
         time_exit_time: str = "15:55",
         initial_value: float = 0.0,
     ) -> Group:
-        """Create a new group."""
+        """Create a new group.
+
+        Args:
+            name: Group name
+            position_quantities: dict mapping con_id -> quantity to allocate
+        """
         group_id = f"grp_{len(self._groups) + 1}_{datetime.now().strftime('%H%M%S')}"
         stop_price = calculate_stop_price(initial_value, trail_mode, trail_value)
+
+        # Convert int keys to str for JSON serialization
+        pos_qty_str = {str(k): v for k, v in position_quantities.items()}
 
         group = Group(
             id=group_id,
             name=name,
-            con_ids=con_ids,
+            position_quantities=pos_qty_str,
             created_at=datetime.now().isoformat(),
             is_active=False,
             trail_enabled=True,
@@ -146,7 +168,8 @@ class GroupManager:
         )
         self._groups[group.id] = group
         self._save()
-        logger.info(f"Group created: {group.name} ({group.id}) with {len(con_ids)} positions")
+        total_qty = sum(position_quantities.values())
+        logger.info(f"Group created: {group.name} ({group.id}) with {len(position_quantities)} positions, {total_qty} total qty")
         return group
 
     def delete(self, group_id: str) -> bool:
@@ -241,6 +264,47 @@ class GroupManager:
             name = self._groups[group_id].name
             self.delete(group_id)
             logger.info(f"Auto-removed group after order triggered: {name}")
+
+    def get_used_quantities(self) -> dict[int, int]:
+        """Calculate total quantity used for each con_id across all groups.
+
+        Returns:
+            dict mapping con_id -> total quantity allocated across all groups
+        """
+        usage: dict[int, int] = {}
+        for group in self._groups.values():
+            for con_id_str, qty in group.position_quantities.items():
+                con_id = int(con_id_str)
+                usage[con_id] = usage.get(con_id, 0) + qty
+        return usage
+
+    def can_use_position(self, con_id: int, position_qty: float) -> bool:
+        """Check if a position can still be added to a new group.
+
+        Args:
+            con_id: The position's contract ID
+            position_qty: The position's total quantity
+
+        Returns:
+            True if there's still available quantity (used < total qty)
+        """
+        usage = self.get_used_quantities()
+        used = usage.get(con_id, 0)
+        return used < abs(position_qty)
+
+    def get_available_quantity(self, con_id: int, position_qty: float) -> float:
+        """Get remaining available quantity for a position.
+
+        Args:
+            con_id: The position's contract ID
+            position_qty: The position's total quantity
+
+        Returns:
+            Available quantity (total - used)
+        """
+        usage = self.get_used_quantities()
+        used = usage.get(con_id, 0)
+        return abs(position_qty) - used
 
 
 # Global instance
