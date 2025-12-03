@@ -68,12 +68,22 @@ def topbar() -> rx.Component:
 
             rx.spacer(),
 
-            # Connection status
+            # Connection status with reconnect support
             rx.hstack(
+                # Status badge with 3 colors: green=connected, yellow=reconnecting, red=disconnected
                 rx.badge(
                     AppState.connection_status,
-                    color_scheme=rx.cond(AppState.is_connected, "green", "red"),
+                    color_scheme=rx.cond(
+                        AppState.is_connected,
+                        "green",
+                        rx.cond(
+                            AppState.connection_status.contains("onnect"),  # Connecting/Reconnecting
+                            "yellow",
+                            "red",
+                        ),
+                    ),
                 ),
+                # Connect/Disconnect buttons
                 rx.cond(
                     AppState.is_connected,
                     rx.button(
@@ -82,11 +92,15 @@ def topbar() -> rx.Component:
                         color_scheme="red",
                         size="1",
                     ),
-                    rx.button(
-                        "Connect",
-                        on_click=AppState.connect_tws,
-                        color_scheme="green",
-                        size="1",
+                    rx.cond(
+                        AppState.connection_status == "Disconnected",
+                        rx.button(
+                            "Connect",
+                            on_click=AppState.connect_tws,
+                            color_scheme="green",
+                            size="1",
+                        ),
+                        rx.fragment(),  # Hide during reconnecting
                     ),
                 ),
                 spacing="2",
@@ -178,16 +192,20 @@ def position_row(row: list) -> rx.Component:
                 font_weight=rx.cond(is_fully_used, "bold", "normal"),
             )
         ),  # usage (e.g., "2/3")
-        # Selected Qty dropdown - shows available quantities (0 to available)
+        # Selected Qty dropdown - only visible when checkbox is selected
         rx.table.cell(
             rx.cond(
                 is_fully_used,
                 rx.text("-", color=COLORS["text_muted"]),
-                rx.select(
-                    row[21].split(","),  # qty_options as comma-separated string -> list
-                    value=selected_qty,
-                    on_change=AppState.set_position_quantity(con_id_str),
-                    size="1",
+                rx.cond(
+                    is_selected,
+                    rx.select(
+                        row[21].split(","),  # qty_options as comma-separated string -> list
+                        value=selected_qty,
+                        on_change=AppState.set_position_quantity(con_id_str),
+                        size="1",
+                    ),
+                    rx.text("-", color=COLORS["text_muted"]),  # Hidden when not selected
                 ),
             )
         ),
@@ -556,9 +574,10 @@ def setup_tab() -> rx.Component:
 # =============================================================================
 
 def compact_group_card(group: dict) -> rx.Component:
-    """Compact group card for monitor view (2x2 grid) - Bloomberg style."""
+    """Compact group card for monitor view (2x2 grid) - Bloomberg style. Clickable for chart selection."""
     group_id = group["id"]
     is_active = group["is_active"]
+    is_selected = AppState.selected_group_id == group_id
 
     return rx.box(
         rx.vstack(
@@ -571,6 +590,11 @@ def compact_group_card(group: dict) -> rx.Component:
                     rx.cond(is_active, "ACTIVE", "IDLE"),
                     color_scheme=rx.cond(is_active, "green", "gray"),
                     size="1",
+                ),
+                rx.cond(
+                    is_selected,
+                    rx.badge("SELECTED", color_scheme="purple", size="1"),
+                    rx.fragment(),
                 ),
                 width="100%",
             ),
@@ -687,30 +711,52 @@ def compact_group_card(group: dict) -> rx.Component:
             width="100%",
             spacing="2",
         ),
+        on_click=AppState.select_group(group_id),
+        cursor="pointer",
         background=COLORS["bg_panel"],
         border=PANEL_STYLES["border"],
-        border_left=PANEL_STYLES["border_left"],
+        border_left=rx.cond(
+            is_selected,
+            f"3px solid {COLORS['accent']}",  # Highlight selected
+            PANEL_STYLES["border_left"],
+        ),
         border_radius=PANEL_STYLES["border_radius"],
         padding=PANEL_STYLES["padding"],
         width="100%",
+        _hover={"background": COLORS["bg_elevated"]},
     )
 
 
-def chart_placeholder() -> rx.Component:
-    """Placeholder for future chart implementation - Bloomberg style."""
+def underlying_chart() -> rx.Component:
+    """Chart A: Underlying price history (3D, 3min bars)."""
     return rx.box(
         rx.vstack(
-            rx.text("CHART", weight="bold", size="2", color=COLORS["primary"],
-                   font_family=TYPOGRAPHY["font_family"]),
-            rx.box(
-                rx.text("Price chart coming soon...", color=COLORS["text_muted"],
+            rx.hstack(
+                rx.text("UNDERLYING", weight="bold", size="2", color=COLORS["primary"],
                        font_family=TYPOGRAPHY["font_family"]),
-                height="200px",
-                width="100%",
-                display="flex",
-                align_items="center",
-                justify_content="center",
-                background=COLORS["bg_elevated"],
+                rx.text(AppState.selected_underlying_symbol, size="1", color=COLORS["text_muted"]),
+                spacing="2",
+            ),
+            rx.cond(
+                AppState.selected_group_id != "",
+                rx.cond(
+                    AppState.underlying_history.length() > 0,
+                    rx.recharts.bar_chart(
+                        rx.recharts.bar(
+                            data_key="close",
+                            fill=COLORS["accent"],
+                        ),
+                        rx.recharts.x_axis(data_key="date", tick=False),
+                        rx.recharts.y_axis(width=60, domain=["auto", "auto"]),
+                        rx.recharts.cartesian_grid(stroke_dasharray="3 3", stroke=COLORS["border"]),
+                        rx.recharts.graphing_tooltip(),
+                        data=AppState.underlying_history.get(AppState.selected_underlying_symbol, []),
+                        width="100%",
+                        height=150,
+                    ),
+                    rx.text("Loading underlying data...", color=COLORS["text_muted"]),
+                ),
+                rx.text("Select a group to view charts", color=COLORS["text_muted"]),
             ),
             width="100%",
             spacing="2",
@@ -724,10 +770,124 @@ def chart_placeholder() -> rx.Component:
     )
 
 
+def combo_price_chart() -> rx.Component:
+    """Chart B: Position Mid Price history (1D building, 3min bars) with stop price line."""
+    return rx.box(
+        rx.vstack(
+            rx.hstack(
+                rx.text("POSITION MID", weight="bold", size="2", color=COLORS["primary"],
+                       font_family=TYPOGRAPHY["font_family"]),
+                rx.text("(6s updates)", size="1", color=COLORS["text_muted"]),
+                spacing="2",
+            ),
+            rx.cond(
+                AppState.selected_group_id != "",
+                rx.cond(
+                    AppState.position_price_ticks.get(AppState.selected_group_id, []).length() > 0,
+                    rx.recharts.composed_chart(
+                        rx.recharts.bar(
+                            data_key="mid",
+                            fill=COLORS["accent"],
+                            name="Mid",
+                        ),
+                        rx.recharts.line(
+                            data_key="stop_price",
+                            stroke=COLORS["error"],
+                            stroke_width=2,
+                            stroke_dasharray="5 5",
+                            dot=False,
+                            name="Stop",
+                        ),
+                        rx.recharts.x_axis(data_key="time", tick=False),
+                        rx.recharts.y_axis(width=60, domain=["auto", "auto"]),
+                        rx.recharts.cartesian_grid(stroke_dasharray="3 3", stroke=COLORS["border"]),
+                        rx.recharts.graphing_tooltip(),
+                        rx.recharts.legend(),
+                        data=AppState.position_price_ticks.get(AppState.selected_group_id, []),
+                        width="100%",
+                        height=150,
+                    ),
+                    rx.text("Collecting position data...", color=COLORS["text_muted"]),
+                ),
+                rx.text("Select a group", color=COLORS["text_muted"]),
+            ),
+            width="100%",
+            spacing="2",
+        ),
+        background=COLORS["bg_panel"],
+        border=PANEL_STYLES["border"],
+        border_left=PANEL_STYLES["border_left"],
+        border_radius=PANEL_STYLES["border_radius"],
+        padding=PANEL_STYLES["padding"],
+        width="100%",
+    )
+
+
+def live_oscillator_chart() -> rx.Component:
+    """Chart C: Live oscillator showing PnL with HWM and Stop Price lines."""
+    return rx.box(
+        rx.vstack(
+            rx.text("LIVE P&L", weight="bold", size="2", color=COLORS["primary"],
+                   font_family=TYPOGRAPHY["font_family"]),
+            rx.cond(
+                AppState.selected_group_id != "",
+                rx.recharts.composed_chart(
+                    rx.recharts.area(
+                        data_key="pnl",
+                        fill=COLORS["success"],
+                        stroke=COLORS["success"],
+                        fill_opacity=0.2,
+                        name="P&L",
+                    ),
+                    rx.recharts.reference_line(
+                        y=0,
+                        stroke=COLORS["text_muted"],
+                        stroke_dasharray="3 3",
+                    ),
+                    rx.recharts.x_axis(data_key="time", tick=False),
+                    rx.recharts.y_axis(width=60),
+                    rx.recharts.cartesian_grid(stroke_dasharray="3 3", stroke=COLORS["border"]),
+                    rx.recharts.graphing_tooltip(),
+                    data=AppState.live_ticks.get(AppState.selected_group_id, []),
+                    width="100%",
+                    height=150,
+                ),
+                rx.text("Select a group", color=COLORS["text_muted"]),
+            ),
+            width="100%",
+            spacing="2",
+        ),
+        background=COLORS["bg_panel"],
+        border=PANEL_STYLES["border"],
+        border_left=PANEL_STYLES["border_left"],
+        border_radius=PANEL_STYLES["border_radius"],
+        padding=PANEL_STYLES["padding"],
+        width="100%",
+    )
+
+
+def charts_section() -> rx.Component:
+    """Combined charts section for monitor tab."""
+    return rx.vstack(
+        rx.hstack(
+            underlying_chart(),
+            width="100%",
+        ),
+        rx.hstack(
+            combo_price_chart(),
+            live_oscillator_chart(),
+            width="100%",
+            spacing="3",
+        ),
+        width="100%",
+        spacing="3",
+    )
+
+
 def monitor_tab() -> rx.Component:
     """Monitor tab content - Groups overview with charts."""
     return rx.vstack(
-        # Groups in 3-column grid
+        # Groups in 3-column grid with selection
         rx.cond(
             AppState.groups.length() > 0,
             rx.box(
@@ -741,8 +901,8 @@ def monitor_tab() -> rx.Component:
             ),
             rx.text("No groups to monitor. Create groups in Setup tab.", color=COLORS["text_muted"]),
         ),
-        # Chart section
-        chart_placeholder(),
+        # Charts section (3 charts: Underlying, Position Price, Live P&L)
+        charts_section(),
         width="100%",
         spacing="4",
     )

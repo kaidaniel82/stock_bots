@@ -215,11 +215,12 @@ def compute_group_metrics(legs: list[LegData]) -> GroupMetrics:
             total_cost -= leg.fill_price * abs_qty * mult  # Credit received
 
         # Aggregate Greeks (position-weighted: greek * qty * mult)
-        # Delta is per contract, qty can be +/-, mult is always positive
+        # All Greeks use signed qty: short positions have opposite exposure
+        # Delta, Gamma, Theta, Vega all scale with position direction
         group_delta += leg.delta * qty * mult
-        group_gamma += leg.gamma * abs_qty * mult
+        group_gamma += leg.gamma * qty * mult  # Fixed: was abs_qty, now qty for correct sign
         group_theta += leg.theta * qty * mult
-        group_vega += leg.vega * abs_qty * mult
+        group_vega += leg.vega * qty * mult    # Fixed: was abs_qty, now qty for correct sign
 
     # Calculate PnL (all with multiplier for position value)
     pnl_mark = mark_value_pos - total_cost

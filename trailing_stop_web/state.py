@@ -105,6 +105,13 @@ class AppState(rx.State):
     # Price history for charts
     group_price_history: dict[str, list[dict]] = {}
 
+    # Chart data for monitor page
+    underlying_history: dict[str, list[dict]] = {}  # symbol -> OHLC bars (3D, 3min)
+    combo_history: dict[str, list[dict]] = {}       # group_id -> price bars
+    live_ticks: dict[str, list[dict]] = {}          # group_id -> rolling live data
+    position_price_ticks: dict[str, list[dict]] = {}  # group_id -> mid price rolling (1D, 3min equivalent)
+    _chart_loaded_for_group: str = ""               # Track which group has loaded chart data
+
     # UI State
     active_tab: str = "setup"  # "setup" or "monitor"
     delete_confirm_group_id: str = ""  # Group ID pending delete confirmation
@@ -181,11 +188,15 @@ class AppState(rx.State):
             logger.success(f"Connected, {len(self.positions)} positions")
             # Auto-start monitoring
             self.is_monitoring = True
+            # Load chart data if a group was already selected
+            if self.selected_group_id:
+                self._load_group_chart_data(self.selected_group_id)
         else:
             self.is_connected = False
-            self.connection_status = "Connection failed"
-            self.status_message = "Failed to connect to TWS"
-            logger.error("Connection failed")
+            # Auto-reconnect is happening, status will be updated via tick_update
+            self.connection_status = "Connecting..."
+            self.status_message = "Connection in progress (auto-reconnect enabled)..."
+            logger.info("Initial connection pending, auto-reconnect enabled")
 
     def disconnect_tws(self):
         """Disconnect from TWS."""
@@ -197,6 +208,13 @@ class AppState(rx.State):
         self.positions = []
         self.status_message = "Disconnected from TWS"
         logger.success("Disconnected")
+
+    def reconnect_tws(self):
+        """Manually trigger reconnection."""
+        logger.info("Manual reconnect requested...")
+        self.connection_status = "Reconnecting..."
+        self.status_message = "Manual reconnect requested..."
+        BROKER.request_reconnect()
 
     def _load_positions(self):
         """Load positions from broker (uses live prices when available)."""
@@ -503,17 +521,40 @@ class AppState(rx.State):
         self.status_message = "Group deleted"
 
     def toggle_group_active(self, group_id: str):
-        """Toggle group monitoring on/off."""
+        """Toggle group monitoring on/off - places/cancels orders at TWS."""
         # Sync connection state and refresh positions
         self._sync_broker_state()
         group = GROUP_MANAGER.get(group_id)
         if group:
             if group.is_active:
-                GROUP_MANAGER.deactivate(group_id)
+                # Deactivating - cancel orders at TWS
+                if group.oca_group_id:
+                    BROKER.cancel_oca_group(group.oca_group_id)
+                GROUP_MANAGER.deactivate(group_id, clear_orders=True)
+                self.status_message = f"Deactivated: {group.name}"
             else:
-                # Calculate current value and activate
+                # Activating - place orders at TWS
                 value = self._calc_group_value(group.con_ids)
-                GROUP_MANAGER.activate(group_id, value)
+
+                # Place OCA order group
+                order_result = BROKER.place_oca_group(
+                    group_name=group.name,
+                    position_quantities={int(k): v for k, v in group.position_quantities.items()},
+                    trail_value=group.trail_value,
+                    trail_mode=group.trail_mode,
+                    stop_type=group.stop_type,
+                    limit_offset=group.limit_offset,
+                    time_exit_enabled=group.time_exit_enabled,
+                    time_exit_time=group.time_exit_time
+                )
+
+                if order_result:
+                    GROUP_MANAGER.activate(group_id, value, order_result)
+                    self.status_message = f"Activated: {group.name} (Order #{order_result['trailing_order_id']})"
+                else:
+                    self.status_message = f"Failed to place orders for {group.name}"
+                    logger.error(f"Failed to place orders for group {group.name}")
+
             self._load_groups_from_manager()
 
     def update_group_trail(self, group_id, value):
@@ -768,18 +809,88 @@ class AppState(rx.State):
 
     def tick_update(self, _=None):
         """Called by frontend interval - refresh positions and force UI update."""
+        # Always sync connection status from broker (may have changed async)
+        broker_connected = BROKER.is_connected()
+        if broker_connected != self.is_connected:
+            self.is_connected = broker_connected
+            if broker_connected:
+                self.connection_status = "Connected"
+                self.is_monitoring = True
+                self.status_message = f"Connected - refreshing positions..."
+                # Load chart data if a group was selected before connection
+                if self.selected_group_id:
+                    self._load_group_chart_data(self.selected_group_id)
+            else:
+                self.connection_status = "Disconnected"
+
         if not self.is_connected or not self.is_monitoring:
             return
 
         self._refresh_positions()
         self.refresh_tick += 1
 
-        now = datetime.now().strftime("%H:%M:%S")
-        self.status_message = f"Monitoring... ({now})"
+        # Load chart data once positions are available (deferred loading) - only once per group
+        if self.selected_group_id and self.positions and self._chart_loaded_for_group != self.selected_group_id:
+            group = GROUP_MANAGER.get(self.selected_group_id)
+            if group:
+                symbol = self.selected_underlying_symbol
+                if symbol and symbol not in self.underlying_history:
+                    logger.info(f"Deferred chart loading for {symbol}")
+                    self._load_group_chart_data(self.selected_group_id)
+                    self._chart_loaded_for_group = self.selected_group_id
+
+        now = datetime.now()
+        now_str = now.strftime("%H:%M:%S")
+        self.status_message = f"Monitoring... ({now_str})"
+
+        # Update live_ticks for Chart C (rolling window of ~120 data points = ~1 min at 0.5s interval)
+        new_live_ticks = dict(self.live_ticks)
+        new_position_ticks = dict(self.position_price_ticks)
+
+        # Every 12 ticks (~6 sec at 0.5s interval), record position price for Chart B
+        # Use 360 for real 3-min bars, 12 for faster demo
+        record_position_tick = (self.refresh_tick % 12) == 0
 
         # Update groups via GroupManager
         for g in GROUP_MANAGER.get_all():
             value = self._calc_group_value(g.con_ids)
+            metrics = self._calc_group_metrics(g.con_ids, g.position_quantities)
+
+            # Record live tick for oscillator chart (every tick)
+            if g.id not in new_live_ticks:
+                new_live_ticks[g.id] = []
+            ticks = list(new_live_ticks[g.id])
+            ticks.append({
+                "time": now_str,
+                "timestamp": now.timestamp(),
+                "mark": metrics["mark_value"],
+                "pnl": metrics["pnl_mark"],
+                "stop_price": g.stop_price,
+                "hwm": g.high_water_mark,
+            })
+            # Keep rolling window of 120 ticks (~1 min)
+            if len(ticks) > 120:
+                ticks = ticks[-120:]
+            new_live_ticks[g.id] = ticks
+
+            # Record position price tick for Chart B (every 3 min)
+            if record_position_tick:
+                if g.id not in new_position_ticks:
+                    new_position_ticks[g.id] = []
+                pos_ticks = list(new_position_ticks[g.id])
+                pos_ticks.append({
+                    "time": now_str,
+                    "timestamp": now.timestamp(),
+                    "mid": metrics["mid_value"],
+                    "mark": metrics["mark_value"],
+                    "bid": metrics["spread_bid"],
+                    "ask": metrics["spread_ask"],
+                    "stop_price": g.stop_price,
+                })
+                # Keep max 200 ticks (~10 hours of 3-min bars)
+                if len(pos_ticks) > 200:
+                    pos_ticks = pos_ticks[-200:]
+                new_position_ticks[g.id] = pos_ticks
 
             if g.is_active:
                 # Update HWM if value increased
@@ -792,6 +903,9 @@ class AppState(rx.State):
                     # Optional: Auto-remove group when triggered
                     # GROUP_MANAGER.remove_if_order_triggered(g.id)
 
+        self.live_ticks = new_live_ticks
+        self.position_price_ticks = new_position_ticks
+
         # Reload groups to reflect changes
         self._load_groups_from_manager()
 
@@ -802,31 +916,90 @@ class AppState(rx.State):
         self.active_tab = tab
 
     def select_group(self, group_id: str):
-        """Select a group in monitor view."""
+        """Select a group in monitor view and load chart data."""
+        logger.info(f"select_group called with group_id={group_id}")
         self.selected_group_id = group_id
+        # Only reload chart data if this is a different group
+        if self._chart_loaded_for_group != group_id:
+            self._load_group_chart_data(group_id)
+            self._chart_loaded_for_group = group_id
+
+    def _load_group_chart_data(self, group_id: str):
+        """Load historical chart data for a group."""
+        group = GROUP_MANAGER.get(group_id)
+        logger.info(f"_load_group_chart_data: group={group}, is_connected={self.is_connected}")
+        if not group or not self.is_connected:
+            logger.warning(f"_load_group_chart_data: early return - group={group is not None}, connected={self.is_connected}")
+            return
+
+        logger.info(f"_load_group_chart_data: group.con_ids={group.con_ids}, positions count={len(self.positions)}")
+        # Get underlying symbol from first position
+        if group.con_ids:
+            first_con_id = group.con_ids[0]
+            for p in self.positions:
+                if p["con_id"] == first_con_id:
+                    symbol = p["symbol"]
+                    break
+            else:
+                return
+
+            # Fetch underlying history if not already loaded
+            if symbol not in self.underlying_history:
+                bars = BROKER.fetch_underlying_history(symbol, "3 D", "3 mins")
+                if bars:
+                    new_hist = dict(self.underlying_history)
+                    new_hist[symbol] = bars
+                    self.underlying_history = new_hist
+                    logger.info(f"Loaded {len(bars)} underlying bars for {symbol}")
+
+            # Fetch combo/position history for each leg
+            for con_id in group.con_ids:
+                if str(con_id) not in self.combo_history:
+                    bars = BROKER.fetch_historical_bars(con_id, "3 D", "3 mins", "MIDPOINT")
+                    if bars:
+                        new_hist = dict(self.combo_history)
+                        new_hist[str(con_id)] = bars
+                        self.combo_history = new_hist
+
+    @rx.var
+    def selected_underlying_symbol(self) -> str:
+        """Get the underlying symbol for the selected group."""
+        if not self.selected_group_id:
+            return ""
+        group = GROUP_MANAGER.get(self.selected_group_id)
+        if not group or not group.con_ids:
+            return ""
+        first_con_id = group.con_ids[0]
+        for p in self.positions:
+            if p["con_id"] == first_con_id:
+                return p["symbol"]
+        return ""
 
     # === Order Management ===
 
     def cancel_all_orders(self):
         """Cancel all orders for all groups at IB."""
         logger.info("Canceling all orders...")
-        # TODO: Implement actual IB order cancellation
-        # For now, just deactivate all groups
+        cancelled_count = 0
+
         for g in GROUP_MANAGER.get_all():
-            if g.is_active:
-                GROUP_MANAGER.deactivate(g.id)
+            if g.is_active and g.oca_group_id:
+                if BROKER.cancel_oca_group(g.oca_group_id):
+                    cancelled_count += 1
+                GROUP_MANAGER.deactivate(g.id, clear_orders=True)
+
         self._load_groups_from_manager()
-        self.status_message = "All orders canceled"
-        logger.info("All orders canceled")
+        self.status_message = f"Cancelled {cancelled_count} order groups"
+        logger.info(f"Cancelled {cancelled_count} order groups")
 
     def cancel_group_order(self, group_id: str):
         """Cancel order for a specific group at IB and set to inactive."""
         logger.info(f"Canceling order for group {group_id}")
         group = GROUP_MANAGER.get(group_id)
         if group:
-            # TODO: Implement actual IB order cancellation
-            # For now, just deactivate
-            GROUP_MANAGER.deactivate(group_id)
+            if group.oca_group_id:
+                BROKER.cancel_oca_group(group.oca_group_id)
+            GROUP_MANAGER.deactivate(group_id, clear_orders=True)
             self._load_groups_from_manager()
             self.status_message = f"Order canceled: {group.name}"
             logger.info(f"Order canceled for group {group.name}")
@@ -853,8 +1026,9 @@ class AppState(rx.State):
 
         group = GROUP_MANAGER.get(group_id)
         if group:
-            if cancel_order:
-                # TODO: Cancel IB order
+            if cancel_order and group.oca_group_id:
+                # Cancel IB order
+                BROKER.cancel_oca_group(group.oca_group_id)
                 logger.info(f"Deleting group {group.name} and canceling order")
             else:
                 logger.info(f"Deleting group {group.name}, leaving order at IB")

@@ -50,6 +50,23 @@ DEFAULT_LIMIT_OFFSET = 0.10
 
 
 # =============================================================================
+# TWS RECONNECTION
+# =============================================================================
+
+# Initial delay before first reconnection attempt (seconds)
+RECONNECT_INITIAL_DELAY = 5
+
+# Maximum delay between reconnection attempts (seconds)
+RECONNECT_MAX_DELAY = 60
+
+# Backoff multiplier (delay doubles each attempt until max)
+RECONNECT_BACKOFF_FACTOR = 2
+
+# Maximum reconnection attempts (0 = unlimited)
+RECONNECT_MAX_ATTEMPTS = 0
+
+
+# =============================================================================
 # LOGGING
 # =============================================================================
 

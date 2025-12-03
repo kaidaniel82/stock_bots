@@ -203,8 +203,14 @@ class GroupManager:
         self._save()
         return True
 
-    def activate(self, group_id: str, current_value: float = None) -> bool:
-        """Activate group monitoring."""
+    def activate(self, group_id: str, current_value: float = None, order_result: dict = None) -> bool:
+        """Activate group monitoring and store order IDs.
+
+        Args:
+            group_id: The group to activate
+            current_value: Initial value for high water mark
+            order_result: Dict with oca_group_id, trailing_order_id, time_exit_order_id from broker
+        """
         if group_id in self._groups:
             group = self._groups[group_id]
             group.is_active = True
@@ -213,16 +219,35 @@ class GroupManager:
                 group.stop_price = calculate_stop_price(
                     current_value, group.trail_mode, group.trail_value
                 )
+
+            # Store order IDs if provided
+            if order_result:
+                group.oca_group_id = order_result.get("oca_group_id", "")
+                group.trailing_order_id = order_result.get("trailing_order_id", 0)
+                group.time_exit_order_id = order_result.get("time_exit_order_id", 0)
+
             self._save()
-            logger.info(f"Group activated: {group.name} HWM=${group.high_water_mark:.2f} Stop=${group.stop_price:.2f}")
+            logger.info(f"Group activated: {group.name} HWM=${group.high_water_mark:.2f} "
+                       f"Stop=${group.stop_price:.2f} OCA={group.oca_group_id}")
             return True
         return False
 
-    def deactivate(self, group_id: str) -> bool:
-        """Deactivate group monitoring."""
+    def deactivate(self, group_id: str, clear_orders: bool = False) -> bool:
+        """Deactivate group monitoring.
+
+        Args:
+            group_id: The group to deactivate
+            clear_orders: If True, clear order IDs (use when orders are cancelled)
+        """
         if group_id in self._groups:
             group = self._groups[group_id]
             group.is_active = False
+
+            if clear_orders:
+                group.oca_group_id = ""
+                group.trailing_order_id = 0
+                group.time_exit_order_id = 0
+
             self._save()
             logger.info(f"Group deactivated: {group.name}")
             return True

@@ -4,11 +4,13 @@ from datetime import datetime
 from threading import Thread
 from typing import Callable, Optional
 import asyncio
-from ib_insync import IB, Contract, Option, Stock, ComboLeg, PortfolioItem, Ticker, util
+from ib_insync import IB, Contract, Option, Stock, Index, Future, ComboLeg, PortfolioItem, Ticker, util, Order, Trade
+import uuid
 
 from .config import (
     TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
-    BROKER_UPDATE_INTERVAL, VERBOSE_PORTFOLIO_UPDATES, LOG_ONLY_CHANGES
+    BROKER_UPDATE_INTERVAL, VERBOSE_PORTFOLIO_UPDATES, LOG_ONLY_CHANGES,
+    RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY, RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_ATTEMPTS
 )
 from .logger import logger
 
@@ -235,57 +237,167 @@ class TWSBroker:
         self.price_cache = PriceCache()
         self._market_data: Optional[MarketDataManager] = None
 
+        # Reconnection state
+        self._reconnect_attempt = 0
+        self._reconnect_delay = RECONNECT_INITIAL_DELAY
+        self._auto_reconnect = True
+        self._connection_status_callback: Optional[Callable[[str], None]] = None
+
     def _run_loop(self):
-        """Run ib_insync event loop in separate thread."""
+        """Run ib_insync event loop in separate thread with reconnection support."""
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
+        while not self._stop_requested:
+            try:
+                if self._attempt_connection():
+                    self._run_connected_loop()
+
+                # If we get here, connection was lost
+                if not self._stop_requested and self._auto_reconnect:
+                    self._handle_reconnection()
+                else:
+                    break
+
+            except Exception as e:
+                logger.error(f"TWS connection error: {e}")
+                self._connected = False
+                if not self._stop_requested and self._auto_reconnect:
+                    self._handle_reconnection()
+                else:
+                    break
+
+        logger.info("TWS thread stopped")
+
+    def _attempt_connection(self) -> bool:
+        """Attempt to connect to TWS. Returns True if successful."""
+        import time
+
+        attempt_str = f" (attempt {self._reconnect_attempt + 1})" if self._reconnect_attempt > 0 else ""
+        status = f"Connecting{attempt_str}..."
+        self._notify_status(status)
+        logger.info(f"Connecting to TWS at {self.host}:{self.port}{attempt_str}")
+
         try:
-            logger.info(f"Connecting to TWS at {self.host}:{self.port} (client_id={self.client_id})")
             self.ib.connect(self.host, self.port, clientId=self.client_id)
             self._connected = True
-            logger.success(f"Connected to TWS")
+            self._reconnect_attempt = 0
+            self._reconnect_delay = RECONNECT_INITIAL_DELAY
+            self._notify_status("Connected")
+            logger.success("Connected to TWS")
 
-            # Initialize MarketDataManager
+            # Initialize/reinitialize MarketDataManager
             self._market_data = MarketDataManager(self.ib, self.price_cache)
             logger.info("MarketDataManager initialized")
 
-            # Wait for initial data to arrive
+            # Wait for initial data
             self.ib.sleep(2.0)
 
-            # Initial portfolio load
+            # Fetch portfolio
             self._fetch_portfolio()
 
-            # Subscribe to market data for all positions
+            # Re-subscribe to market data for all positions
             if self._market_data and self._positions:
                 count = self._market_data.subscribe_all(list(self._positions.values()))
                 logger.info(f"Subscribed to {count} market data streams")
 
-            # Load entry prices from recent executions
+            # Load entry prices
             self._load_entry_prices()
 
-            # Run loop - poll portfolio frequently
-            import time
-            last_fetch = time.time()
-            while self._connected and not self._stop_requested:
-                self.ib.sleep(0.1)  # Process IB events
-
-                if not self.ib.isConnected():
-                    logger.warning("TWS connection lost")
-                    self._connected = False
-                    break
-
-                # Fetch portfolio at interval
-                now = time.time()
-                if now - last_fetch >= BROKER_UPDATE_INTERVAL:
-                    self._fetch_portfolio()
-                    last_fetch = now
+            return True
 
         except Exception as e:
-            logger.error(f"TWS connection error: {e}")
+            logger.error(f"Connection attempt failed: {e}")
             self._connected = False
+            return False
 
-        logger.info("TWS thread stopped")
+    def _run_connected_loop(self):
+        """Main loop while connected - monitors connection and fetches data."""
+        import time
+        last_fetch = time.time()
+
+        while self._connected and not self._stop_requested:
+            self.ib.sleep(0.1)  # Process IB events
+
+            if not self.ib.isConnected():
+                logger.warning("TWS connection lost")
+                self._connected = False
+                self._notify_status("Connection lost")
+                break
+
+            # Fetch portfolio at interval
+            now = time.time()
+            if now - last_fetch >= BROKER_UPDATE_INTERVAL:
+                self._fetch_portfolio()
+                last_fetch = now
+
+    def _handle_reconnection(self):
+        """Handle reconnection with exponential backoff."""
+        import time
+
+        self._reconnect_attempt += 1
+        delay = min(self._reconnect_delay, RECONNECT_MAX_DELAY)
+
+        # Check max attempts (0 = unlimited)
+        if RECONNECT_MAX_ATTEMPTS > 0 and self._reconnect_attempt > RECONNECT_MAX_ATTEMPTS:
+            logger.error(f"Max reconnection attempts ({RECONNECT_MAX_ATTEMPTS}) reached")
+            self._notify_status("Reconnection failed - max attempts")
+            self._stop_requested = True
+            return
+
+        logger.info(f"Reconnecting in {delay}s (attempt {self._reconnect_attempt})...")
+
+        # Wait with countdown (check stop_requested periodically)
+        start = time.time()
+        while time.time() - start < delay:
+            if self._stop_requested:
+                return
+            remaining = int(delay - (time.time() - start))
+            self._notify_status(f"Reconnecting in {remaining}s...")
+            time.sleep(1)
+
+        # Disconnect cleanly before reconnecting
+        try:
+            self.ib.disconnect()
+        except Exception:
+            pass
+
+        # Create new IB instance for clean reconnect
+        self.ib = IB()
+
+        # Update backoff delay for next attempt
+        self._reconnect_delay = min(
+            self._reconnect_delay * RECONNECT_BACKOFF_FACTOR,
+            RECONNECT_MAX_DELAY
+        )
+
+    def _notify_status(self, status: str) -> None:
+        """Notify status change via callback."""
+        if self._connection_status_callback:
+            try:
+                self._connection_status_callback(status)
+            except Exception as e:
+                logger.error(f"Status callback error: {e}")
+
+    def set_connection_status_callback(self, callback: Callable[[str], None]) -> None:
+        """Set callback for connection status changes."""
+        self._connection_status_callback = callback
+
+    def request_reconnect(self) -> None:
+        """Request manual reconnection (can be called from UI)."""
+        if self._connected:
+            logger.info("Already connected, ignoring reconnect request")
+            return
+
+        logger.info("Manual reconnect requested")
+        self._reconnect_attempt = 0
+        self._reconnect_delay = RECONNECT_INITIAL_DELAY
+        self._stop_requested = False
+        self._auto_reconnect = True
+
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
 
     def _fetch_portfolio(self):
         """Fetch portfolio and process updates."""
@@ -375,6 +487,9 @@ class TWSBroker:
             return True
 
         self._stop_requested = False
+        self._auto_reconnect = True  # Enable auto-reconnect on connect
+        self._reconnect_attempt = 0
+        self._reconnect_delay = RECONNECT_INITIAL_DELAY
 
         if self._thread is None or not self._thread.is_alive():
             self._thread = Thread(target=self._run_loop, daemon=True)
@@ -390,17 +505,26 @@ class TWSBroker:
         return self._connected
 
     def disconnect(self):
-        """Disconnect from TWS."""
-        if self._connected:
-            logger.info("Disconnecting from TWS...")
-            self._stop_requested = True
-            try:
-                self.ib.disconnect()
-            except Exception as e:
-                logger.error(f"Error disconnecting: {e}")
-            self._connected = False
-            self._positions.clear()
-            logger.success("Disconnected from TWS")
+        """Disconnect from TWS and stop reconnection attempts."""
+        logger.info("Disconnecting from TWS...")
+        self._stop_requested = True
+        self._auto_reconnect = False  # Disable auto-reconnect on manual disconnect
+
+        # Unsubscribe from market data
+        if self._market_data:
+            self._market_data.unsubscribe_all()
+
+        try:
+            self.ib.disconnect()
+        except Exception as e:
+            logger.error(f"Error disconnecting: {e}")
+
+        self._connected = False
+        self._notify_status("Disconnected")
+        # Note: We keep _positions for state preservation during reconnect attempts
+        # Only clear when explicitly disconnected by user
+        self._positions.clear()
+        logger.success("Disconnected from TWS")
 
     def is_connected(self) -> bool:
         return self._connected and self.ib.isConnected()
@@ -467,6 +591,521 @@ class TWSBroker:
         if self._market_data:
             return self._market_data.get_quote_data(con_id)
         return {"bid": 0.0, "ask": 0.0, "last": 0.0, "mid": 0.0}
+
+    # =========================================================================
+    # ORDER PLACEMENT
+    # =========================================================================
+
+    def create_oca_group_id(self, group_name: str) -> str:
+        """Generate unique OCA group identifier."""
+        return f"TSM_{group_name}_{uuid.uuid4().hex[:8]}"
+
+    def build_combo_contract(self, position_quantities: dict[int, int]) -> Optional[Contract]:
+        """Build BAG (combo) contract from multiple positions.
+
+        Args:
+            position_quantities: {con_id: quantity} mapping
+
+        Returns:
+            Contract object for the combo, or None if failed
+        """
+        if not position_quantities:
+            logger.error("No positions provided for combo contract")
+            return None
+
+        if len(position_quantities) == 1:
+            # Single leg - return the position's contract
+            con_id = list(position_quantities.keys())[0]
+            pos = self._positions.get(con_id)
+            if pos and pos.raw_contract:
+                return pos.raw_contract
+            logger.error(f"Position {con_id} not found")
+            return None
+
+        # Multi-leg combo
+        combo_legs = []
+        symbol = None
+
+        for con_id, qty in position_quantities.items():
+            pos = self._positions.get(con_id)
+            if not pos:
+                logger.error(f"Position {con_id} not found")
+                return None
+
+            if symbol is None:
+                symbol = pos.symbol
+            elif pos.symbol != symbol:
+                logger.error(f"All legs must have same underlying: {symbol} vs {pos.symbol}")
+                return None
+
+            # Determine action based on position sign (closing the position)
+            # If we're long (qty > 0), we SELL to close
+            # If we're short (qty < 0), we BUY to close
+            action = "SELL" if qty > 0 else "BUY"
+
+            leg = ComboLeg(
+                conId=con_id,
+                ratio=abs(qty),
+                action=action,
+                exchange="SMART"
+            )
+            combo_legs.append(leg)
+
+        combo = Contract(
+            secType="BAG",
+            symbol=symbol,
+            exchange="SMART",
+            currency="USD",
+            comboLegs=combo_legs
+        )
+
+        return combo
+
+    def place_trailing_stop_order(
+        self,
+        contract: Contract,
+        quantity: int,
+        trail_amount: float,
+        trail_mode: str,  # "percent" or "absolute"
+        stop_type: str,   # "market" or "limit"
+        limit_offset: float,
+        oca_group: str,
+        action: str = "SELL"  # SELL to close long, BUY to close short
+    ) -> Optional[Trade]:
+        """Place a trailing stop order.
+
+        Args:
+            contract: Contract or BAG contract for combo
+            quantity: Total quantity to trade
+            trail_amount: Trail value (percent or absolute)
+            trail_mode: "percent" or "absolute"
+            stop_type: "market" for TRAIL or "limit" for TRAIL LIMIT
+            limit_offset: Offset for limit orders
+            oca_group: OCA group identifier
+            action: "SELL" or "BUY"
+
+        Returns:
+            Trade object or None if failed
+        """
+        if not self.is_connected():
+            logger.error("Cannot place order: not connected")
+            return None
+
+        try:
+            order = Order()
+            order.action = action
+            order.totalQuantity = abs(quantity)
+            order.transmit = True
+
+            # OCA group settings
+            order.ocaGroup = oca_group
+            order.ocaType = 1  # Cancel all remaining on fill
+
+            if trail_mode == "percent":
+                order.orderType = "TRAIL" if stop_type == "market" else "TRAIL LIMIT"
+                order.trailingPercent = trail_amount
+                if stop_type == "limit":
+                    order.lmtPriceOffset = limit_offset
+            else:  # absolute
+                order.orderType = "TRAIL" if stop_type == "market" else "TRAIL LIMIT"
+                order.auxPrice = trail_amount  # Trail amount in dollars
+                if stop_type == "limit":
+                    order.lmtPriceOffset = limit_offset
+
+            trade = self.ib.placeOrder(contract, order)
+
+            logger.info(f"Placed trailing stop: orderId={trade.order.orderId} "
+                       f"type={order.orderType} trail={trail_amount} mode={trail_mode}")
+
+            return trade
+
+        except Exception as e:
+            logger.error(f"Failed to place trailing stop: {e}")
+            return None
+
+    def place_time_exit_order(
+        self,
+        contract: Contract,
+        quantity: int,
+        exit_time: str,  # "HH:MM" format
+        oca_group: str,
+        action: str = "SELL"
+    ) -> Optional[Trade]:
+        """Place a time-based market order (Good After Time).
+
+        Args:
+            contract: Contract to trade
+            quantity: Quantity
+            exit_time: Time in HH:MM format (ET)
+            oca_group: OCA group identifier
+            action: "SELL" or "BUY"
+
+        Returns:
+            Trade object or None if failed
+        """
+        if not self.is_connected():
+            logger.error("Cannot place order: not connected")
+            return None
+
+        try:
+            # Convert HH:MM to TWS format (YYYYMMDD HH:MM:SS timezone)
+            today = datetime.now().strftime("%Y%m%d")
+            gat_time = f"{today} {exit_time}:00 US/Eastern"
+
+            order = Order()
+            order.action = action
+            order.totalQuantity = abs(quantity)
+            order.orderType = "MKT"
+            order.goodAfterTime = gat_time
+            order.tif = "DAY"
+            order.transmit = True
+
+            # OCA group settings
+            order.ocaGroup = oca_group
+            order.ocaType = 1
+
+            trade = self.ib.placeOrder(contract, order)
+
+            logger.info(f"Placed time exit: orderId={trade.order.orderId} at {exit_time}")
+
+            return trade
+
+        except Exception as e:
+            logger.error(f"Failed to place time exit: {e}")
+            return None
+
+    def place_oca_group(
+        self,
+        group_name: str,
+        position_quantities: dict[int, int],
+        trail_value: float,
+        trail_mode: str,
+        stop_type: str,
+        limit_offset: float,
+        time_exit_enabled: bool,
+        time_exit_time: str
+    ) -> Optional[dict]:
+        """Place complete OCA order group (trailing stop + optional time exit).
+
+        Returns:
+            Dict with oca_group_id, trailing_order_id, time_exit_order_id
+            or None if failed
+        """
+        try:
+            # Build contract
+            contract = self.build_combo_contract(position_quantities)
+            if not contract:
+                return None
+
+            total_qty = sum(abs(q) for q in position_quantities.values())
+
+            # Determine action: if net position is long, SELL to close
+            net_qty = sum(position_quantities.values())
+            action = "SELL" if net_qty > 0 else "BUY"
+
+            # Create OCA group
+            oca_group = self.create_oca_group_id(group_name)
+
+            # Place trailing stop
+            trailing_trade = self.place_trailing_stop_order(
+                contract=contract,
+                quantity=total_qty,
+                trail_amount=trail_value,
+                trail_mode=trail_mode,
+                stop_type=stop_type,
+                limit_offset=limit_offset,
+                oca_group=oca_group,
+                action=action
+            )
+
+            if not trailing_trade:
+                return None
+
+            time_exit_order_id = 0
+
+            # Place time exit if enabled
+            if time_exit_enabled and time_exit_time:
+                time_trade = self.place_time_exit_order(
+                    contract=contract,
+                    quantity=total_qty,
+                    exit_time=time_exit_time,
+                    oca_group=oca_group,
+                    action=action
+                )
+                if time_trade:
+                    time_exit_order_id = time_trade.order.orderId
+
+            logger.info(f"OCA group placed: {oca_group} trailing={trailing_trade.order.orderId} time_exit={time_exit_order_id}")
+
+            return {
+                "oca_group_id": oca_group,
+                "trailing_order_id": trailing_trade.order.orderId,
+                "time_exit_order_id": time_exit_order_id
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to place OCA group: {e}")
+            return None
+
+    def modify_trailing_stop(
+        self,
+        order_id: int,
+        trail_amount: float,
+        trail_mode: str,
+        stop_type: str,
+        limit_offset: float
+    ) -> bool:
+        """Modify an existing trailing stop order."""
+        if not self.is_connected():
+            return False
+
+        try:
+            # Find the existing trade
+            trades = [t for t in self.ib.openTrades() if t.order.orderId == order_id]
+            if not trades:
+                logger.error(f"Order {order_id} not found in open trades")
+                return False
+
+            trade = trades[0]
+            order = trade.order
+
+            # Modify only the trail parameters
+            if trail_mode == "percent":
+                order.trailingPercent = trail_amount
+                order.auxPrice = 0  # Clear absolute trail
+            else:
+                order.auxPrice = trail_amount
+                order.trailingPercent = 0  # Clear percent trail
+
+            if stop_type == "limit":
+                order.lmtPriceOffset = limit_offset
+
+            # Re-place the order (ib_insync handles modification)
+            self.ib.placeOrder(trade.contract, order)
+
+            logger.info(f"Modified order {order_id}: trail={trail_amount} mode={trail_mode}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to modify order {order_id}: {e}")
+            return False
+
+    def cancel_order(self, order_id: int) -> bool:
+        """Cancel a single order."""
+        if not self.is_connected():
+            return False
+
+        try:
+            trades = [t for t in self.ib.openTrades() if t.order.orderId == order_id]
+            if trades:
+                self.ib.cancelOrder(trades[0].order)
+                logger.info(f"Cancelled order {order_id}")
+                return True
+            logger.warning(f"Order {order_id} not found")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to cancel order {order_id}: {e}")
+            return False
+
+    def cancel_oca_group(self, oca_group: str) -> bool:
+        """Cancel all orders in an OCA group."""
+        if not self.is_connected():
+            return False
+
+        try:
+            cancelled = 0
+            for trade in self.ib.openTrades():
+                if trade.order.ocaGroup == oca_group:
+                    self.ib.cancelOrder(trade.order)
+                    cancelled += 1
+
+            if cancelled > 0:
+                logger.info(f"Cancelled {cancelled} orders in OCA group {oca_group}")
+            return cancelled > 0
+        except Exception as e:
+            logger.error(f"Failed to cancel OCA group {oca_group}: {e}")
+            return False
+
+    # =========================================================================
+    # HISTORICAL DATA
+    # =========================================================================
+
+    def fetch_historical_bars(
+        self,
+        con_id: int,
+        duration: str = "3 D",
+        bar_size: str = "3 mins",
+        what_to_show: str = "TRADES"
+    ) -> list[dict]:
+        """Fetch historical OHLC bars for a contract.
+
+        Args:
+            con_id: Contract ID
+            duration: Duration string (e.g., "3 D", "1 W", "1 M")
+            bar_size: Bar size (e.g., "3 mins", "5 mins", "1 hour")
+            what_to_show: Data type ("TRADES", "MIDPOINT", "BID", "ASK")
+
+        Returns:
+            List of dicts with: date, open, high, low, close, volume
+        """
+        if not self.is_connected():
+            logger.error("Cannot fetch historical data: not connected")
+            return []
+
+        if not self._loop:
+            logger.error("fetch_historical_bars: no event loop available")
+            return []
+
+        pos = self._positions.get(con_id)
+        if not pos or not pos.raw_contract:
+            logger.error(f"Position {con_id} not found")
+            return []
+
+        contract = pos.raw_contract
+
+        async def _fetch_async():
+            try:
+                bars = await self.ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime="",  # Now
+                    durationStr=duration,
+                    barSizeSetting=bar_size,
+                    whatToShow=what_to_show,
+                    useRTH=False,  # Include extended hours
+                    formatDate=1   # String format
+                )
+
+                if not bars:
+                    logger.warning(f"No historical data for {contract.symbol}")
+                    return []
+
+                result = []
+                for bar in bars:
+                    result.append({
+                        "date": bar.date.isoformat() if hasattr(bar.date, 'isoformat') else str(bar.date),
+                        "open": bar.open,
+                        "high": bar.high,
+                        "low": bar.low,
+                        "close": bar.close,
+                        "volume": bar.volume
+                    })
+
+                logger.info(f"Fetched {len(result)} historical bars for {contract.symbol}")
+                return result
+
+            except Exception as e:
+                logger.error(f"Async fetch error for {contract.symbol}: {e}")
+                return []
+
+        try:
+            # Schedule coroutine in broker's event loop and wait for result
+            future = asyncio.run_coroutine_threadsafe(_fetch_async(), self._loop)
+            return future.result(timeout=30)
+
+        except Exception as e:
+            logger.error(f"Failed to fetch historical data: {e}")
+            return []
+
+    def fetch_underlying_history(self, symbol: str, duration: str = "3 D", bar_size: str = "3 mins") -> list[dict]:
+        """Fetch historical data for underlying stock/index/future.
+
+        Args:
+            symbol: Symbol (e.g., "AAPL", "SPY", "SPX", "ES", "DAX")
+            duration: Duration string
+            bar_size: Bar size string
+
+        Returns:
+            List of OHLC bar dicts
+        """
+        if not self.is_connected():
+            logger.debug("fetch_underlying_history: not connected")
+            return []
+
+        if not self._loop:
+            logger.error("fetch_underlying_history: no event loop available")
+            return []
+
+        # Define async fetch logic
+        async def _fetch_async():
+            try:
+                # Detect contract type based on symbol
+                indices = {"SPX", "NDX", "RUT", "VIX", "DJX", "DAX", "ESTX50"}
+                futures = {"ES", "NQ", "YM", "RTY", "CL", "GC", "SI", "ZB", "ZN"}
+
+                if symbol in indices:
+                    # Index contract - use correct exchange
+                    if symbol == "DAX":
+                        contract = Index(symbol, "EUREX", "EUR")
+                    elif symbol in {"SPX", "NDX", "VIX", "RUT", "DJX"}:
+                        contract = Index(symbol, "CBOE", "USD")
+                    else:
+                        contract = Index(symbol, "EUREX", "EUR")
+                    await self.ib.qualifyContractsAsync(contract)
+
+                elif symbol in futures:
+                    # Future - get front month contract
+                    if symbol in {"ES", "NQ", "RTY"}:
+                        contract = Future(symbol, exchange="CME")
+                    elif symbol in {"CL", "GC", "SI"}:
+                        contract = Future(symbol, exchange="NYMEX")
+                    else:
+                        contract = Future(symbol, exchange="CME")
+
+                    contracts = await self.ib.reqContractDetailsAsync(contract)
+                    if contracts:
+                        # Get front month (first contract by expiry)
+                        contract = sorted(contracts, key=lambda c: c.contract.lastTradeDateOrContractMonth)[0].contract
+                        await self.ib.qualifyContractsAsync(contract)
+                    else:
+                        logger.warning(f"No future contracts found for {symbol}")
+                        return []
+                else:
+                    # Stock contract
+                    contract = Stock(symbol, "SMART", "USD")
+                    await self.ib.qualifyContractsAsync(contract)
+
+                logger.debug(f"Requesting historical data for {symbol} ({type(contract).__name__})")
+
+                bars = await self.ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime="",
+                    durationStr=duration,
+                    barSizeSetting=bar_size,
+                    whatToShow="TRADES",
+                    useRTH=False,
+                    formatDate=1
+                )
+
+                if not bars:
+                    logger.warning(f"No historical data returned for {symbol}")
+                    return []
+
+                result = []
+                for bar in bars:
+                    result.append({
+                        "date": bar.date.isoformat() if hasattr(bar.date, 'isoformat') else str(bar.date),
+                        "open": bar.open,
+                        "high": bar.high,
+                        "low": bar.low,
+                        "close": bar.close,
+                        "volume": bar.volume
+                    })
+
+                logger.info(f"Fetched {len(result)} underlying bars for {symbol}")
+                return result
+
+            except Exception as e:
+                logger.error(f"Async fetch error for {symbol}: {e}")
+                return []
+
+        try:
+            # Schedule coroutine in broker's event loop and wait for result
+            future = asyncio.run_coroutine_threadsafe(_fetch_async(), self._loop)
+            return future.result(timeout=30)  # 30 second timeout
+
+        except Exception as e:
+            logger.error(f"Failed to fetch underlying history for {symbol}: {e}")
+            return []
 
 
 # Global broker instance
