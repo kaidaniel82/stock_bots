@@ -1,6 +1,6 @@
 """Application state management."""
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Lock
 import reflex as rx
 import plotly.graph_objects as go
@@ -10,7 +10,8 @@ from .groups import GROUP_MANAGER, calculate_stop_price
 from .metrics import LegData, GroupMetrics, compute_group_metrics
 from .config import (
     UI_UPDATE_INTERVAL,
-    DEFAULT_TRAIL_PERCENT, DEFAULT_STOP_TYPE, DEFAULT_LIMIT_OFFSET
+    DEFAULT_TRAIL_PERCENT, DEFAULT_STOP_TYPE, DEFAULT_LIMIT_OFFSET,
+    BAR_INTERVAL_TICKS, CHART_RENDER_INTERVAL
 )
 from .logger import logger
 
@@ -103,29 +104,40 @@ class AppState(rx.State):
     status_message: str = "Ready"
     refresh_tick: int = 0  # Force UI refresh
 
-    # Price history for charts
-    group_price_history: dict[str, list[dict]] = {}
+    # === NEW: Unified Chart State (12h window, 240 x 3-min slots) ===
+    # chart_data: group_id -> {
+    #   "start_timestamp": float,     # Connect/create time
+    #   "current_slot": int,          # 0-239
+    #   "position_bars": list[240],   # OHLC bars (None or dict)
+    #   "pnl_bars": list[240],        # PnL bars (None or dict)
+    #   "current_pos": dict | None,   # Accumulator for current bar
+    #   "current_pnl": dict | None,   # Accumulator for current bar
+    # }
+    chart_data: dict[str, dict] = {}
 
-    # Chart data for monitor page
-    underlying_history: dict[str, list[dict]] = {}  # symbol -> OHLC bars (3D, 3min)
-    combo_history: dict[str, list[dict]] = {}       # group_id -> price bars
-    live_ticks: dict[str, list[dict]] = {}          # group_id -> rolling live data
-    position_price_ticks: dict[str, list[dict]] = {}  # group_id -> mid price rolling (1D, 3min equivalent)
-    _chart_loaded_for_group: str = ""               # Track which group has loaded chart data
+    # Pre-rendered Plotly figures (stored as Figure, NOT @rx.var!)
+    # Reflex serializes go.Figure to dict automatically
+    underlying_figure: go.Figure = go.Figure()
+    position_figure: go.Figure = go.Figure()
+    pnl_figure: go.Figure = go.Figure()
 
-    # === 12-Hour Charts with 3-min Aggregation ===
-    # P&L History: 12h window with extremum bundling (min for negative, max for positive)
-    pnl_history: dict[str, list[dict]] = {}         # group_id -> 3-min aggregated P&L bars
-    _pnl_current_bar: dict[str, dict] = {}          # Temp storage for current 3-min window
-
-    # Position OHLC: 12h history with real OHLC bars from tick aggregation
-    position_ohlc: dict[str, list[dict]] = {}       # group_id -> OHLC bars
-    _position_current_bar: dict[str, dict] = {}     # Temp storage for current 3-min OHLC
+    # Underlying history for Chart 1 (loaded from TWS)
+    underlying_history: dict[str, list[dict]] = {}  # symbol -> OHLC bars
 
     # UI State
     active_tab: str = "setup"  # "setup" or "monitor"
     delete_confirm_group_id: str = ""  # Group ID pending delete confirmation
     selected_group_id: str = ""  # Currently selected group in monitor tab
+
+    # === Chart Header Info (updated every render cycle) ===
+    # Position OHLC Header: Close, Stop, Limit, HWM
+    chart_pos_close: str = "-"
+    chart_pos_stop: str = "-"
+    chart_pos_limit: str = "-"
+    chart_pos_hwm: str = "-"
+    # P&L History Header: Current P&L, Stop P&L
+    chart_pnl_current: str = "-"
+    chart_pnl_stop: str = "-"
 
     @rx.var
     def position_rows(self) -> list[list[str]]:
@@ -326,23 +338,31 @@ class AppState(rx.State):
         logger.info(f"create_group: after refresh, positions={len(self.positions)}")
         self._load_groups_from_manager()
         logger.info(f"create_group: after _load_groups, positions={len(self.positions)}")
-        # Reflex requires full reassignment, not in-place modification
-        new_history = dict(self.group_price_history)
-        new_history[group.id] = []
-        self.group_price_history = new_history
+
+        # Initialize chart state for new group
+        self._init_chart_state(group.id)
+
         self.selected_quantities = {}
         self.new_group_name = ""
         self.status_message = f"Group '{group.name}' created"
         logger.info(f"create_group: DONE, final positions={len(self.positions)}")
 
-    def _load_groups_from_manager(self):
-        """Load groups from GroupManager into state for UI."""
+    def _load_groups_from_manager(self, metrics_cache: dict = None):
+        """Load groups from GroupManager into state for UI.
+
+        Args:
+            metrics_cache: Optional dict of pre-computed metrics {group_id: metrics}
+                          to avoid double computation in tick_update()
+        """
         self.groups = []
         for g in GROUP_MANAGER.get_all():
             # Calculate current value (simple)
             value = self._calc_group_value(g.con_ids)
-            # Calculate detailed metrics with allocated quantities
-            metrics = self._calc_group_metrics(g.con_ids, g.position_quantities)
+            # Use cached metrics if available, otherwise compute
+            if metrics_cache and g.id in metrics_cache:
+                metrics = metrics_cache[g.id]
+            else:
+                metrics = self._calc_group_metrics(g.con_ids, g.position_quantities)
             # Calculate total allocated quantity
             total_allocated_qty = sum(g.position_quantities.values())
 
@@ -375,10 +395,11 @@ class AppState(rx.State):
                 "time_exit_time": g.time_exit_time,
                 # Runtime state
                 "is_active": g.is_active,
-                "high_water_mark": g.high_water_mark,
-                "hwm_str": f"${g.high_water_mark:.2f}",
-                "stop_price": g.stop_price,
-                "stop_str": f"${g.stop_price:.2f}",
+                # HWM and Stop from chart_data (mid-based) or fallback to metrics mid_value
+                "high_water_mark": self._get_group_hwm_mid(g.id, metrics.get("mid_value", 0)),
+                "hwm_str": f"${self._get_group_hwm_mid(g.id, metrics.get('mid_value', 0)):.2f}",
+                "stop_price": self._get_group_stop_mid(g.id, g.trail_mode, g.trail_value, metrics.get("mid_value", 0)),
+                "stop_str": f"${self._get_group_stop_mid(g.id, g.trail_mode, g.trail_value, metrics.get('mid_value', 0)):.2f}",
                 "current_value": value,
                 "value_str": f"${value:.2f}",
                 # Metrics - Legs info
@@ -415,6 +436,21 @@ class AppState(rx.State):
                 # Use net_value which already includes multiplier
                 total += pos["net_value"]
         return round(total, 2)
+
+    def _get_group_hwm_mid(self, group_id: str, fallback_mid: float = 0) -> float:
+        """Get mid-based HWM from chart_data, or fallback to current mid_value."""
+        if group_id in self.chart_data:
+            hwm = self.chart_data[group_id].get("current_hwm_mid", 0)
+            if hwm > 0:
+                return hwm
+        return fallback_mid
+
+    def _get_group_stop_mid(self, group_id: str, trail_mode: str, trail_value: float, fallback_mid: float = 0) -> float:
+        """Get mid-based stop price from chart_data HWM."""
+        hwm_mid = self._get_group_hwm_mid(group_id, fallback_mid)
+        if hwm_mid > 0:
+            return calculate_stop_price(hwm_mid, trail_mode, trail_value)
+        return 0.0
 
     def _calc_group_metrics(self, con_ids: list[int], position_quantities: dict = None) -> dict:
         """Calculate detailed metrics for a group.
@@ -524,10 +560,10 @@ class AppState(rx.State):
         # Sync connection state and refresh positions
         self._sync_broker_state()
         self._load_groups_from_manager()
-        # Reflex requires full reassignment, not in-place modification
-        if group_id in self.group_price_history:
-            new_history = {k: v for k, v in self.group_price_history.items() if k != group_id}
-            self.group_price_history = new_history
+        # Remove chart data for deleted group
+        if group_id in self.chart_data:
+            new_data = {k: v for k, v in self.chart_data.items() if k != group_id}
+            self.chart_data = new_data
         self.status_message = "Group deleted"
 
     def toggle_group_active(self, group_id: str):
@@ -818,16 +854,25 @@ class AppState(rx.State):
         logger.info("Monitoring stop requested")
 
     def tick_update(self, _=None):
-        """Called by frontend interval - refresh positions and force UI update."""
-        # Always sync connection status from broker (may have changed async)
+        """Called by frontend interval - refresh positions and force UI update.
+
+        New optimized version:
+        - Metrics cached to avoid double computation
+        - Chart accumulation every tick (in-place)
+        - Bar completion every 3 min (BAR_INTERVAL_TICKS)
+        - Chart rendering every 1 sec (CHART_RENDER_INTERVAL)
+        """
+        # 1. Sync connection status from broker
         broker_connected = BROKER.is_connected()
         if broker_connected != self.is_connected:
             self.is_connected = broker_connected
             if broker_connected:
                 self.connection_status = "Connected"
                 self.is_monitoring = True
-                self.status_message = f"Connected - refreshing positions..."
-                # Load chart data if a group was selected before connection
+                self.status_message = "Connected - refreshing positions..."
+                # Initialize chart states for all groups
+                self._init_all_chart_states()
+                # Load underlying history if group selected
                 if self.selected_group_id:
                     self._load_group_chart_data(self.selected_group_id)
             else:
@@ -836,183 +881,58 @@ class AppState(rx.State):
         if not self.is_connected or not self.is_monitoring:
             return
 
+        # 2. Refresh positions (necessary for price data)
         self._refresh_positions()
         self.refresh_tick += 1
-
-        # Load chart data once positions are available (deferred loading) - only once per group
-        if self.selected_group_id and self.positions and self._chart_loaded_for_group != self.selected_group_id:
-            group = GROUP_MANAGER.get(self.selected_group_id)
-            if group:
-                symbol = self.selected_underlying_symbol
-                if symbol and symbol not in self.underlying_history:
-                    logger.info(f"Deferred chart loading for {symbol}")
-                    self._load_group_chart_data(self.selected_group_id)
-                    self._chart_loaded_for_group = self.selected_group_id
 
         now = datetime.now()
         now_str = now.strftime("%H:%M:%S")
         self.status_message = f"Monitoring... ({now_str})"
 
-        # Update live_ticks for Chart C (rolling window of ~120 data points = ~1 min at 0.5s interval)
-        new_live_ticks = dict(self.live_ticks)
-        new_position_ticks = dict(self.position_price_ticks)
-        new_pnl_history = dict(self.pnl_history)
-        new_position_ohlc = dict(self.position_ohlc)
-
-        # 3-min bar aggregation: 360 ticks at 0.5s = 3 minutes
-        # Use 36 for faster demo (18 seconds = one bar)
-        BAR_INTERVAL = 36  # Change to 360 for production 3-min bars
-        is_bar_complete = (self.refresh_tick % BAR_INTERVAL) == 0 and self.refresh_tick > 0
-
-        # Update groups via GroupManager
+        # 3. Process all groups with metrics cache
+        metrics_cache = {}
         for g in GROUP_MANAGER.get_all():
             value = self._calc_group_value(g.con_ids)
             metrics = self._calc_group_metrics(g.con_ids, g.position_quantities)
-            pnl = metrics["pnl_mark"]
-            mid = metrics["mid_value"]
+            metrics_cache[g.id] = metrics
 
-            # Record live tick for oscillator chart (every tick)
-            if g.id not in new_live_ticks:
-                new_live_ticks[g.id] = []
-            ticks = list(new_live_ticks[g.id])
-            ticks.append({
-                "time": now_str,
-                "timestamp": now.timestamp(),
-                "mark": metrics["mark_value"],
-                "pnl": pnl,
-                "stop_price": g.stop_price,
-                "hwm": g.high_water_mark,
-            })
-            # Keep rolling window of 120 ticks (~1 min)
-            if len(ticks) > 120:
-                ticks = ticks[-120:]
-            new_live_ticks[g.id] = ticks
+            # Accumulate tick into current bar (in-place, fast)
+            self._accumulate_tick(g.id, metrics)
 
-            # === P&L EXTREMUM AGGREGATION (for pnl_history) ===
-            # Track min/max during the 3-min window
-            if g.id not in self._pnl_current_bar:
-                self._pnl_current_bar[g.id] = {"pnl_min": pnl, "pnl_max": pnl, "stop": g.stop_price}
-            current_pnl = self._pnl_current_bar[g.id]
-            current_pnl["pnl_min"] = min(current_pnl["pnl_min"], pnl)
-            current_pnl["pnl_max"] = max(current_pnl["pnl_max"], pnl)
-            current_pnl["stop"] = g.stop_price
-
-            # === POSITION OHLC AGGREGATION ===
-            if g.id not in self._position_current_bar:
-                self._position_current_bar[g.id] = {
-                    "open": mid, "high": mid, "low": mid, "close": mid,
-                    "stop": g.stop_price
-                }
-            current_ohlc = self._position_current_bar[g.id]
-            current_ohlc["high"] = max(current_ohlc["high"], mid)
-            current_ohlc["low"] = min(current_ohlc["low"], mid)
-            current_ohlc["close"] = mid
-            current_ohlc["stop"] = g.stop_price
-
-            # === BAR COMPLETION: Emit 3-min aggregated bars ===
-            if is_bar_complete:
-                # P&L History bar: use extremum (min if negative, max if positive)
-                extremum_pnl = current_pnl["pnl_min"] if pnl < 0 else current_pnl["pnl_max"]
-                if g.id not in new_pnl_history:
-                    new_pnl_history[g.id] = []
-                pnl_bars = list(new_pnl_history[g.id])
-                pnl_bars.append({
-                    "time": now_str,
-                    "timestamp": now.timestamp(),
-                    "pnl": extremum_pnl,
-                    "stop_price": current_pnl["stop"],
-                })
-                # 12h window: 240 bars at 3-min = 12 hours
-                if len(pnl_bars) > 240:
-                    pnl_bars = pnl_bars[-240:]
-                new_pnl_history[g.id] = pnl_bars
-
-                # Position OHLC bar
-                if g.id not in new_position_ohlc:
-                    new_position_ohlc[g.id] = []
-                ohlc_bars = list(new_position_ohlc[g.id])
-                ohlc_bars.append({
-                    "time": now_str,
-                    "timestamp": now.timestamp(),
-                    "open": current_ohlc["open"],
-                    "high": current_ohlc["high"],
-                    "low": current_ohlc["low"],
-                    "close": current_ohlc["close"],
-                    "stop_price": current_ohlc["stop"],
-                })
-                # 12h window: 240 bars
-                if len(ohlc_bars) > 240:
-                    ohlc_bars = ohlc_bars[-240:]
-                new_position_ohlc[g.id] = ohlc_bars
-
-                # Reset current bars for next window
-                self._pnl_current_bar[g.id] = {"pnl_min": pnl, "pnl_max": pnl, "stop": g.stop_price}
-                self._position_current_bar[g.id] = {
-                    "open": mid, "high": mid, "low": mid, "close": mid,
-                    "stop": g.stop_price
-                }
-
-            # Record position price tick for legacy Chart B (every ~6 sec for backwards compat)
-            record_position_tick = (self.refresh_tick % 12) == 0
-            if record_position_tick:
-                if g.id not in new_position_ticks:
-                    new_position_ticks[g.id] = []
-                pos_ticks = list(new_position_ticks[g.id])
-                pos_ticks.append({
-                    "time": now_str,
-                    "timestamp": now.timestamp(),
-                    "mid": mid,
-                    "mark": metrics["mark_value"],
-                    "bid": metrics["spread_bid"],
-                    "ask": metrics["spread_ask"],
-                    "stop_price": g.stop_price,
-                })
-                # Keep max 200 ticks
-                if len(pos_ticks) > 200:
-                    pos_ticks = pos_ticks[-200:]
-                new_position_ticks[g.id] = pos_ticks
-
+            # Check stop trigger for active groups
             if g.is_active:
-                # Update HWM if value increased
                 GROUP_MANAGER.update_hwm(g.id, value)
-
-                # Check if stop triggered
                 if GROUP_MANAGER.check_stop_triggered(g.id, value):
                     self.status_message = f"STOP TRIGGERED: {g.name} at ${value:.2f}!"
                     GROUP_MANAGER.deactivate(g.id)
-                    # Optional: Auto-remove group when triggered
-                    # GROUP_MANAGER.remove_if_order_triggered(g.id)
 
-        self.live_ticks = new_live_ticks
-        self.position_price_ticks = new_position_ticks
-        self.pnl_history = new_pnl_history
-        self.position_ohlc = new_position_ohlc
+        # 4. Bar completion every 3 min (BAR_INTERVAL_TICKS = 360)
+        if self.refresh_tick > 0 and (self.refresh_tick % BAR_INTERVAL_TICKS) == 0:
+            self._complete_bars()
 
-        # === UNDERLYING CHART LIVE UPDATE ===
-        # Fetch latest underlying bar every 3 minutes (on bar complete)
-        if is_bar_complete and self.selected_group_id:
-            symbol = self.selected_underlying_symbol
-            if symbol and symbol in self.underlying_history:
-                new_bar = BROKER.fetch_latest_underlying_bar(symbol)
-                if new_bar:
-                    new_hist = dict(self.underlying_history)
-                    bars = list(new_hist.get(symbol, []))
-                    # Check if this is a new bar (different time) or update existing
-                    if bars and bars[-1].get("date") == new_bar.get("date"):
-                        # Update existing bar (price may have changed)
-                        bars[-1] = new_bar
-                    else:
-                        # Append new bar
-                        bars.append(new_bar)
-                        # Keep last 3 days worth (~480 bars for 3-min bars)
-                        if len(bars) > 500:
-                            bars = bars[-500:]
-                    new_hist[symbol] = bars
-                    self.underlying_history = new_hist
-                    logger.debug(f"Updated underlying chart for {symbol}, now {len(bars)} bars")
+            # Update underlying history on bar completion
+            if self.selected_group_id:
+                symbol = self.selected_underlying_symbol
+                if symbol and symbol in self.underlying_history:
+                    new_bar = BROKER.fetch_latest_underlying_bar(symbol)
+                    if new_bar:
+                        new_hist = dict(self.underlying_history)
+                        bars = list(new_hist.get(symbol, []))
+                        if bars and bars[-1].get("date") == new_bar.get("date"):
+                            bars[-1] = new_bar
+                        else:
+                            bars.append(new_bar)
+                            if len(bars) > 500:
+                                bars = bars[-500:]
+                        new_hist[symbol] = bars
+                        self.underlying_history = new_hist
 
-        # Reload groups to reflect changes
-        self._load_groups_from_manager()
+        # 5. Chart rendering every 1 sec (CHART_RENDER_INTERVAL = 2 ticks)
+        if (self.refresh_tick % CHART_RENDER_INTERVAL) == 0 and self.selected_group_id:
+            self._render_all_charts()
+
+        # 6. Reload groups with cached metrics (no double computation)
+        self._load_groups_from_manager(metrics_cache)
 
     # === UI Navigation ===
 
@@ -1024,13 +944,18 @@ class AppState(rx.State):
         """Select a group in monitor view and load chart data."""
         logger.info(f"select_group called with group_id={group_id}")
         self.selected_group_id = group_id
-        # Only reload chart data if this is a different group
-        if self._chart_loaded_for_group != group_id:
-            self._load_group_chart_data(group_id)
-            self._chart_loaded_for_group = group_id
+        # Initialize chart state if not exists
+        if group_id not in self.chart_data:
+            self._init_chart_state(group_id)
+        # Load underlying history for Chart 1
+        self._load_group_chart_data(group_id)
 
     def _load_group_chart_data(self, group_id: str):
-        """Load historical chart data for a group."""
+        """Load underlying historical chart data for a group.
+
+        Note: Position and PnL charts collect data from connect time,
+        so we only load the underlying history here.
+        """
         group = GROUP_MANAGER.get(group_id)
         logger.info(f"_load_group_chart_data: group={group}, is_connected={self.is_connected}")
         if not group or not self.is_connected:
@@ -1057,14 +982,17 @@ class AppState(rx.State):
                     self.underlying_history = new_hist
                     logger.info(f"Loaded {len(bars)} underlying bars for {symbol}")
 
-            # Fetch combo/position history for each leg
-            for con_id in group.con_ids:
-                if str(con_id) not in self.combo_history:
-                    bars = BROKER.fetch_historical_bars(con_id, "3 D", "3 mins", "MIDPOINT")
-                    if bars:
-                        new_hist = dict(self.combo_history)
-                        new_hist[str(con_id)] = bars
-                        self.combo_history = new_hist
+    # NOTE: _build_position_ohlc_from_history and _build_pnl_history_from_position
+    # are no longer used - data is collected from connect time using _accumulate_tick
+
+    # Placeholder for backwards compatibility (remove if not referenced elsewhere)
+    def _build_position_ohlc_from_history(self, group, all_leg_bars: dict[int, list[dict]]):
+        """DEPRECATED: Position OHLC now collected live from connect time."""
+        pass
+
+    def _build_pnl_history_from_position(self, group):
+        """DEPRECATED: PnL history now collected live from connect time."""
+        pass
 
     @rx.var
     def selected_underlying_symbol(self) -> str:
@@ -1080,116 +1008,621 @@ class AppState(rx.State):
                 return p["symbol"]
         return ""
 
-    @rx.var
-    def position_candlestick_figure(self) -> go.Figure:
-        """Generate Plotly candlestick chart for position OHLC data."""
-        # Access refresh_tick to trigger re-computation
-        _ = self.refresh_tick
+    # === Chart Rendering Methods (NOT @rx.var - controlled updates) ===
 
-        data = self.position_ohlc.get(self.selected_group_id, [])
-        if not data:
-            # Return empty figure with message
-            fig = go.Figure()
-            fig.add_annotation(
-                text="Collecting OHLC data...",
-                xref="paper", yref="paper",
-                x=0.5, y=0.5, showarrow=False,
-                font=dict(size=14, color="#888")
-            )
-            fig.update_layout(
-                height=200,
-                margin=dict(l=50, r=20, t=20, b=30),
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(30,30,30,0.8)',
-                xaxis=dict(visible=False),
-                yaxis=dict(visible=False),
-            )
-            return fig
+    def _empty_figure(self, message: str) -> go.Figure:
+        """Return empty placeholder chart as dict."""
+        fig = go.Figure()
+        fig.add_annotation(
+            text=message,
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="#888")
+        )
+        fig.update_layout(
+            height=200,
+            margin=dict(l=5, r=50, t=5, b=10),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(30,30,30,0.8)',
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+        )
+        return fig
 
-        # Create candlestick chart
+    def _generate_12h_labels(self, start_timestamp: float) -> list[str]:
+        """Generate 240 time labels for fixed 12h X-axis."""
+        labels = []
+        start_dt = datetime.fromtimestamp(start_timestamp)
+        for i in range(240):
+            dt = start_dt + timedelta(minutes=i * 3)
+            labels.append(dt.strftime("%H:%M"))
+        return labels
+
+    def _slot_to_time_label(self, start_timestamp: float, slot: int) -> str:
+        """Convert slot index to time label matching categoryarray."""
+        start_dt = datetime.fromtimestamp(start_timestamp)
+        dt = start_dt + timedelta(minutes=slot * 3)
+        return dt.strftime("%H:%M")
+
+    def _init_chart_state(self, group_id: str):
+        """Initialize 240-slot chart arrays for a group."""
+        import time
+        # HWM starts at 0 - will be set from first mid_value tick
+        # (old HWM in GROUP_MANAGER is net value, we track mid_price here)
+
+        state = {
+            "start_timestamp": time.time(),
+            "current_slot": 0,
+            "tick_count": 0,  # Ticks since last bar completion
+            "position_bars": [None] * 240,  # OHLC bars
+            "pnl_bars": [None] * 240,  # PnL bars
+            "hwm_bars": [None] * 240,  # HWM per slot for visualization
+            "stop_bars": [None] * 240,  # Stop price per slot for visualization
+            "limit_bars": [None] * 240,  # Limit price per slot for visualization
+            "stop_pnl_bars": [None] * 240,  # Stop P&L per slot for visualization
+            "current_pos": None,  # Accumulator for current position bar
+            "current_pnl": None,  # Accumulator for current PnL bar
+            "current_hwm_mid": 0.0,  # Track HWM as mid_price (for Position OHLC)
+        }
+        new_data = dict(self.chart_data)
+        new_data[group_id] = state
+        self.chart_data = new_data
+        logger.info(f"Initialized chart state for group {group_id}")
+
+    def _init_all_chart_states(self):
+        """Initialize chart state for all groups at connect."""
+        for g in GROUP_MANAGER.get_all():
+            if g.id not in self.chart_data:
+                self._init_chart_state(g.id)
+
+    def _accumulate_tick(self, group_id: str, metrics: dict):
+        """Accumulate tick into current bar (in-place update).
+
+        Also implements the trailing mechanism:
+        - Track HWM (High Water Mark) which only moves UP
+        - Calculate stop price based on trail settings
+        - Update GROUP_MANAGER with new HWM (for persistence)
+        """
+        mid = metrics.get("mid_value", 0)
+        pnl = metrics.get("pnl_mark", 0)
+
+        # Skip if no valid mid value (positions not loaded yet)
+        if mid == 0:
+            return
+
+        if group_id not in self.chart_data:
+            self._init_chart_state(group_id)
+
+        state = self.chart_data[group_id]
+
+        # Position OHLC accumulator
+        if state["current_pos"] is None:
+            state["current_pos"] = {"open": mid, "high": mid, "low": mid, "close": mid}
+        else:
+            state["current_pos"]["high"] = max(state["current_pos"]["high"], mid)
+            state["current_pos"]["low"] = min(state["current_pos"]["low"], mid)
+            state["current_pos"]["close"] = mid
+
+        # PnL accumulator (track extremum) - PnL can be 0 or negative, so always update
+        if state["current_pnl"] is None:
+            state["current_pnl"] = {"pnl_min": pnl, "pnl_max": pnl, "close": pnl}
+        else:
+            state["current_pnl"]["pnl_min"] = min(state["current_pnl"]["pnl_min"], pnl)
+            state["current_pnl"]["pnl_max"] = max(state["current_pnl"]["pnl_max"], pnl)
+            state["current_pnl"]["close"] = pnl
+
+        # === TRAILING MECHANISM ===
+        # Track HWM as mid_price (for Position OHLC chart visualization)
+        current_hwm_mid = state.get("current_hwm_mid", 0)
+        if mid > current_hwm_mid:
+            # New high water mark (mid-price based)!
+            state["current_hwm_mid"] = mid
+            logger.debug(f"Trailing: HWM mid updated ${current_hwm_mid:.2f} -> ${mid:.2f}")
+
+        # === LIVE UPDATE: Store current HWM/Stop/Limit in current slot ===
+        # This creates the time-series history for visualization
+        slot = state["current_slot"]
+        time_label = self._slot_to_time_label(state["start_timestamp"], slot)
+        hwm_mid = state.get("current_hwm_mid", 0)
+
+        if hwm_mid > 0:
+            # Get group settings for stop calculation
+            group = GROUP_MANAGER.get(group_id)
+            if group:
+                stop_mid = calculate_stop_price(hwm_mid, group.trail_mode, group.trail_value)
+                state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm_mid}
+                state["stop_bars"][slot] = {"time": time_label, "stop": stop_mid}
+
+                # Limit price (only for limit orders)
+                if group.stop_type == "limit":
+                    limit_mid = stop_mid - group.limit_offset
+                    state["limit_bars"][slot] = {"time": time_label, "limit": limit_mid}
+
+                # Stop P&L calculation (for P&L chart)
+                # Convert stop_mid to P&L: What would P&L be if mid dropped to stop_mid?
+                total_cost = metrics.get("total_cost", 0)
+                mid_value = metrics.get("mid_value", 0)
+                pnl_mark = metrics.get("pnl_mark", 0)
+
+                if total_cost > 0:
+                    # stop_mid is already a VALUE (not price), so stop_pnl is simply:
+                    stop_pnl = stop_mid - total_cost
+                    state["stop_pnl_bars"][slot] = {"time": time_label, "stop_pnl": stop_pnl}
+
+        state["tick_count"] += 1
+
+    def _complete_bars(self):
+        """Finalize bars, store, advance slot (called every 3 min)."""
+        for group_id, state in self.chart_data.items():
+            slot = state["current_slot"]
+            # Calculate time label from slot (matches categoryarray!)
+            time_label = self._slot_to_time_label(state["start_timestamp"], slot)
+
+            # Finalize position bar
+            if state["current_pos"]:
+                state["position_bars"][slot] = {
+                    "time": time_label,
+                    "open": state["current_pos"]["open"],
+                    "high": state["current_pos"]["high"],
+                    "low": state["current_pos"]["low"],
+                    "close": state["current_pos"]["close"],
+                }
+
+            # Finalize PnL bar (use extremum: min if negative, max if positive)
+            if state["current_pnl"]:
+                pnl_close = state["current_pnl"]["close"]
+                extremum = state["current_pnl"]["pnl_min"] if pnl_close < 0 else state["current_pnl"]["pnl_max"]
+                state["pnl_bars"][slot] = {
+                    "time": time_label,
+                    "pnl": extremum,
+                }
+
+            # Finalize HWM and Stop bars for historical visualization (mid-price based)
+            group = GROUP_MANAGER.get(group_id)
+            if group:
+                hwm_mid = state.get("current_hwm_mid", 0)
+                if hwm_mid > 0:
+                    stop_mid = calculate_stop_price(hwm_mid, group.trail_mode, group.trail_value)
+                    state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm_mid}
+                    state["stop_bars"][slot] = {"time": time_label, "stop": stop_mid}
+
+            # Advance slot (wrap around at 240)
+            state["current_slot"] = (slot + 1) % 240
+            state["tick_count"] = 0
+
+            # Reset accumulators for next bar
+            state["current_pos"] = None
+            state["current_pnl"] = None
+
+        # Trigger state update
+        self.chart_data = dict(self.chart_data)
+
+    def _render_all_charts(self):
+        """Render all 3 charts for selected group (called every 1 second)."""
+        if not self.selected_group_id:
+            self.position_figure = self._empty_figure("Select a group")
+            self.pnl_figure = self._empty_figure("Select a group")
+            self.underlying_figure = self._empty_figure("Select a group")
+            return
+
+        group_id = self.selected_group_id
+        if group_id not in self.chart_data:
+            self._init_chart_state(group_id)
+
+        state = self.chart_data[group_id]
+
+        # Get group data for stop/limit visualization
+        group = GROUP_MANAGER.get(group_id)
+        group_info = None
+        if group:
+            # Get mid-price based HWM from chart state
+            hwm_mid = state.get("current_hwm_mid", 0)
+            # Calculate stop price based on mid-price HWM
+            stop_mid = calculate_stop_price(hwm_mid, group.trail_mode, group.trail_value) if hwm_mid > 0 else 0
+
+            # Get metrics for P&L calculation
+            metrics = self._calc_group_metrics(group.con_ids, group.position_quantities)
+
+            group_info = {
+                # Position OHLC uses mid-price based values
+                "stop_price": stop_mid,  # Stop as mid-price
+                "high_water_mark": hwm_mid,  # HWM as mid-price
+                "trail_mode": group.trail_mode,
+                "trail_value": group.trail_value,
+                "stop_type": group.stop_type,
+                "limit_offset": group.limit_offset,
+                # P&L chart calculation values
+                "total_cost": metrics.get("total_cost", 0.0),
+                "pnl_mark": metrics.get("pnl_mark", 0.0),
+                "mid_value": metrics.get("mid_value", 0.0),  # For stop_pnl calculation
+            }
+
+        # Render position chart with stop/limit lines
+        self.position_figure = self._render_position_chart(state, group_info)
+
+        # Render PnL chart with stop line
+        self.pnl_figure = self._render_pnl_chart(state, group_info)
+
+        # Render underlying chart
+        self.underlying_figure = self._render_underlying_chart()
+
+        # === Update chart header info ===
+        if group_info:
+            # Position OHLC header: Close, Stop, Limit, HWM
+            mid_value = group_info.get("mid_value", 0)
+            stop_mid = group_info.get("stop_price", 0)
+            hwm_mid = group_info.get("high_water_mark", 0)
+            limit_offset = group_info.get("limit_offset", 0)
+            stop_type = group_info.get("stop_type", "market")
+
+            self.chart_pos_close = f"${mid_value:.2f}" if mid_value > 0 else "-"
+            self.chart_pos_stop = f"${stop_mid:.2f}" if stop_mid > 0 else "-"
+            self.chart_pos_hwm = f"${hwm_mid:.2f}" if hwm_mid > 0 else "-"
+            if stop_type == "limit" and stop_mid > 0:
+                limit_price = stop_mid - limit_offset
+                self.chart_pos_limit = f"${limit_price:.2f}"
+            else:
+                self.chart_pos_limit = "-"
+
+            # P&L History header: Current P&L, Stop P&L
+            pnl_mark = group_info.get("pnl_mark", 0)
+            total_cost = group_info.get("total_cost", 0)
+            self.chart_pnl_current = f"${pnl_mark:.2f}" if pnl_mark != 0 else "$0.00"
+
+            # Calculate stop P&L: stop_mid is already a VALUE, so stop_pnl = stop_mid - total_cost
+            if stop_mid > 0 and total_cost > 0:
+                stop_pnl = stop_mid - total_cost
+                self.chart_pnl_stop = f"${stop_pnl:.2f}"
+            else:
+                self.chart_pnl_stop = "-"
+        else:
+            # Reset headers
+            self.chart_pos_close = "-"
+            self.chart_pos_stop = "-"
+            self.chart_pos_limit = "-"
+            self.chart_pos_hwm = "-"
+            self.chart_pnl_current = "-"
+            self.chart_pnl_stop = "-"
+
+    def _render_position_chart(self, state: dict, group_info: dict = None) -> go.Figure:
+        """Render position candlestick chart including current (incomplete) bar.
+
+        Args:
+            state: Chart state with bars and current accumulators
+            group_info: Group data for stop/limit visualization:
+                - stop_price: Current stop price
+                - high_water_mark: Current HWM
+                - stop_type: "market" or "limit"
+                - limit_offset: Offset for limit orders
+        """
+        # Generate fixed 12h x-axis labels (all 240 slots)
+        x_labels = self._generate_12h_labels(state["start_timestamp"])
+
+        # Build arrays for ALL 240 slots (None for empty)
+        open_vals = [None] * 240
+        high_vals = [None] * 240
+        low_vals = [None] * 240
+        close_vals = [None] * 240
+
+        # Fill in completed bars
+        for i, bar in enumerate(state["position_bars"]):
+            if bar is not None:
+                open_vals[i] = bar["open"]
+                high_vals[i] = bar["high"]
+                low_vals[i] = bar["low"]
+                close_vals[i] = bar["close"]
+
+        # Add current (incomplete) bar at current_slot
+        slot = state["current_slot"]
+        if state["current_pos"]:
+            open_vals[slot] = state["current_pos"]["open"]
+            high_vals[slot] = state["current_pos"]["high"]
+            low_vals[slot] = state["current_pos"]["low"]
+            close_vals[slot] = state["current_pos"]["close"]
+
+        # Check if we have any data
+        if all(v is None for v in close_vals):
+            return self._empty_figure("Collecting OHLC data...")
+
+        # Create candlestick chart with ALL 240 x values
         fig = go.Figure(data=[go.Candlestick(
-            x=[d["time"] for d in data],
-            open=[d["open"] for d in data],
-            high=[d["high"] for d in data],
-            low=[d["low"] for d in data],
-            close=[d["close"] for d in data],
-            increasing_line_color='#00C805',  # Green
-            decreasing_line_color='#FF5252',  # Red
+            x=x_labels,  # All 240 labels
+            open=open_vals,
+            high=high_vals,
+            low=low_vals,
+            close=close_vals,
+            increasing_line_color='#00C805',
+            decreasing_line_color='#FF5252',
             increasing_fillcolor='#00C805',
             decreasing_fillcolor='#FF5252',
-            name="Price",
+            name="Position",
         )])
 
-        # Add stop price line
-        stop_prices = [d.get("stop_price", 0) for d in data]
-        if any(sp > 0 for sp in stop_prices):
+        # === HISTORICAL LINES: Stop, Limit, HWM as time-series ===
+        # Build arrays from historical bars + extend to future with current value
+
+        # Get current values for extending into future
+        current_hwm = state.get("current_hwm_mid", 0)
+        current_stop = 0
+        current_limit = 0
+        if group_info:
+            current_stop = group_info.get("stop_price", 0)
+            if group_info.get("stop_type") == "limit":
+                current_limit = current_stop - group_info.get("limit_offset", 0)
+
+        # HWM line (green dotted)
+        hwm_vals = [None] * 240
+        for i, bar in enumerate(state.get("hwm_bars", [])):
+            if bar is not None:
+                hwm_vals[i] = bar.get("hwm")
+        # Fill future slots with current value
+        for i in range(slot + 1, 240):
+            if current_hwm > 0:
+                hwm_vals[i] = current_hwm
+
+        if any(v is not None for v in hwm_vals):
             fig.add_trace(go.Scatter(
-                x=[d["time"] for d in data],
-                y=stop_prices,
+                x=x_labels,
+                y=hwm_vals,
                 mode='lines',
-                line=dict(color='#FF5252', width=2, dash='dash'),
-                name='Stop Price',
+                line=dict(color='rgba(0, 200, 5, 0.6)', width=2),
+                name='HWM',
+                hovertemplate='HWM: $%{y:.2f}<extra></extra>',
             ))
+
+        # Stop line (red solid, semi-transparent)
+        stop_vals = [None] * 240
+        for i, bar in enumerate(state.get("stop_bars", [])):
+            if bar is not None:
+                stop_vals[i] = bar.get("stop")
+        # Fill future slots with current value
+        for i in range(slot + 1, 240):
+            if current_stop > 0:
+                stop_vals[i] = current_stop
+
+        if any(v is not None for v in stop_vals):
+            fig.add_trace(go.Scatter(
+                x=x_labels,
+                y=stop_vals,
+                mode='lines',
+                line=dict(color='rgba(255, 82, 82, 0.7)', width=2),
+                name='Stop',
+                hovertemplate='Stop: $%{y:.2f}<extra></extra>',
+            ))
+
+        # Limit line (orange solid, semi-transparent) - only if limit order type
+        limit_vals = []  # Initialize empty, will be populated if limit order
+        if group_info and group_info.get("stop_type") == "limit":
+            limit_vals = [None] * 240
+            for i, bar in enumerate(state.get("limit_bars", [])):
+                if bar is not None:
+                    limit_vals[i] = bar.get("limit")
+            # Fill future slots with current value
+            for i in range(slot + 1, 240):
+                if current_limit > 0:
+                    limit_vals[i] = current_limit
+
+            if any(v is not None for v in limit_vals):
+                fig.add_trace(go.Scatter(
+                    x=x_labels,
+                    y=limit_vals,
+                    mode='lines',
+                    line=dict(color='rgba(255, 165, 0, 0.6)', width=2),
+                    name='Limit',
+                    hovertemplate='Limit: $%{y:.2f}<extra></extra>',
+                ))
+
+        # Calculate stable Y-range with 10% padding
+        all_y_vals = [v for v in low_vals + high_vals + hwm_vals + stop_vals + limit_vals if v is not None]
+        if all_y_vals:
+            y_min = min(all_y_vals)
+            y_max = max(all_y_vals)
+            y_padding = (y_max - y_min) * 0.1 if y_max > y_min else 1.0
+            y_range = [y_min - y_padding, y_max + y_padding]
+        else:
+            y_range = None
 
         fig.update_layout(
             xaxis_rangeslider_visible=False,
-            height=200,
-            margin=dict(l=50, r=20, t=20, b=30),
+            height=230,
+            margin=dict(l=5, r=50, t=0, b=25),
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(30,30,30,0.8)',
+            uirevision='position_chart',  # Prevents axis reset on data update
             xaxis=dict(
+                type='category',
+                categoryorder='array',
+                categoryarray=x_labels,  # Fixed 12h axis
                 showgrid=True,
                 gridcolor='rgba(100,100,100,0.3)',
-                tickfont=dict(size=10, color='#888'),
+                tickfont=dict(size=10, color='#ccc', family='Arial Black, sans-serif'),
+                tickangle=-25,
+                nticks=24,
             ),
             yaxis=dict(
                 showgrid=True,
                 gridcolor='rgba(100,100,100,0.3)',
-                tickfont=dict(size=10, color='#888'),
+                tickfont=dict(size=11, color='#ccc', family='Arial Black, sans-serif'),
                 side='right',
+                range=y_range,
             ),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1,
-                font=dict(size=10, color='#888'),
-            ),
-            showlegend=True,
+            showlegend=False,
         )
         return fig
 
-    @rx.var
-    def underlying_candlestick_figure(self) -> go.Figure:
-        """Generate Plotly candlestick chart for underlying price history."""
-        # Access refresh_tick to trigger re-computation
-        _ = self.refresh_tick
+    def _render_pnl_chart(self, state: dict, group_info: dict = None) -> go.Figure:
+        """Render PnL bar chart including current (incomplete) bar.
 
+        Args:
+            state: Chart state with bars and current accumulators
+            group_info: Group data for stop visualization:
+                - stop_price: Current stop price (in net value terms)
+                - total_cost: Total cost for P&L conversion
+        """
+        # Generate fixed 12h x-axis labels (all 240 slots)
+        x_labels = self._generate_12h_labels(state["start_timestamp"])
+
+        # Build arrays for ALL 240 slots (None for empty)
+        pnl_vals = [None] * 240
+        colors = ['rgba(0,0,0,0)'] * 240  # Transparent for empty
+
+        # Fill in completed bars
+        for i, bar in enumerate(state["pnl_bars"]):
+            if bar is not None:
+                pnl_vals[i] = bar["pnl"]
+                colors[i] = '#00C805' if bar["pnl"] >= 0 else '#FF5252'
+
+        # Add current (incomplete) bar at current_slot
+        slot = state["current_slot"]
+        if state["current_pnl"]:
+            pnl_close = state["current_pnl"]["close"]
+            extremum = state["current_pnl"]["pnl_min"] if pnl_close < 0 else state["current_pnl"]["pnl_max"]
+            pnl_vals[slot] = extremum
+            colors[slot] = '#00C805' if extremum >= 0 else '#FF5252'
+
+        # Check if we have any data
+        if all(v is None for v in pnl_vals):
+            return self._empty_figure("Collecting P&L data...")
+
+        fig = go.Figure(data=[go.Bar(
+            x=x_labels,  # All 240 labels
+            y=pnl_vals,
+            marker_color=colors,
+            name="P&L",
+        )])
+
+        # Zero line
+        fig.add_hline(y=0, line_dash="dash", line_color="#666")
+
+        # === HISTORICAL Stop P&L line (red dashed) ===
+        # Build array from historical bars + extend to future with current value
+
+        # Calculate current stop P&L for extending into future
+        # stop_mid is already a VALUE (not price), so stop_pnl = stop_mid - total_cost
+        current_stop_pnl = None
+        if group_info and group_info.get("stop_price", 0) > 0:
+            stop_mid = group_info["stop_price"]
+            total_cost = group_info.get("total_cost", 0)
+
+            if total_cost > 0:
+                current_stop_pnl = stop_mid - total_cost
+
+        # Build historical Stop P&L array
+        stop_pnl_vals = [None] * 240
+        for i, bar in enumerate(state.get("stop_pnl_bars", [])):
+            if bar is not None:
+                stop_pnl_vals[i] = bar.get("stop_pnl")
+        # Fill future slots with current value
+        for i in range(slot + 1, 240):
+            if current_stop_pnl is not None:
+                stop_pnl_vals[i] = current_stop_pnl
+
+        if any(v is not None for v in stop_pnl_vals):
+            fig.add_trace(go.Scatter(
+                x=x_labels,
+                y=stop_pnl_vals,
+                mode='lines',
+                line=dict(color='rgba(255, 82, 82, 0.7)', width=2),
+                name='Stop',
+                hovertemplate='Stop P&L: $%{y:.2f}<extra></extra>',
+            ))
+
+        # Calculate stable Y-range with 15% padding (more for P&L which can swing)
+        all_y_vals = [v for v in pnl_vals + stop_pnl_vals if v is not None]
+        # Always include 0 in P&L range for reference
+        all_y_vals.append(0)
+        if all_y_vals:
+            y_min = min(all_y_vals)
+            y_max = max(all_y_vals)
+            y_padding = (y_max - y_min) * 0.15 if y_max > y_min else 10.0
+            y_range = [y_min - y_padding, y_max + y_padding]
+        else:
+            y_range = None
+
+        fig.update_layout(
+            height=230,
+            margin=dict(l=5, r=50, t=0, b=25),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(30,30,30,0.8)',
+            uirevision='pnl_chart',  # Prevents axis reset on data update
+            xaxis=dict(
+                type='category',
+                categoryorder='array',
+                categoryarray=x_labels,  # Fixed 12h axis
+                showgrid=True,
+                gridcolor='rgba(100,100,100,0.3)',
+                tickfont=dict(size=10, color='#ccc', family='Arial Black, sans-serif'),
+                tickangle=-25,
+                nticks=24,
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridcolor='rgba(100,100,100,0.3)',
+                tickfont=dict(size=12, color='#ccc', family='Arial Black, sans-serif'),
+                side='right',
+                range=y_range,
+            ),
+            showlegend=False,
+            bargap=0.1,
+        )
+        return fig
+
+    def _find_session_breaks(self, data: list[dict], date_key: str = "date", gap_minutes: int = 30) -> list[int]:
+        """Find indices where session breaks occur (gaps > gap_minutes)."""
+        breaks = []
+        for i in range(1, len(data)):
+            try:
+                prev_time = data[i-1].get(date_key, "")
+                curr_time = data[i].get(date_key, "")
+                if not prev_time or not curr_time or "T" not in str(prev_time):
+                    continue
+                prev_dt = datetime.fromisoformat(prev_time)
+                curr_dt = datetime.fromisoformat(curr_time)
+                gap = (curr_dt - prev_dt).total_seconds() / 60
+                if gap > gap_minutes:
+                    breaks.append(i)
+            except Exception:
+                continue
+        return breaks
+
+    def _format_relative_time(self, iso_date: str) -> str:
+        """Format ISO date as compact relative time: 'T-1: 15:45' or 'T: 09:30'."""
+        try:
+            # Parse ISO datetime
+            dt = datetime.fromisoformat(iso_date.replace('Z', '+00:00'))
+            now = datetime.now()
+
+            # Calculate days difference (based on date only)
+            today = now.date()
+            bar_date = dt.date()
+            days_diff = (today - bar_date).days
+
+            time_str = dt.strftime("%H:%M")
+
+            if days_diff == 0:
+                return f"T:{time_str}"
+            elif days_diff == 1:
+                return f"T-1:{time_str}"
+            else:
+                return f"T-{days_diff}:{time_str}"
+        except Exception:
+            # Fallback: just show time portion
+            return iso_date[-8:-3] if len(iso_date) > 8 else iso_date
+
+    def _render_underlying_chart(self) -> go.Figure:
+        """Render underlying candlestick chart."""
         symbol = self.selected_underlying_symbol
         data = self.underlying_history.get(symbol, []) if symbol else []
 
         if not data:
-            fig = go.Figure()
-            fig.add_annotation(
-                text="Loading underlying data..." if symbol else "Select a group",
-                xref="paper", yref="paper",
-                x=0.5, y=0.5, showarrow=False,
-                font=dict(size=14, color="#888")
-            )
-            fig.update_layout(
-                height=200,
-                margin=dict(l=50, r=20, t=20, b=30),
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(30,30,30,0.8)',
-                xaxis=dict(visible=False),
-                yaxis=dict(visible=False),
-            )
-            return fig
+            msg = "Loading underlying data..." if symbol else "Select a group"
+            return self._empty_figure(msg)
 
-        # Create candlestick chart
+        # Format x-axis labels as compact relative time
+        x_labels = [self._format_relative_time(d["date"]) for d in data]
+
         fig = go.Figure(data=[go.Candlestick(
-            x=[d["date"] for d in data],
+            x=x_labels,
             open=[d["open"] for d in data],
             high=[d["high"] for d in data],
             low=[d["low"] for d in data],
@@ -1201,83 +1634,38 @@ class AppState(rx.State):
             name=symbol,
         )])
 
+        # Add session break lines
+        session_breaks = self._find_session_breaks(data, "date", gap_minutes=30)
+        for idx in session_breaks:
+            if idx < len(x_labels):
+                fig.add_vline(
+                    x=x_labels[idx],
+                    line_width=1,
+                    line_dash="dot",
+                    line_color="rgba(255,255,255,0.3)",
+                )
+
         fig.update_layout(
             xaxis_rangeslider_visible=False,
-            height=200,
-            margin=dict(l=50, r=20, t=20, b=30),
+            height=230,
+            margin=dict(l=5, r=50, t=0, b=25),
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(30,30,30,0.8)',
             xaxis=dict(
+                type='category',
                 showgrid=True,
                 gridcolor='rgba(100,100,100,0.3)',
-                tickfont=dict(size=10, color='#888'),
+                tickfont=dict(size=10, color='#ccc', family='Arial Black, sans-serif'),
+                tickangle=-25,
+                nticks=16,
             ),
             yaxis=dict(
                 showgrid=True,
                 gridcolor='rgba(100,100,100,0.3)',
-                tickfont=dict(size=10, color='#888'),
+                tickfont=dict(size=11, color='#ccc', family='Arial Black, sans-serif'),
                 side='right',
             ),
             showlegend=False,
-        )
-        return fig
-
-    @rx.var
-    def pnl_history_figure(self) -> go.Figure:
-        """Generate Plotly bar chart for P&L history with extremum bundling."""
-        # Access refresh_tick to trigger re-computation
-        _ = self.refresh_tick
-
-        data = self.pnl_history.get(self.selected_group_id, [])
-        if not data:
-            fig = go.Figure()
-            fig.add_annotation(
-                text="Collecting P&L data...",
-                xref="paper", yref="paper",
-                x=0.5, y=0.5, showarrow=False,
-                font=dict(size=14, color="#888")
-            )
-            fig.update_layout(
-                height=200,
-                margin=dict(l=50, r=20, t=20, b=30),
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(30,30,30,0.8)',
-                xaxis=dict(visible=False),
-                yaxis=dict(visible=False),
-            )
-            return fig
-
-        # Create bar chart with color based on positive/negative
-        colors = ['#00C805' if d["pnl"] >= 0 else '#FF5252' for d in data]
-
-        fig = go.Figure(data=[go.Bar(
-            x=[d["time"] for d in data],
-            y=[d["pnl"] for d in data],
-            marker_color=colors,
-            name="P&L",
-        )])
-
-        # Add zero reference line
-        fig.add_hline(y=0, line_dash="dash", line_color="#666")
-
-        fig.update_layout(
-            height=200,
-            margin=dict(l=50, r=20, t=20, b=30),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(30,30,30,0.8)',
-            xaxis=dict(
-                showgrid=True,
-                gridcolor='rgba(100,100,100,0.3)',
-                tickfont=dict(size=10, color='#888'),
-            ),
-            yaxis=dict(
-                showgrid=True,
-                gridcolor='rgba(100,100,100,0.3)',
-                tickfont=dict(size=10, color='#888'),
-                side='right',
-            ),
-            showlegend=False,
-            bargap=0.1,
         )
         return fig
 
@@ -1340,10 +1728,10 @@ class AppState(rx.State):
                 logger.info(f"Deleting group {group.name}, leaving order at IB")
 
             GROUP_MANAGER.delete(group_id)
-            # Remove from price history
-            if group_id in self.group_price_history:
-                new_history = {k: v for k, v in self.group_price_history.items() if k != group_id}
-                self.group_price_history = new_history
+            # Remove chart data for deleted group
+            if group_id in self.chart_data:
+                new_data = {k: v for k, v in self.chart_data.items() if k != group_id}
+                self.chart_data = new_data
 
         self.delete_confirm_group_id = ""
         self._sync_broker_state()

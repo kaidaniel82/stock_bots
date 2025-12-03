@@ -151,6 +151,9 @@ def tab_navigation() -> rx.Component:
         align="center",
         background=COLORS["bg_app"],
         border_bottom=TAB_STYLES["container_border_bottom"],
+        position="sticky",
+        top="48px",  # Below topbar (height ~48px)
+        z_index="999",
     )
 
 
@@ -737,13 +740,14 @@ def underlying_chart() -> rx.Component:
                 rx.text(AppState.selected_underlying_symbol, size="1", color=COLORS["text_muted"]),
                 rx.text("(3D / 3-min bars)", size="1", color=COLORS["text_muted"]),
                 spacing="2",
+                align="center",
             ),
             rx.cond(
                 AppState.selected_group_id != "",
                 rx.plotly(
-                    data=AppState.underlying_candlestick_figure,
+                    data=AppState.underlying_figure,
                     width="100%",
-                    height="200px",
+                    height="230px",
                 ),
                 rx.text("Select a group to view charts", color=COLORS["text_muted"]),
             ),
@@ -767,14 +771,30 @@ def combo_price_chart() -> rx.Component:
                 rx.text("POSITION OHLC", weight="bold", size="2", color=COLORS["primary"],
                        font_family=TYPOGRAPHY["font_family"]),
                 rx.text("(12h / 3-min bars)", size="1", color=COLORS["text_muted"]),
+                rx.spacer(),
+                # Live values header
+                rx.hstack(
+                    rx.text("Mid:", size="1", color=COLORS["text_muted"]),
+                    rx.text(AppState.chart_pos_close, size="1", weight="bold", color=COLORS["text_secondary"]),
+                    rx.text("Stop:", size="1", color=COLORS["text_muted"]),
+                    rx.text(AppState.chart_pos_stop, size="1", weight="bold", color=COLORS["stop"]),
+                    rx.text("Limit:", size="1", color=COLORS["text_muted"]),
+                    rx.text(AppState.chart_pos_limit, size="1", weight="bold", color="#FFA500"),
+                    rx.text("HWM:", size="1", color=COLORS["text_muted"]),
+                    rx.text(AppState.chart_pos_hwm, size="1", weight="bold", color=COLORS["hwm"]),
+                    spacing="1",
+                    align="center",
+                ),
                 spacing="2",
+                width="100%",
+                align="center",
             ),
             rx.cond(
                 AppState.selected_group_id != "",
                 rx.plotly(
-                    data=AppState.position_candlestick_figure,
+                    data=AppState.position_figure,
                     width="100%",
-                    height="200px",
+                    height="230px",
                 ),
                 rx.text("Select a group", color=COLORS["text_muted"]),
             ),
@@ -797,15 +817,27 @@ def live_oscillator_chart() -> rx.Component:
             rx.hstack(
                 rx.text("P&L HISTORY", weight="bold", size="2", color=COLORS["primary"],
                        font_family=TYPOGRAPHY["font_family"]),
-                rx.text("(12h / extremum bundling)", size="1", color=COLORS["text_muted"]),
+                rx.text("(12h / 3-min bars)", size="1", color=COLORS["text_muted"]),
+                rx.spacer(),
+                # Live values header
+                rx.hstack(
+                    rx.text("P&L:", size="1", color=COLORS["text_muted"]),
+                    rx.text(AppState.chart_pnl_current, size="1", weight="bold", color=COLORS["text_secondary"]),
+                    rx.text("Stop P&L:", size="1", color=COLORS["text_muted"]),
+                    rx.text(AppState.chart_pnl_stop, size="1", weight="bold", color=COLORS["stop"]),
+                    spacing="1",
+                    align="center",
+                ),
                 spacing="2",
+                width="100%",
+                align="center",
             ),
             rx.cond(
                 AppState.selected_group_id != "",
                 rx.plotly(
-                    data=AppState.pnl_history_figure,
+                    data=AppState.pnl_figure,
                     width="100%",
-                    height="200px",
+                    height="230px",
                 ),
                 rx.text("Select a group", color=COLORS["text_muted"]),
             ),

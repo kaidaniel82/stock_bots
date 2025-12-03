@@ -34,6 +34,13 @@ BROKER_UPDATE_INTERVAL = 0.5
 # Wie oft die Web-UI aktualisiert wird
 UI_UPDATE_INTERVAL = 0.5
 
+# Chart Bar-Intervall: Anzahl Ticks bis ein neuer 3-min Bar erstellt wird
+# Bei 500ms UI_UPDATE_INTERVAL: 360 ticks = 3 Minuten
+BAR_INTERVAL_TICKS = 360
+
+# Chart-Rendering: Alle N Ticks rendern (2 = jede Sekunde bei 500ms interval)
+CHART_RENDER_INTERVAL = 2
+
 
 # =============================================================================
 # TRAILING STOP DEFAULTS
