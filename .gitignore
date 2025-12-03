@@ -36,6 +36,7 @@ ENV/
 
 # Runtime data
 data/
+.pids
 *.db
 *.db-journal
 *.db-wal
