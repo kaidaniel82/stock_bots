@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from threading import Lock
 import reflex as rx
+import plotly.graph_objects as go
 
 from .broker import BROKER
 from .groups import GROUP_MANAGER, calculate_stop_price
@@ -111,6 +112,15 @@ class AppState(rx.State):
     live_ticks: dict[str, list[dict]] = {}          # group_id -> rolling live data
     position_price_ticks: dict[str, list[dict]] = {}  # group_id -> mid price rolling (1D, 3min equivalent)
     _chart_loaded_for_group: str = ""               # Track which group has loaded chart data
+
+    # === 12-Hour Charts with 3-min Aggregation ===
+    # P&L History: 12h window with extremum bundling (min for negative, max for positive)
+    pnl_history: dict[str, list[dict]] = {}         # group_id -> 3-min aggregated P&L bars
+    _pnl_current_bar: dict[str, dict] = {}          # Temp storage for current 3-min window
+
+    # Position OHLC: 12h history with real OHLC bars from tick aggregation
+    position_ohlc: dict[str, list[dict]] = {}       # group_id -> OHLC bars
+    _position_current_bar: dict[str, dict] = {}     # Temp storage for current 3-min OHLC
 
     # UI State
     active_tab: str = "setup"  # "setup" or "monitor"
@@ -846,15 +856,20 @@ class AppState(rx.State):
         # Update live_ticks for Chart C (rolling window of ~120 data points = ~1 min at 0.5s interval)
         new_live_ticks = dict(self.live_ticks)
         new_position_ticks = dict(self.position_price_ticks)
+        new_pnl_history = dict(self.pnl_history)
+        new_position_ohlc = dict(self.position_ohlc)
 
-        # Every 12 ticks (~6 sec at 0.5s interval), record position price for Chart B
-        # Use 360 for real 3-min bars, 12 for faster demo
-        record_position_tick = (self.refresh_tick % 12) == 0
+        # 3-min bar aggregation: 360 ticks at 0.5s = 3 minutes
+        # Use 36 for faster demo (18 seconds = one bar)
+        BAR_INTERVAL = 36  # Change to 360 for production 3-min bars
+        is_bar_complete = (self.refresh_tick % BAR_INTERVAL) == 0 and self.refresh_tick > 0
 
         # Update groups via GroupManager
         for g in GROUP_MANAGER.get_all():
             value = self._calc_group_value(g.con_ids)
             metrics = self._calc_group_metrics(g.con_ids, g.position_quantities)
+            pnl = metrics["pnl_mark"]
+            mid = metrics["mid_value"]
 
             # Record live tick for oscillator chart (every tick)
             if g.id not in new_live_ticks:
@@ -864,7 +879,7 @@ class AppState(rx.State):
                 "time": now_str,
                 "timestamp": now.timestamp(),
                 "mark": metrics["mark_value"],
-                "pnl": metrics["pnl_mark"],
+                "pnl": pnl,
                 "stop_price": g.stop_price,
                 "hwm": g.high_water_mark,
             })
@@ -873,7 +888,72 @@ class AppState(rx.State):
                 ticks = ticks[-120:]
             new_live_ticks[g.id] = ticks
 
-            # Record position price tick for Chart B (every 3 min)
+            # === P&L EXTREMUM AGGREGATION (for pnl_history) ===
+            # Track min/max during the 3-min window
+            if g.id not in self._pnl_current_bar:
+                self._pnl_current_bar[g.id] = {"pnl_min": pnl, "pnl_max": pnl, "stop": g.stop_price}
+            current_pnl = self._pnl_current_bar[g.id]
+            current_pnl["pnl_min"] = min(current_pnl["pnl_min"], pnl)
+            current_pnl["pnl_max"] = max(current_pnl["pnl_max"], pnl)
+            current_pnl["stop"] = g.stop_price
+
+            # === POSITION OHLC AGGREGATION ===
+            if g.id not in self._position_current_bar:
+                self._position_current_bar[g.id] = {
+                    "open": mid, "high": mid, "low": mid, "close": mid,
+                    "stop": g.stop_price
+                }
+            current_ohlc = self._position_current_bar[g.id]
+            current_ohlc["high"] = max(current_ohlc["high"], mid)
+            current_ohlc["low"] = min(current_ohlc["low"], mid)
+            current_ohlc["close"] = mid
+            current_ohlc["stop"] = g.stop_price
+
+            # === BAR COMPLETION: Emit 3-min aggregated bars ===
+            if is_bar_complete:
+                # P&L History bar: use extremum (min if negative, max if positive)
+                extremum_pnl = current_pnl["pnl_min"] if pnl < 0 else current_pnl["pnl_max"]
+                if g.id not in new_pnl_history:
+                    new_pnl_history[g.id] = []
+                pnl_bars = list(new_pnl_history[g.id])
+                pnl_bars.append({
+                    "time": now_str,
+                    "timestamp": now.timestamp(),
+                    "pnl": extremum_pnl,
+                    "stop_price": current_pnl["stop"],
+                })
+                # 12h window: 240 bars at 3-min = 12 hours
+                if len(pnl_bars) > 240:
+                    pnl_bars = pnl_bars[-240:]
+                new_pnl_history[g.id] = pnl_bars
+
+                # Position OHLC bar
+                if g.id not in new_position_ohlc:
+                    new_position_ohlc[g.id] = []
+                ohlc_bars = list(new_position_ohlc[g.id])
+                ohlc_bars.append({
+                    "time": now_str,
+                    "timestamp": now.timestamp(),
+                    "open": current_ohlc["open"],
+                    "high": current_ohlc["high"],
+                    "low": current_ohlc["low"],
+                    "close": current_ohlc["close"],
+                    "stop_price": current_ohlc["stop"],
+                })
+                # 12h window: 240 bars
+                if len(ohlc_bars) > 240:
+                    ohlc_bars = ohlc_bars[-240:]
+                new_position_ohlc[g.id] = ohlc_bars
+
+                # Reset current bars for next window
+                self._pnl_current_bar[g.id] = {"pnl_min": pnl, "pnl_max": pnl, "stop": g.stop_price}
+                self._position_current_bar[g.id] = {
+                    "open": mid, "high": mid, "low": mid, "close": mid,
+                    "stop": g.stop_price
+                }
+
+            # Record position price tick for legacy Chart B (every ~6 sec for backwards compat)
+            record_position_tick = (self.refresh_tick % 12) == 0
             if record_position_tick:
                 if g.id not in new_position_ticks:
                     new_position_ticks[g.id] = []
@@ -881,13 +961,13 @@ class AppState(rx.State):
                 pos_ticks.append({
                     "time": now_str,
                     "timestamp": now.timestamp(),
-                    "mid": metrics["mid_value"],
+                    "mid": mid,
                     "mark": metrics["mark_value"],
                     "bid": metrics["spread_bid"],
                     "ask": metrics["spread_ask"],
                     "stop_price": g.stop_price,
                 })
-                # Keep max 200 ticks (~10 hours of 3-min bars)
+                # Keep max 200 ticks
                 if len(pos_ticks) > 200:
                     pos_ticks = pos_ticks[-200:]
                 new_position_ticks[g.id] = pos_ticks
@@ -905,6 +985,31 @@ class AppState(rx.State):
 
         self.live_ticks = new_live_ticks
         self.position_price_ticks = new_position_ticks
+        self.pnl_history = new_pnl_history
+        self.position_ohlc = new_position_ohlc
+
+        # === UNDERLYING CHART LIVE UPDATE ===
+        # Fetch latest underlying bar every 3 minutes (on bar complete)
+        if is_bar_complete and self.selected_group_id:
+            symbol = self.selected_underlying_symbol
+            if symbol and symbol in self.underlying_history:
+                new_bar = BROKER.fetch_latest_underlying_bar(symbol)
+                if new_bar:
+                    new_hist = dict(self.underlying_history)
+                    bars = list(new_hist.get(symbol, []))
+                    # Check if this is a new bar (different time) or update existing
+                    if bars and bars[-1].get("date") == new_bar.get("date"):
+                        # Update existing bar (price may have changed)
+                        bars[-1] = new_bar
+                    else:
+                        # Append new bar
+                        bars.append(new_bar)
+                        # Keep last 3 days worth (~480 bars for 3-min bars)
+                        if len(bars) > 500:
+                            bars = bars[-500:]
+                    new_hist[symbol] = bars
+                    self.underlying_history = new_hist
+                    logger.debug(f"Updated underlying chart for {symbol}, now {len(bars)} bars")
 
         # Reload groups to reflect changes
         self._load_groups_from_manager()
@@ -974,6 +1079,207 @@ class AppState(rx.State):
             if p["con_id"] == first_con_id:
                 return p["symbol"]
         return ""
+
+    @rx.var
+    def position_candlestick_figure(self) -> go.Figure:
+        """Generate Plotly candlestick chart for position OHLC data."""
+        # Access refresh_tick to trigger re-computation
+        _ = self.refresh_tick
+
+        data = self.position_ohlc.get(self.selected_group_id, [])
+        if not data:
+            # Return empty figure with message
+            fig = go.Figure()
+            fig.add_annotation(
+                text="Collecting OHLC data...",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="#888")
+            )
+            fig.update_layout(
+                height=200,
+                margin=dict(l=50, r=20, t=20, b=30),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(30,30,30,0.8)',
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+            )
+            return fig
+
+        # Create candlestick chart
+        fig = go.Figure(data=[go.Candlestick(
+            x=[d["time"] for d in data],
+            open=[d["open"] for d in data],
+            high=[d["high"] for d in data],
+            low=[d["low"] for d in data],
+            close=[d["close"] for d in data],
+            increasing_line_color='#00C805',  # Green
+            decreasing_line_color='#FF5252',  # Red
+            increasing_fillcolor='#00C805',
+            decreasing_fillcolor='#FF5252',
+            name="Price",
+        )])
+
+        # Add stop price line
+        stop_prices = [d.get("stop_price", 0) for d in data]
+        if any(sp > 0 for sp in stop_prices):
+            fig.add_trace(go.Scatter(
+                x=[d["time"] for d in data],
+                y=stop_prices,
+                mode='lines',
+                line=dict(color='#FF5252', width=2, dash='dash'),
+                name='Stop Price',
+            ))
+
+        fig.update_layout(
+            xaxis_rangeslider_visible=False,
+            height=200,
+            margin=dict(l=50, r=20, t=20, b=30),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(30,30,30,0.8)',
+            xaxis=dict(
+                showgrid=True,
+                gridcolor='rgba(100,100,100,0.3)',
+                tickfont=dict(size=10, color='#888'),
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridcolor='rgba(100,100,100,0.3)',
+                tickfont=dict(size=10, color='#888'),
+                side='right',
+            ),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
+                font=dict(size=10, color='#888'),
+            ),
+            showlegend=True,
+        )
+        return fig
+
+    @rx.var
+    def underlying_candlestick_figure(self) -> go.Figure:
+        """Generate Plotly candlestick chart for underlying price history."""
+        # Access refresh_tick to trigger re-computation
+        _ = self.refresh_tick
+
+        symbol = self.selected_underlying_symbol
+        data = self.underlying_history.get(symbol, []) if symbol else []
+
+        if not data:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="Loading underlying data..." if symbol else "Select a group",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="#888")
+            )
+            fig.update_layout(
+                height=200,
+                margin=dict(l=50, r=20, t=20, b=30),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(30,30,30,0.8)',
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+            )
+            return fig
+
+        # Create candlestick chart
+        fig = go.Figure(data=[go.Candlestick(
+            x=[d["date"] for d in data],
+            open=[d["open"] for d in data],
+            high=[d["high"] for d in data],
+            low=[d["low"] for d in data],
+            close=[d["close"] for d in data],
+            increasing_line_color='#00C805',
+            decreasing_line_color='#FF5252',
+            increasing_fillcolor='#00C805',
+            decreasing_fillcolor='#FF5252',
+            name=symbol,
+        )])
+
+        fig.update_layout(
+            xaxis_rangeslider_visible=False,
+            height=200,
+            margin=dict(l=50, r=20, t=20, b=30),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(30,30,30,0.8)',
+            xaxis=dict(
+                showgrid=True,
+                gridcolor='rgba(100,100,100,0.3)',
+                tickfont=dict(size=10, color='#888'),
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridcolor='rgba(100,100,100,0.3)',
+                tickfont=dict(size=10, color='#888'),
+                side='right',
+            ),
+            showlegend=False,
+        )
+        return fig
+
+    @rx.var
+    def pnl_history_figure(self) -> go.Figure:
+        """Generate Plotly bar chart for P&L history with extremum bundling."""
+        # Access refresh_tick to trigger re-computation
+        _ = self.refresh_tick
+
+        data = self.pnl_history.get(self.selected_group_id, [])
+        if not data:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="Collecting P&L data...",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="#888")
+            )
+            fig.update_layout(
+                height=200,
+                margin=dict(l=50, r=20, t=20, b=30),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(30,30,30,0.8)',
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+            )
+            return fig
+
+        # Create bar chart with color based on positive/negative
+        colors = ['#00C805' if d["pnl"] >= 0 else '#FF5252' for d in data]
+
+        fig = go.Figure(data=[go.Bar(
+            x=[d["time"] for d in data],
+            y=[d["pnl"] for d in data],
+            marker_color=colors,
+            name="P&L",
+        )])
+
+        # Add zero reference line
+        fig.add_hline(y=0, line_dash="dash", line_color="#666")
+
+        fig.update_layout(
+            height=200,
+            margin=dict(l=50, r=20, t=20, b=30),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(30,30,30,0.8)',
+            xaxis=dict(
+                showgrid=True,
+                gridcolor='rgba(100,100,100,0.3)',
+                tickfont=dict(size=10, color='#888'),
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridcolor='rgba(100,100,100,0.3)',
+                tickfont=dict(size=10, color='#888'),
+                side='right',
+            ),
+            showlegend=False,
+            bargap=0.1,
+        )
+        return fig
 
     # === Order Management ===
 

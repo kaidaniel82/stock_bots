@@ -728,33 +728,22 @@ def compact_group_card(group: dict) -> rx.Component:
 
 
 def underlying_chart() -> rx.Component:
-    """Chart A: Underlying price history (3D, 3min bars)."""
+    """Chart A: Underlying price history (3D, 3min candlesticks)."""
     return rx.box(
         rx.vstack(
             rx.hstack(
                 rx.text("UNDERLYING", weight="bold", size="2", color=COLORS["primary"],
                        font_family=TYPOGRAPHY["font_family"]),
                 rx.text(AppState.selected_underlying_symbol, size="1", color=COLORS["text_muted"]),
+                rx.text("(3D / 3-min bars)", size="1", color=COLORS["text_muted"]),
                 spacing="2",
             ),
             rx.cond(
                 AppState.selected_group_id != "",
-                rx.cond(
-                    AppState.underlying_history.length() > 0,
-                    rx.recharts.bar_chart(
-                        rx.recharts.bar(
-                            data_key="close",
-                            fill=COLORS["accent"],
-                        ),
-                        rx.recharts.x_axis(data_key="date", tick=False),
-                        rx.recharts.y_axis(width=60, domain=["auto", "auto"]),
-                        rx.recharts.cartesian_grid(stroke_dasharray="3 3", stroke=COLORS["border"]),
-                        rx.recharts.graphing_tooltip(),
-                        data=AppState.underlying_history.get(AppState.selected_underlying_symbol, []),
-                        width="100%",
-                        height=150,
-                    ),
-                    rx.text("Loading underlying data...", color=COLORS["text_muted"]),
+                rx.plotly(
+                    data=AppState.underlying_candlestick_figure,
+                    width="100%",
+                    height="200px",
                 ),
                 rx.text("Select a group to view charts", color=COLORS["text_muted"]),
             ),
@@ -771,43 +760,21 @@ def underlying_chart() -> rx.Component:
 
 
 def combo_price_chart() -> rx.Component:
-    """Chart B: Position Mid Price history (1D building, 3min bars) with stop price line."""
+    """Chart B: Position OHLC candlestick chart (12h, 3min bars) with stop price line."""
     return rx.box(
         rx.vstack(
             rx.hstack(
-                rx.text("POSITION MID", weight="bold", size="2", color=COLORS["primary"],
+                rx.text("POSITION OHLC", weight="bold", size="2", color=COLORS["primary"],
                        font_family=TYPOGRAPHY["font_family"]),
-                rx.text("(6s updates)", size="1", color=COLORS["text_muted"]),
+                rx.text("(12h / 3-min bars)", size="1", color=COLORS["text_muted"]),
                 spacing="2",
             ),
             rx.cond(
                 AppState.selected_group_id != "",
-                rx.cond(
-                    AppState.position_price_ticks.get(AppState.selected_group_id, []).length() > 0,
-                    rx.recharts.composed_chart(
-                        rx.recharts.bar(
-                            data_key="mid",
-                            fill=COLORS["accent"],
-                            name="Mid",
-                        ),
-                        rx.recharts.line(
-                            data_key="stop_price",
-                            stroke=COLORS["error"],
-                            stroke_width=2,
-                            stroke_dasharray="5 5",
-                            dot=False,
-                            name="Stop",
-                        ),
-                        rx.recharts.x_axis(data_key="time", tick=False),
-                        rx.recharts.y_axis(width=60, domain=["auto", "auto"]),
-                        rx.recharts.cartesian_grid(stroke_dasharray="3 3", stroke=COLORS["border"]),
-                        rx.recharts.graphing_tooltip(),
-                        rx.recharts.legend(),
-                        data=AppState.position_price_ticks.get(AppState.selected_group_id, []),
-                        width="100%",
-                        height=150,
-                    ),
-                    rx.text("Collecting position data...", color=COLORS["text_muted"]),
+                rx.plotly(
+                    data=AppState.position_candlestick_figure,
+                    width="100%",
+                    height="200px",
                 ),
                 rx.text("Select a group", color=COLORS["text_muted"]),
             ),
@@ -824,33 +791,21 @@ def combo_price_chart() -> rx.Component:
 
 
 def live_oscillator_chart() -> rx.Component:
-    """Chart C: Live oscillator showing PnL with HWM and Stop Price lines."""
+    """Chart C: P&L history with extremum bundling (12h, 3min bars)."""
     return rx.box(
         rx.vstack(
-            rx.text("LIVE P&L", weight="bold", size="2", color=COLORS["primary"],
-                   font_family=TYPOGRAPHY["font_family"]),
+            rx.hstack(
+                rx.text("P&L HISTORY", weight="bold", size="2", color=COLORS["primary"],
+                       font_family=TYPOGRAPHY["font_family"]),
+                rx.text("(12h / extremum bundling)", size="1", color=COLORS["text_muted"]),
+                spacing="2",
+            ),
             rx.cond(
                 AppState.selected_group_id != "",
-                rx.recharts.composed_chart(
-                    rx.recharts.area(
-                        data_key="pnl",
-                        fill=COLORS["success"],
-                        stroke=COLORS["success"],
-                        fill_opacity=0.2,
-                        name="P&L",
-                    ),
-                    rx.recharts.reference_line(
-                        y=0,
-                        stroke=COLORS["text_muted"],
-                        stroke_dasharray="3 3",
-                    ),
-                    rx.recharts.x_axis(data_key="time", tick=False),
-                    rx.recharts.y_axis(width=60),
-                    rx.recharts.cartesian_grid(stroke_dasharray="3 3", stroke=COLORS["border"]),
-                    rx.recharts.graphing_tooltip(),
-                    data=AppState.live_ticks.get(AppState.selected_group_id, []),
+                rx.plotly(
+                    data=AppState.pnl_history_figure,
                     width="100%",
-                    height=150,
+                    height="200px",
                 ),
                 rx.text("Select a group", color=COLORS["text_muted"]),
             ),
@@ -869,16 +824,12 @@ def live_oscillator_chart() -> rx.Component:
 def charts_section() -> rx.Component:
     """Combined charts section for monitor tab."""
     return rx.vstack(
-        rx.hstack(
-            underlying_chart(),
-            width="100%",
-        ),
-        rx.hstack(
-            combo_price_chart(),
-            live_oscillator_chart(),
-            width="100%",
-            spacing="3",
-        ),
+        # Row 1: Underlying chart (full width)
+        underlying_chart(),
+        # Row 2: Position OHLC (full width)
+        combo_price_chart(),
+        # Row 3: P&L History (full width)
+        live_oscillator_chart(),
         width="100%",
         spacing="3",
     )

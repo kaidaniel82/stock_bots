@@ -1107,6 +1107,89 @@ class TWSBroker:
             logger.error(f"Failed to fetch underlying history for {symbol}: {e}")
             return []
 
+    def fetch_latest_underlying_bar(self, symbol: str, bar_size: str = "3 mins") -> dict | None:
+        """Fetch only the most recent bar for live updates.
+
+        Args:
+            symbol: Symbol (e.g., "AAPL", "SPY", "SPX", "ES", "DAX")
+            bar_size: Bar size string (default "3 mins")
+
+        Returns:
+            Single bar dict or None
+        """
+        if not self.is_connected():
+            return None
+
+        if not self._loop:
+            return None
+
+        async def _fetch_async():
+            try:
+                # Detect contract type based on symbol
+                indices = {"SPX", "NDX", "RUT", "VIX", "DJX", "DAX", "ESTX50"}
+                futures = {"ES", "NQ", "YM", "RTY", "CL", "GC", "SI", "ZB", "ZN"}
+
+                if symbol in indices:
+                    if symbol == "DAX":
+                        contract = Index(symbol, "EUREX", "EUR")
+                    elif symbol in {"SPX", "NDX", "VIX", "RUT", "DJX"}:
+                        contract = Index(symbol, "CBOE", "USD")
+                    else:
+                        contract = Index(symbol, "EUREX", "EUR")
+                    await self.ib.qualifyContractsAsync(contract)
+
+                elif symbol in futures:
+                    if symbol in {"ES", "NQ", "RTY"}:
+                        contract = Future(symbol, exchange="CME")
+                    elif symbol in {"CL", "GC", "SI"}:
+                        contract = Future(symbol, exchange="NYMEX")
+                    else:
+                        contract = Future(symbol, exchange="CME")
+
+                    contracts = await self.ib.reqContractDetailsAsync(contract)
+                    if contracts:
+                        contract = sorted(contracts, key=lambda c: c.contract.lastTradeDateOrContractMonth)[0].contract
+                        await self.ib.qualifyContractsAsync(contract)
+                    else:
+                        return None
+                else:
+                    contract = Stock(symbol, "SMART", "USD")
+                    await self.ib.qualifyContractsAsync(contract)
+
+                # Request just the latest bar (5 mins duration for 3-min bar)
+                bars = await self.ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime="",
+                    durationStr="5 mins",
+                    barSizeSetting=bar_size,
+                    whatToShow="TRADES",
+                    useRTH=False,
+                    formatDate=1
+                )
+
+                if bars:
+                    bar = bars[-1]  # Get the most recent bar
+                    return {
+                        "date": bar.date.isoformat() if hasattr(bar.date, 'isoformat') else str(bar.date),
+                        "open": bar.open,
+                        "high": bar.high,
+                        "low": bar.low,
+                        "close": bar.close,
+                        "volume": bar.volume
+                    }
+                return None
+
+            except Exception as e:
+                logger.error(f"Error fetching latest bar for {symbol}: {e}")
+                return None
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_fetch_async(), self._loop)
+            return future.result(timeout=10)
+        except Exception as e:
+            logger.error(f"Failed to fetch latest bar for {symbol}: {e}")
+            return None
+
 
 # Global broker instance
 BROKER = TWSBroker()
