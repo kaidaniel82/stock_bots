@@ -434,8 +434,13 @@ def _group_greeks_row(group: dict) -> rx.Component:
 
 
 def _group_hwm_stop_row(group: dict, show_trail: bool = False) -> rx.Component:
-    """HWM, Stop, and optionally Trail display."""
+    """HWM, Stop, Fill/Cost, and optionally Trail display."""
     items = [
+        rx.vstack(
+            rx.text("Fill", size="1", color=COLORS["text_muted"]),
+            rx.text(group["cost_str"], size="1", color=COLORS["text_secondary"]),
+            align="center", spacing="0",
+        ),
         rx.vstack(
             rx.text("HWM", size="1", color=COLORS["text_muted"]),
             rx.text(group["hwm_str"], size="1", color=COLORS["hwm"]),
@@ -743,6 +748,8 @@ def combo_price_chart() -> rx.Component:
                 rx.spacer(),
                 # Live values header (label shows trigger_price_type: Mid, Mark, Bid, Ask, Last)
                 rx.hstack(
+                    rx.text("Fill:", size="1", color=COLORS["text_muted"]),
+                    rx.text(AppState.chart_pos_fill, size="1", weight="bold", color=COLORS["text_secondary"]),
                     rx.text(AppState.chart_trigger_label + ":", size="1", color=COLORS["accent"]),
                     rx.text(AppState.chart_pos_close, size="1", weight="bold", color=COLORS["accent"]),
                     rx.text("Stop:", size="1", color=COLORS["text_muted"]),

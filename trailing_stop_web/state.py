@@ -131,12 +131,13 @@ class AppState(rx.State):
     selected_group_id: str = ""  # Currently selected group in monitor tab
 
     # === Chart Header Info (updated every render cycle) ===
-    # Position OHLC Header: Trigger value (based on trigger_price_type), Stop, Limit, HWM
+    # Position OHLC Header: Trigger value (based on trigger_price_type), Stop, Limit, HWM, Fill
     chart_trigger_label: str = "Mid"  # "Mark", "Mid", "Bid", "Ask", "Last"
     chart_pos_close: str = "-"
     chart_pos_stop: str = "-"
     chart_pos_limit: str = "-"
     chart_pos_hwm: str = "-"
+    chart_pos_fill: str = "-"  # Fill/Cost price
     # P&L History Header: Current P&L, Stop P&L
     chart_pnl_current: str = "-"
     chart_pnl_stop: str = "-"
@@ -427,6 +428,7 @@ class AppState(rx.State):
                 "spread_bid_str": metrics["spread_bid_str"],
                 "spread_ask_str": metrics["spread_ask_str"],
                 # Cost and PnL
+                "entry_price": metrics["entry_price"],
                 "cost_str": metrics["cost_str"],
                 "pnl_mark": metrics["pnl_mark"],
                 "pnl_mark_str": metrics["pnl_mark_str"],
@@ -552,6 +554,8 @@ class AppState(rx.State):
             "spread_ask": metrics.spread_ask,
             "spread_ask_str": metrics.spread_ask_str,
             # Cost and PnL
+            "entry_price": metrics.entry_price,
+            "entry_price_str": metrics.entry_price_str,
             "total_cost": metrics.total_cost,
             "cost_str": metrics.cost_str,
             "pnl_mark": metrics.pnl_mark,
@@ -1355,6 +1359,7 @@ class AppState(rx.State):
                 "total_cost": metrics.get("total_cost", 0.0),
                 "pnl_mark": metrics.get("pnl_mark", 0.0),
                 "trigger_value": metrics.get("trigger_value", 0.0),  # For stop_pnl calculation
+                "entry_price": metrics.get("entry_price", 0.0),  # Per-contract fill price
             }
 
         # Render position chart with stop/limit lines
@@ -1391,11 +1396,23 @@ class AppState(rx.State):
             # P&L History header: Current P&L, Stop P&L
             pnl_mark = group_info.get("pnl_mark", 0)
             total_cost = group_info.get("total_cost", 0)
+            entry_price = group_info.get("entry_price", 0)
             self.chart_pnl_current = f"${pnl_mark:.2f}" if pnl_mark != 0 else "$0.00"
+            # Fill/Entry price (per-contract, like bid/ask)
+            self.chart_pos_fill = f"${entry_price:.2f}" if entry_price != 0 else "-"
 
-            # Calculate stop P&L: stop_price is already a VALUE, so stop_pnl = stop_price - total_cost
-            if stop_price > 0 and total_cost > 0:
-                stop_pnl = stop_price - total_cost
+            # Calculate stop P&L: (stop_price - entry_price) per-contract, then scale
+            # stop_price and entry_price are both per-contract values
+            # To get total P&L we need qty * multiplier from metrics
+            if stop_price > 0 and entry_price != 0:
+                # Per-contract P&L at stop level
+                per_contract_pnl = stop_price - entry_price
+                # Scale by total position (total_cost / entry_price gives qty * mult)
+                if entry_price != 0:
+                    scale = abs(total_cost / entry_price) if entry_price != 0 else 0
+                    stop_pnl = per_contract_pnl * scale
+                else:
+                    stop_pnl = 0
                 self.chart_pnl_stop = f"${stop_pnl:.2f}"
             else:
                 self.chart_pnl_stop = "-"
@@ -1406,6 +1423,7 @@ class AppState(rx.State):
             self.chart_pos_stop = "-"
             self.chart_pos_limit = "-"
             self.chart_pos_hwm = "-"
+            self.chart_pos_fill = "-"
             self.chart_pnl_current = "-"
             self.chart_pnl_stop = "-"
 
@@ -1623,14 +1641,18 @@ class AppState(rx.State):
         # Build array from historical bars + extend to future with current value
 
         # Calculate current stop P&L for extending into future
-        # stop_mid is already a VALUE (not price), so stop_pnl = stop_mid - total_cost
+        # stop_price and entry_price are both per-contract values
+        # stop_pnl = (stop_price - entry_price) * scale
         current_stop_pnl = None
         if group_info and group_info.get("stop_price", 0) > 0:
-            stop_mid = group_info["stop_price"]
+            stop_price = group_info["stop_price"]
+            entry_price = group_info.get("entry_price", 0)
             total_cost = group_info.get("total_cost", 0)
 
-            if total_cost > 0:
-                current_stop_pnl = stop_mid - total_cost
+            if entry_price != 0:
+                per_contract_pnl = stop_price - entry_price
+                scale = abs(total_cost / entry_price)
+                current_stop_pnl = per_contract_pnl * scale
 
         # Build historical Stop P&L array
         stop_pnl_vals = [None] * 240
