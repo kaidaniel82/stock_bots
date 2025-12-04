@@ -1,4 +1,5 @@
 """Application state management."""
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from threading import Lock
@@ -302,7 +303,7 @@ class AppState(rx.State):
 
     def create_group(self):
         """Create a new group from selected positions with quantities."""
-        logger.info(f"create_group called: selected_quantities={self.selected_quantities}, positions_count={len(self.positions)}")
+        logger.debug(f"create_group called: selected_quantities={self.selected_quantities}")
 
         if not self.selected_quantities:
             self.status_message = "No positions selected"
@@ -318,7 +319,6 @@ class AppState(rx.State):
         # Calculate initial value (using con_ids list for compatibility)
         con_ids = list(position_quantities.keys())
         value = self._calc_group_value(con_ids)
-        logger.info(f"create_group: calculated value={value}, positions still={len(self.positions)}")
 
         # Create via GroupManager (persisted to JSON)
         group = GROUP_MANAGER.create(
@@ -332,12 +332,9 @@ class AppState(rx.State):
         )
 
         # Refresh positions if connected (don't clear if disconnected)
-        logger.info(f"create_group: before refresh, positions={len(self.positions)}, broker_connected={BROKER.is_connected()}")
         if BROKER.is_connected():
             self._refresh_positions()
-        logger.info(f"create_group: after refresh, positions={len(self.positions)}")
         self._load_groups_from_manager()
-        logger.info(f"create_group: after _load_groups, positions={len(self.positions)}")
 
         # Initialize chart state for new group
         self._init_chart_state(group.id)
@@ -345,7 +342,7 @@ class AppState(rx.State):
         self.selected_quantities = {}
         self.new_group_name = ""
         self.status_message = f"Group '{group.name}' created"
-        logger.info(f"create_group: DONE, final positions={len(self.positions)}")
+        logger.info(f"Group created: '{group.name}' with {len(position_quantities)} positions, value=${value:.2f}")
 
     def _load_groups_from_manager(self, metrics_cache: dict = None):
         """Load groups from GroupManager into state for UI.
@@ -689,7 +686,7 @@ class AppState(rx.State):
         When on_change=handler(group_id), Reflex calls handler(group_id, event_value).
         No type annotations to avoid Reflex type validation issues.
         """
-        logger.info(f"update_group_time_exit_enabled: group_id={group_id}, checked={checked}")
+        logger.debug(f"update_group_time_exit_enabled: group_id={group_id}, checked={checked}")
         GROUP_MANAGER.update(str(group_id), time_exit_enabled=bool(checked))
         self._sync_broker_state()
         self._load_groups_from_manager()
@@ -862,7 +859,11 @@ class AppState(rx.State):
         - Bar completion every 3 min (BAR_INTERVAL_TICKS)
         - Chart rendering every 1 sec (CHART_RENDER_INTERVAL)
         """
+        tick_start = time.perf_counter()
+        timings = {}  # Track timing for each step
+
         # 1. Sync connection status from broker
+        t0 = time.perf_counter()
         broker_connected = BROKER.is_connected()
         if broker_connected != self.is_connected:
             self.is_connected = broker_connected
@@ -877,19 +878,23 @@ class AppState(rx.State):
                     self._load_group_chart_data(self.selected_group_id)
             else:
                 self.connection_status = "Disconnected"
+        timings["1_broker_sync"] = (time.perf_counter() - t0) * 1000
 
         if not self.is_connected or not self.is_monitoring:
             return
 
         # 2. Refresh positions (necessary for price data)
+        t0 = time.perf_counter()
         self._refresh_positions()
         self.refresh_tick += 1
+        timings["2_refresh_pos"] = (time.perf_counter() - t0) * 1000
 
         now = datetime.now()
         now_str = now.strftime("%H:%M:%S")
         self.status_message = f"Monitoring... ({now_str})"
 
         # 3. Process all groups with metrics cache
+        t0 = time.perf_counter()
         metrics_cache = {}
         for g in GROUP_MANAGER.get_all():
             value = self._calc_group_value(g.con_ids)
@@ -905,8 +910,10 @@ class AppState(rx.State):
                 if GROUP_MANAGER.check_stop_triggered(g.id, value):
                     self.status_message = f"STOP TRIGGERED: {g.name} at ${value:.2f}!"
                     GROUP_MANAGER.deactivate(g.id)
+        timings["3_groups_metrics"] = (time.perf_counter() - t0) * 1000
 
         # 4. Bar completion every 3 min (BAR_INTERVAL_TICKS = 360)
+        t0 = time.perf_counter()
         if self.refresh_tick > 0 and (self.refresh_tick % BAR_INTERVAL_TICKS) == 0:
             self._complete_bars()
 
@@ -926,13 +933,36 @@ class AppState(rx.State):
                                 bars = bars[-500:]
                         new_hist[symbol] = bars
                         self.underlying_history = new_hist
+        timings["4_bar_complete"] = (time.perf_counter() - t0) * 1000
 
         # 5. Chart rendering every 1 sec (CHART_RENDER_INTERVAL = 2 ticks)
+        t0 = time.perf_counter()
         if (self.refresh_tick % CHART_RENDER_INTERVAL) == 0 and self.selected_group_id:
             self._render_all_charts()
+        timings["5_chart_render"] = (time.perf_counter() - t0) * 1000
 
         # 6. Reload groups with cached metrics (no double computation)
+        t0 = time.perf_counter()
         self._load_groups_from_manager(metrics_cache)
+        timings["6_reload_groups"] = (time.perf_counter() - t0) * 1000
+
+        # Performance logging
+        elapsed_ms = (time.perf_counter() - tick_start) * 1000
+
+        # DEBUG: Detailed breakdown every 20 ticks or when slow
+        if self.refresh_tick % 20 == 0 or elapsed_ms > 200:
+            breakdown = " | ".join(f"{k}:{v:.0f}" for k, v in timings.items() if v > 1)
+            logger.debug(f"tick #{self.refresh_tick}: {elapsed_ms:.0f}ms | {breakdown}")
+
+        # INFO: Summary every 60 ticks (~30s)
+        if self.refresh_tick % 60 == 0:
+            n_positions = len(self.positions)
+            n_groups = len(GROUP_MANAGER.get_all())
+            n_active = sum(1 for g in GROUP_MANAGER.get_all() if g.is_active)
+            logger.info(
+                f"Summary #{self.refresh_tick}: {n_positions} positions, "
+                f"{n_groups} groups ({n_active} active), {elapsed_ms:.0f}ms/tick"
+            )
 
     # === UI Navigation ===
 
@@ -942,7 +972,7 @@ class AppState(rx.State):
 
     def select_group(self, group_id: str):
         """Select a group in monitor view and load chart data."""
-        logger.info(f"select_group called with group_id={group_id}")
+        logger.debug(f"select_group called with group_id={group_id}")
         self.selected_group_id = group_id
         # Initialize chart state if not exists
         if group_id not in self.chart_data:
@@ -957,12 +987,12 @@ class AppState(rx.State):
         so we only load the underlying history here.
         """
         group = GROUP_MANAGER.get(group_id)
-        logger.info(f"_load_group_chart_data: group={group}, is_connected={self.is_connected}")
+        logger.debug(f"_load_group_chart_data: group={group}, is_connected={self.is_connected}")
         if not group or not self.is_connected:
             logger.warning(f"_load_group_chart_data: early return - group={group is not None}, connected={self.is_connected}")
             return
 
-        logger.info(f"_load_group_chart_data: group.con_ids={group.con_ids}, positions count={len(self.positions)}")
+        logger.debug(f"_load_group_chart_data: group.con_ids={group.con_ids}, positions count={len(self.positions)}")
         # Get underlying symbol from first position
         if group.con_ids:
             first_con_id = group.con_ids[0]
@@ -980,7 +1010,7 @@ class AppState(rx.State):
                     new_hist = dict(self.underlying_history)
                     new_hist[symbol] = bars
                     self.underlying_history = new_hist
-                    logger.info(f"Loaded {len(bars)} underlying bars for {symbol}")
+                    logger.debug(f"Loaded {len(bars)} underlying bars for {symbol}")
 
     # NOTE: _build_position_ohlc_from_history and _build_pnl_history_from_position
     # are no longer used - data is collected from connect time using _accumulate_tick
@@ -1067,7 +1097,7 @@ class AppState(rx.State):
         new_data = dict(self.chart_data)
         new_data[group_id] = state
         self.chart_data = new_data
-        logger.info(f"Initialized chart state for group {group_id}")
+        logger.debug(f"Initialized chart state for group {group_id}")
 
     def _init_all_chart_states(self):
         """Initialize chart state for all groups at connect."""
@@ -1331,10 +1361,10 @@ class AppState(rx.State):
             high=high_vals,
             low=low_vals,
             close=close_vals,
-            increasing_line_color='#00C805',
-            decreasing_line_color='#FF5252',
-            increasing_fillcolor='#00C805',
-            decreasing_fillcolor='#FF5252',
+            increasing_line_color='#00D26A',  # Profit green from theme
+            decreasing_line_color='#FF3B30',  # Loss red from theme
+            increasing_fillcolor='#00D26A',
+            decreasing_fillcolor='#FF3B30',
             name="Position",
         )])
 
@@ -1365,7 +1395,7 @@ class AppState(rx.State):
                 x=x_labels,
                 y=hwm_vals,
                 mode='lines',
-                line=dict(color='rgba(0, 200, 5, 0.6)', width=2),
+                line=dict(color='rgba(0, 191, 255, 0.8)', width=2),  # Cyan #00BFFF
                 name='HWM',
                 hovertemplate='HWM: $%{y:.2f}<extra></extra>',
             ))
@@ -1385,7 +1415,7 @@ class AppState(rx.State):
                 x=x_labels,
                 y=stop_vals,
                 mode='lines',
-                line=dict(color='rgba(255, 82, 82, 0.7)', width=2),
+                line=dict(color='rgba(255, 59, 48, 0.8)', width=2),  # Red #FF3B30
                 name='Stop',
                 hovertemplate='Stop: $%{y:.2f}<extra></extra>',
             ))
@@ -1407,7 +1437,7 @@ class AppState(rx.State):
                     x=x_labels,
                     y=limit_vals,
                     mode='lines',
-                    line=dict(color='rgba(255, 165, 0, 0.6)', width=2),
+                    line=dict(color='rgba(255, 165, 0, 0.8)', width=2),  # Orange #FFA500
                     name='Limit',
                     hovertemplate='Limit: $%{y:.2f}<extra></extra>',
                 ))
@@ -1470,7 +1500,7 @@ class AppState(rx.State):
         for i, bar in enumerate(state["pnl_bars"]):
             if bar is not None:
                 pnl_vals[i] = bar["pnl"]
-                colors[i] = '#00C805' if bar["pnl"] >= 0 else '#FF5252'
+                colors[i] = '#00D26A' if bar["pnl"] >= 0 else '#FF3B30'  # Profit/loss from theme
 
         # Add current (incomplete) bar at current_slot
         slot = state["current_slot"]
@@ -1478,7 +1508,7 @@ class AppState(rx.State):
             pnl_close = state["current_pnl"]["close"]
             extremum = state["current_pnl"]["pnl_min"] if pnl_close < 0 else state["current_pnl"]["pnl_max"]
             pnl_vals[slot] = extremum
-            colors[slot] = '#00C805' if extremum >= 0 else '#FF5252'
+            colors[slot] = '#00D26A' if extremum >= 0 else '#FF3B30'  # Profit/loss from theme
 
         # Check if we have any data
         if all(v is None for v in pnl_vals):
@@ -1522,7 +1552,7 @@ class AppState(rx.State):
                 x=x_labels,
                 y=stop_pnl_vals,
                 mode='lines',
-                line=dict(color='rgba(255, 82, 82, 0.7)', width=2),
+                line=dict(color='rgba(255, 59, 48, 0.8)', width=2),  # Red #FF3B30
                 name='Stop',
                 hovertemplate='Stop P&L: $%{y:.2f}<extra></extra>',
             ))
@@ -1627,10 +1657,10 @@ class AppState(rx.State):
             high=[d["high"] for d in data],
             low=[d["low"] for d in data],
             close=[d["close"] for d in data],
-            increasing_line_color='#00C805',
-            decreasing_line_color='#FF5252',
-            increasing_fillcolor='#00C805',
-            decreasing_fillcolor='#FF5252',
+            increasing_line_color='#00D26A',  # Profit green from theme
+            decreasing_line_color='#FF3B30',  # Loss red from theme
+            increasing_fillcolor='#00D26A',
+            decreasing_fillcolor='#FF3B30',
             name=symbol,
         )])
 
