@@ -39,6 +39,7 @@ UI_UPDATE_INTERVAL = 0.5
 BAR_INTERVAL_TICKS = 360
 
 # Chart-Rendering: Alle N Ticks rendern (2 = jede Sekunde bei 500ms interval)
+# Charts werden nur neu gerendert wenn sich der Slot ändert (smart caching)
 CHART_RENDER_INTERVAL = 2
 
 
