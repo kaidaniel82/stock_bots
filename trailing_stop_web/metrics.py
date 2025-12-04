@@ -1,4 +1,44 @@
-"""Group metrics calculation - pure math engine for group valuations."""
+"""Group metrics calculation - pure math engine for group valuations.
+
+SEMANTICS - Position Value Perspective:
+========================================
+All values represent what we OWN (positive) or OWE (negative).
+
+- Long position: We OWN an asset → current_value is POSITIVE (we receive money when closing)
+- Short position: We OWE an asset → current_value is NEGATIVE (we pay money when closing)
+- Credit spread: Net credit received → entry_value POSITIVE, current_value NEGATIVE (pay to close)
+- Debit spread: Net debit paid → entry_value NEGATIVE, current_value POSITIVE (receive to close)
+
+P&L = current_value - entry_cost
+    = what we get now - what we paid/received at entry
+
+Examples:
+---------
+1. Long +5 calls @ $10, now worth $12:
+   - entry_cost = -$5000 (we paid)
+   - current_value = +$6000 (we receive if we close)
+   - P&L = $6000 - (-$5000) = $6000 + $5000 = +$1000 ❌ WRONG
+   - Actually: P&L = current - paid = $6000 - $5000 = +$1000 ✓
+
+2. Short -3 puts @ $42, now worth $41:
+   - entry_cost = +$12600 (we received credit)
+   - current_value = -$12300 (we pay to close)
+   - P&L = -$12300 - (+$12600) = -$24900 ❌ WRONG
+   - Actually: P&L = received - pay_to_close = $12600 - $12300 = +$300 ✓
+
+CORRECTED SEMANTICS:
+====================
+- entry_cost: What we PAID (positive for long, negative for short/credit)
+- current_value: What position is worth NOW (positive for long, negative for short)
+- P&L = current_value - entry_cost (for long) OR entry_credit + current_value (for short)
+
+SIMPLER APPROACH - Cash Flow:
+=============================
+- total_cash_out: Money we spent (always positive or zero)
+- total_cash_in: Money we received (always positive or zero)
+- current_close_value: What we'd get/pay to close (positive = receive, negative = pay)
+- P&L = current_close_value + (total_cash_in - total_cash_out)
+"""
 from dataclasses import dataclass
 from typing import Optional
 
@@ -50,214 +90,449 @@ class LegData:
 
 @dataclass
 class GroupMetrics:
-    """Calculated metrics for a group of positions."""
+    """Calculated metrics for a group of positions.
+
+    All prices (mark, mid, bid, ask, entry, trigger) are PER-UNIT prices,
+    meaning the price for 1 contract of the spread/position.
+
+    For display, these match what you'd see in an option chain.
+    For P&L calculation, we multiply by quantity and multiplier internally.
+    """
     # Leg info
     legs: list[LegData]
 
-    # Value calculations (per-leg basis, summed)
-    group_mark_value: float      # Sum of mark * qty * mult
-    group_mid_value: float       # Sum of mid * qty * mult
+    # Position type info
+    position_type: str           # "LONG", "SHORT", "SPREAD_LONG", "SPREAD_SHORT", "RATIO"
+    is_credit: bool              # True if net credit position (received money at entry)
 
-    # Spread-level bid/ask (Natural Price for closing)
-    # Spread Bid = what you get if you close now (sell longs @ bid, buy shorts @ ask)
-    # Spread Ask = what you pay to enter (buy longs @ ask, sell shorts @ bid)
-    spread_bid: float            # Natural exit price (close value)
-    spread_ask: float            # Natural entry price
+    # Per-unit prices (what you'd see in option chain)
+    # These are ALWAYS POSITIVE - they represent the price of the instrument
+    mark: float                  # Current mark price per unit
+    mid: float                   # Current mid price per unit
+    bid: float                   # Current bid price per unit (what we get to sell)
+    ask: float                   # Current ask price per unit (what we pay to buy)
+    entry: float                 # Entry price per unit (fill price)
 
-    # Cost basis
-    entry_price: float           # Per-contract entry price (for display, like spread_bid)
-    total_cost: float            # Sum of fill_price * abs(qty) * mult (for PnL calc)
+    # Trigger value for trailing stop (based on trigger_price_type)
+    trigger_value: float         # Current trigger price for trailing stop
 
-    # PnL
-    pnl_mark: float              # group_mark_value - total_cost
-    pnl_mid: float               # group_mid_value - total_cost
-    pnl_close: float             # spread_bid - total_cost (realistic exit PnL)
+    # Total position value (with qty * multiplier)
+    # Positive = we receive money, Negative = we pay money
+    total_current_value: float   # Current position value (to close)
+    total_entry_cost: float      # What we paid (positive) or received (negative) at entry
+
+    # P&L
+    pnl: float                   # Unrealized P&L
 
     # Greeks (aggregated for entire group, position-weighted)
-    group_delta: float = 0.0     # Sum of delta * qty * mult
-    group_gamma: float = 0.0     # Sum of gamma * qty * mult
-    group_theta: float = 0.0     # Sum of theta * qty * mult
-    group_vega: float = 0.0      # Sum of vega * qty * mult
+    delta: float = 0.0
+    gamma: float = 0.0
+    theta: float = 0.0
+    vega: float = 0.0
+
+    # Trailing Stop fields (calculated when trail_mode is provided)
+    current_hwm: float = 0.0      # Input HWM (before update check)
+    updated_hwm: float = 0.0      # Output HWM (after update logic)
+    hwm_updated: bool = False     # True if HWM changed this tick
+    trail_stop_price: float = 0.0 # Calculated stop price from HWM
+    trail_limit_price: float = 0.0  # Calculated limit price (if stop_type="limit")
 
     # Formatted strings for UI
     @property
     def mark_str(self) -> str:
-        return f"${self.group_mark_value:.2f}"
+        return f"${self.mark:.2f}"
 
     @property
     def mid_str(self) -> str:
-        return f"${self.group_mid_value:.2f}"
+        return f"${self.mid:.2f}"
 
     @property
-    def spread_bid_str(self) -> str:
-        return f"${self.spread_bid:.2f}"
+    def bid_str(self) -> str:
+        return f"${self.bid:.2f}"
 
     @property
-    def spread_ask_str(self) -> str:
-        return f"${self.spread_ask:.2f}"
+    def ask_str(self) -> str:
+        return f"${self.ask:.2f}"
 
     @property
-    def entry_price_str(self) -> str:
-        return f"${self.entry_price:.2f}"
+    def entry_str(self) -> str:
+        return f"${self.entry:.2f}"
 
     @property
-    def cost_str(self) -> str:
-        return f"${self.entry_price:.2f}"  # Use per-contract price for display
+    def trigger_value_str(self) -> str:
+        return f"${self.trigger_value:.2f}"
 
     @property
-    def pnl_mark_str(self) -> str:
-        return f"${self.pnl_mark:.2f}"
-
-    @property
-    def pnl_mid_str(self) -> str:
-        return f"${self.pnl_mid:.2f}"
-
-    @property
-    def pnl_close_str(self) -> str:
-        return f"${self.pnl_close:.2f}"
+    def pnl_str(self) -> str:
+        return f"${self.pnl:.2f}"
 
     @property
     def delta_str(self) -> str:
-        return f"{self.group_delta:+.2f}"
+        return f"{self.delta:+.2f}"
 
     @property
     def gamma_str(self) -> str:
-        return f"{self.group_gamma:.4f}"
+        return f"{self.gamma:.4f}"
 
     @property
     def theta_str(self) -> str:
-        return f"{self.group_theta:+.2f}"
+        return f"{self.theta:+.2f}"
 
     @property
     def vega_str(self) -> str:
-        return f"{self.group_vega:+.2f}"
+        return f"{self.vega:+.2f}"
+
+    # Legacy compatibility
+    @property
+    def group_mark_value(self) -> float:
+        return self.mark
+
+    @property
+    def group_mid_value(self) -> float:
+        return self.mid
+
+    @property
+    def spread_bid(self) -> float:
+        return self.bid
+
+    @property
+    def spread_ask(self) -> float:
+        return self.ask
+
+    @property
+    def spread_bid_str(self) -> str:
+        return self.bid_str
+
+    @property
+    def spread_ask_str(self) -> str:
+        return self.ask_str
+
+    @property
+    def entry_price(self) -> float:
+        return self.entry
+
+    @property
+    def entry_price_str(self) -> str:
+        return self.entry_str
+
+    @property
+    def cost_str(self) -> str:
+        return self.entry_str
+
+    @property
+    def total_cost(self) -> float:
+        return self.total_entry_cost
+
+    @property
+    def pnl_mark(self) -> float:
+        return self.pnl
+
+    @property
+    def pnl_mid(self) -> float:
+        return self.pnl
+
+    @property
+    def pnl_close(self) -> float:
+        return self.pnl
+
+    @property
+    def pnl_mark_str(self) -> str:
+        return self.pnl_str
+
+    @property
+    def group_delta(self) -> float:
+        return self.delta
+
+    @property
+    def group_gamma(self) -> float:
+        return self.gamma
+
+    @property
+    def group_theta(self) -> float:
+        return self.theta
+
+    @property
+    def group_vega(self) -> float:
+        return self.vega
 
 
-def compute_group_metrics(legs: list[LegData]) -> GroupMetrics:
+def _calculate_stop_price(hwm: float, trail_mode: str, trail_value: float,
+                          is_credit: bool) -> float:
+    """
+    Calculate stop price based on HWM and trail settings.
+
+    DEBIT positions (long, debit spreads): HWM is positive, tracks HIGHEST value
+    - We profit when value goes UP
+    - Stop should be BELOW HWM (trigger when value drops)
+    - Formula: hwm * (1 - trail%) or hwm - trail_value
+
+    CREDIT positions (short, credit spreads): HWM tracks "best" value
+    - Single short: HWM is positive (lowest option price = best)
+      Stop should be ABOVE HWM (trigger when price rises)
+    - Credit spread: HWM is negative (most negative = best)
+      Stop should be less negative (trigger when value rises toward 0)
+
+    The key insight: for credits, stop is in the OPPOSITE direction from debit!
+    """
+    if trail_mode == "percent":
+        if is_credit:
+            # Credit: stop is trail% ABOVE (worse direction)
+            # For negative HWM: -6 * 1.15 = -5.10 (less negative = stop)
+            # For positive HWM (single short): 10 * 1.15 = 11.50 (higher = stop)
+            return round(hwm * (1 + trail_value / 100), 2)
+        else:
+            # Debit: stop is trail% BELOW
+            return round(hwm * (1 - trail_value / 100), 2)
+    else:  # absolute
+        if is_credit:
+            # Credit: stop is trail_value ABOVE (worse direction)
+            return round(hwm + trail_value, 2)
+        else:
+            # Debit: stop is trail_value BELOW
+            return round(hwm - trail_value, 2)
+
+
+def compute_group_metrics(
+    legs: list[LegData],
+    trigger_price_type: str = "mark",
+    # Trailing Stop parameters (optional)
+    trail_mode: str = None,
+    trail_value: float = 0.0,
+    current_hwm: float = 0.0,
+    stop_type: str = "market",
+    limit_offset: float = 0.0,
+    market_open: bool = True,
+) -> GroupMetrics:
     """
     Compute group metrics from leg data.
 
-    Two levels of pricing:
-    1. Per-leg: Mark and Mid for each individual contract
-    2. Spread-level: Natural Bid/Ask for the entire spread
-       - Spread Bid = Sum(Long @ Bid) + Sum(Short @ Ask)  [what you get to close]
-       - Spread Ask = Sum(Long @ Ask) + Sum(Short @ Bid)  [what you pay to enter]
+    Args:
+        legs: List of position legs
+        trigger_price_type: Which price to use for trailing stop trigger
+                           ("mark", "mid", "bid", "ask", "last")
+        trail_mode: "percent" or "absolute" (optional, enables HWM/stop calculation)
+        trail_value: Trail amount (10 = 10% or $10 depending on mode)
+        current_hwm: Current high water mark (passed in from state)
+        stop_type: "market" or "limit"
+        limit_offset: Offset for limit orders
+        market_open: Whether market is open (HWM only updates when open)
+
+    Returns:
+        GroupMetrics with all calculated values including trailing stop fields
+
+    Calculation Logic:
+    ==================
+    1. Determine position type (single long/short, spread, ratio)
+    2. Calculate per-unit prices (always positive, like option chain)
+    3. Calculate total position value with qty * multiplier
+    4. Calculate P&L
+    5. Update HWM if new best value and market is open
+    6. Calculate stop/limit prices from HWM
     """
     if not legs:
         return GroupMetrics(
             legs=[],
-            group_mark_value=0.0,
-            group_mid_value=0.0,
-            spread_bid=0.0,
-            spread_ask=0.0,
-            entry_price=0.0,
-            total_cost=0.0,
-            pnl_mark=0.0,
-            pnl_mid=0.0,
-            pnl_close=0.0,
-            group_delta=0.0,
-            group_gamma=0.0,
-            group_theta=0.0,
-            group_vega=0.0,
+            position_type="EMPTY",
+            is_credit=False,
+            mark=0.0,
+            mid=0.0,
+            bid=0.0,
+            ask=0.0,
+            entry=0.0,
+            trigger_value=0.0,
+            total_current_value=0.0,
+            total_entry_cost=0.0,
+            pnl=0.0,
+            delta=0.0,
+            gamma=0.0,
+            theta=0.0,
+            vega=0.0,
         )
 
-    # For display: per-contract prices (like option chain shows)
-    # For PnL: total position value with multiplier
-    group_mark_value = 0.0  # Per-contract mark (no qty, no mult)
-    group_mid_value = 0.0   # Per-contract mid
-    spread_bid = 0.0        # Per-contract natural exit price
-    spread_ask = 0.0        # Per-contract natural entry price
-    entry_price = 0.0       # Per-contract fill/entry price
+    # === STEP 1: Determine position type and calculate GCD for per-unit pricing ===
+    long_legs = [l for l in legs if l.is_long]
+    short_legs = [l for l in legs if not l.is_long]
 
-    mark_value_pos = 0.0    # Total position mark value (WITH qty * mult) for PnL
-    mid_value_pos = 0.0     # Total position mid value for PnL
-    close_value = 0.0       # Total exit value for pnl_close calculation
-    total_cost = 0.0
+    if len(legs) == 1:
+        position_type = "LONG" if legs[0].is_long else "SHORT"
+    elif len(long_legs) > 0 and len(short_legs) > 0:
+        # Multi-leg spread
+        long_qty = sum(abs(l.quantity) for l in long_legs)
+        short_qty = sum(abs(l.quantity) for l in short_legs)
+        if long_qty == short_qty:
+            position_type = "SPREAD"
+        else:
+            position_type = "RATIO"
+    elif len(long_legs) > 0:
+        position_type = "LONG"  # All long legs
+    else:
+        position_type = "SHORT"  # All short legs
 
-    # Greeks aggregated (position-weighted)
-    group_delta = 0.0
-    group_gamma = 0.0
-    group_theta = 0.0
-    group_vega = 0.0
+    # Calculate GCD of all quantities to find "1 unit" of the position
+    # e.g., +6/-2 has GCD=2, so 1 unit = +3/-1
+    # e.g., +5/-5 has GCD=5, so 1 unit = +1/-1
+    from math import gcd
+    from functools import reduce
+    all_qtys = [abs(int(l.quantity)) for l in legs]
+    position_gcd = reduce(gcd, all_qtys) if all_qtys else 1
+
+    # === STEP 2: Calculate per-unit and total values ===
+    # Per-unit accumulators - weighted by unit_qty (qty / gcd)
+    unit_mark = 0.0
+    unit_mid = 0.0
+    unit_bid = 0.0  # What we get if we close (sell longs @ bid, buy shorts @ ask)
+    unit_ask = 0.0  # What we pay if we enter (buy longs @ ask, sell shorts @ bid)
+    unit_entry = 0.0
+
+    # Total position value accumulators
+    total_current = 0.0  # Current value to close position
+    total_entry = 0.0    # What we paid/received at entry
+
+    # Greeks
+    total_delta = 0.0
+    total_gamma = 0.0
+    total_theta = 0.0
+    total_vega = 0.0
 
     for leg in legs:
-        qty = leg.quantity
-        mult = leg.multiplier
+        qty = leg.quantity  # Signed quantity
         abs_qty = abs(qty)
-        # Sign: +1 for long, -1 for short
-        sign = 1 if leg.is_long else -1
+        mult = leg.multiplier
+        is_long = leg.is_long
 
-        # Per-contract Mark value (no qty multiplier for display)
-        # Long adds value, short subtracts (spread pricing)
-        group_mark_value += leg.mark * sign
-        # Total position value with qty and mult for PnL
-        mark_value_pos += leg.mark * qty * mult
+        # Unit quantity for per-unit pricing (qty / gcd)
+        unit_qty = abs_qty // position_gcd
 
-        # Per-contract Mid value
-        mid = leg.mid if leg.mid > 0 else leg.mark
-        group_mid_value += mid * sign
-        mid_value_pos += mid * qty * mult
+        # Get prices with fallbacks
+        leg_mark = leg.mark if leg.mark > 0 else leg.mid
+        leg_mid = leg.mid if leg.mid > 0 else leg.mark
+        leg_bid = leg.bid if leg.bid > 0 else leg_mark
+        leg_ask = leg.ask if leg.ask > 0 else leg_mark
 
-        # Spread-level Natural Price calculation (per-contract)
-        # For closing the spread:
-        #   Long legs: sell at bid
-        #   Short legs: buy back at ask
-        leg_bid = leg.bid if leg.bid > 0 else leg.mark
-        leg_ask = leg.ask if leg.ask > 0 else leg.mark
-
-        if leg.is_long:
-            # Long: to close, sell at bid
-            spread_bid += leg_bid      # Per-contract
-            spread_ask += leg_ask
-            close_value += leg_bid * abs_qty * mult  # Total for PnL
+        # === Per-unit prices (weighted by unit_qty) ===
+        # For a 2:1 ratio (+2/-1), unit_qty for long=2, short=1
+        # Mark per unit = (long_mark * 2) - (short_mark * 1)
+        if is_long:
+            unit_mark += leg_mark * unit_qty
+            unit_mid += leg_mid * unit_qty
+            unit_bid += leg_bid * unit_qty   # Sell long @ bid
+            unit_ask += leg_ask * unit_qty   # Buy long @ ask
+            unit_entry += leg.fill_price * unit_qty
         else:
-            # Short: to close, buy at ask (cost us money, so subtract)
-            spread_bid -= leg_ask      # Per-contract
-            spread_ask -= leg_bid
-            close_value -= leg_ask * abs_qty * mult  # Total for PnL
+            unit_mark -= leg_mark * unit_qty
+            unit_mid -= leg_mid * unit_qty
+            unit_bid -= leg_ask * unit_qty   # Buy back short @ ask (costs us)
+            unit_ask -= leg_bid * unit_qty   # Sell short @ bid (we receive)
+            unit_entry -= leg.fill_price * unit_qty
 
-        # Cost basis
-        # Per-contract entry price (like spread_bid/ask - for display)
-        if leg.is_long:
-            entry_price += leg.fill_price  # Long: paid this
+        # === Total position value (with qty * multiplier) ===
+        # Use MARK for current value (like broker does), not bid/ask
+        if is_long:
+            total_current += leg_mark * abs_qty * mult  # Current value at mark
+            total_entry += leg.fill_price * abs_qty * mult  # Paid at entry
         else:
-            entry_price -= leg.fill_price  # Short: received this (credit)
+            total_current -= leg_mark * abs_qty * mult  # Current value at mark (negative for short)
+            total_entry -= leg.fill_price * abs_qty * mult  # Received at entry (credit)
 
-        # Total cost with qty and mult (for PnL calculation)
-        if leg.is_long:
-            total_cost += leg.fill_price * abs_qty * mult
+        # Greeks (position-weighted)
+        total_delta += leg.delta * qty * mult
+        total_gamma += leg.gamma * qty * mult
+        total_theta += leg.theta * qty * mult
+        total_vega += leg.vega * qty * mult
+
+    # === STEP 3: Normalize per-unit prices ===
+    # For single positions, we want to show the actual instrument prices
+    # For spreads, the calculated spread prices
+
+    if position_type in ("LONG", "SHORT") and len(legs) == 1:
+        # Single position: show the actual instrument prices (not spread-calculated)
+        leg = legs[0]
+        unit_mark = leg.mark if leg.mark > 0 else leg.mid
+        unit_mid = leg.mid if leg.mid > 0 else leg.mark
+        unit_bid = leg.bid if leg.bid > 0 else unit_mark
+        unit_ask = leg.ask if leg.ask > 0 else unit_mark
+        unit_entry = leg.fill_price
+
+    # Determine if credit or debit
+    is_credit = total_entry < 0  # Negative entry = received credit
+
+    # === STEP 4: Calculate P&L ===
+    # P&L = Current value - Entry cost
+    # If we paid $1000 (total_entry = 1000) and now worth $1200 (total_current = 1200)
+    #   P&L = 1200 - 1000 = +$200
+    # If we received $500 credit (total_entry = -500) and now costs $300 to close (total_current = -300)
+    #   P&L = -300 - (-500) = -300 + 500 = +$200
+    pnl = total_current - total_entry
+
+    # === STEP 5: Calculate trigger value ===
+    # Use the appropriate price based on trigger_price_type
+    if trigger_price_type == "bid":
+        trigger_value = unit_bid
+    elif trigger_price_type == "ask":
+        trigger_value = unit_ask
+    elif trigger_price_type == "mid":
+        trigger_value = unit_mid
+    else:  # "mark" or "last"
+        trigger_value = unit_mark
+
+    # === STEP 6: Calculate HWM and Stop prices (if trail_mode provided) ===
+    updated_hwm = current_hwm
+    hwm_updated = False
+    trail_stop_price = 0.0
+    trail_limit_price = 0.0
+
+    if trail_mode:
+        # Determine if this is a new "best" value
+        # Credit: lower (more negative) is better -> track lowest value
+        # Debit: higher is better -> track highest value
+        if is_credit:
+            is_new_best = trigger_value < current_hwm or current_hwm == 0
         else:
-            total_cost -= leg.fill_price * abs_qty * mult  # Credit received
+            is_new_best = trigger_value > current_hwm
 
-        # Aggregate Greeks (position-weighted: greek * qty * mult)
-        group_delta += leg.delta * qty * mult
-        group_gamma += leg.gamma * qty * mult
-        group_theta += leg.theta * qty * mult
-        group_vega += leg.vega * qty * mult
+        # Update HWM only when market is open
+        if market_open and is_new_best:
+            updated_hwm = trigger_value
+            hwm_updated = True
+            direction = "down" if is_credit else "up"
+            logger.debug(f"Trailing: HWM updated {direction} ${current_hwm:.2f} -> ${trigger_value:.2f}")
 
-    # Calculate PnL (all with multiplier for position value)
-    pnl_mark = mark_value_pos - total_cost
-    pnl_mid = mid_value_pos - total_cost
-    pnl_close = close_value - total_cost  # Realistic exit PnL (with multiplier)
+        # Calculate stop price from HWM
+        if updated_hwm != 0:
+            trail_stop_price = _calculate_stop_price(updated_hwm, trail_mode, trail_value, is_credit)
+
+            # Calculate limit price if limit order type
+            if stop_type == "limit" and trail_stop_price != 0:
+                trail_limit_price = round(trail_stop_price - limit_offset, 2)
 
     logger.info(
-        f"Group metrics: entry_price=${entry_price:.2f} spread_bid=${spread_bid:.2f} "
-        f"spread_ask=${spread_ask:.2f} total_cost=${total_cost:.2f}"
+        f"Group metrics [{position_type}]: entry=${unit_entry:.2f} bid=${unit_bid:.2f} "
+        f"ask=${unit_ask:.2f} mark=${unit_mark:.2f} trigger={trigger_price_type}=${trigger_value:.2f} "
+        f"total_entry=${total_entry:.2f} total_current=${total_current:.2f} P&L=${pnl:.2f}"
+        f"{f' HWM=${updated_hwm:.2f} Stop=${trail_stop_price:.2f}' if trail_mode else ''}"
     )
 
     return GroupMetrics(
         legs=legs,
-        group_mark_value=round(group_mark_value, 2),
-        group_mid_value=round(group_mid_value, 2),
-        spread_bid=round(spread_bid, 2),
-        spread_ask=round(spread_ask, 2),
-        entry_price=round(entry_price, 2),
-        total_cost=round(total_cost, 2),
-        pnl_mark=round(pnl_mark, 2),
-        pnl_mid=round(pnl_mid, 2),
-        pnl_close=round(pnl_close, 2),
-        group_delta=round(group_delta, 2),
-        group_gamma=round(group_gamma, 4),
-        group_theta=round(group_theta, 2),
-        group_vega=round(group_vega, 2),
+        position_type=position_type,
+        is_credit=is_credit,
+        mark=round(unit_mark, 2),
+        mid=round(unit_mid, 2),
+        bid=round(unit_bid, 2),
+        ask=round(unit_ask, 2),
+        entry=round(unit_entry, 2),
+        trigger_value=round(trigger_value, 2),
+        total_current_value=round(total_current, 2),
+        total_entry_cost=round(total_entry, 2),
+        pnl=round(pnl, 2),
+        delta=round(total_delta, 2),
+        gamma=round(total_gamma, 4),
+        theta=round(total_theta, 2),
+        vega=round(total_vega, 2),
+        # Trailing stop fields
+        current_hwm=round(current_hwm, 2),
+        updated_hwm=round(updated_hwm, 2),
+        hwm_updated=hwm_updated,
+        trail_stop_price=trail_stop_price,
+        trail_limit_price=trail_limit_price,
     )

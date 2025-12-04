@@ -4,8 +4,15 @@ from datetime import datetime
 from threading import Thread
 from typing import Callable, Optional
 import asyncio
+import logging
+from pathlib import Path
 from ib_insync import IB, Contract, Option, Stock, Index, Future, ComboLeg, PortfolioItem, Ticker, util, Order, Trade
 import uuid
+
+# Enable ib_insync debug logging to file
+IB_LOG_FILE = Path.home() / ".trailing_stop_web" / "ib_insync.log"
+IB_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+util.logToFile(str(IB_LOG_FILE), level=logging.DEBUG)
 
 from .config import (
     TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
@@ -411,19 +418,21 @@ class TWSBroker:
         """Fetch portfolio and process updates."""
         try:
             portfolio = self.ib.portfolio()
-            logger.debug(f"Broker fetching: {len(portfolio) if portfolio else 0} positions")
+            # Log all position conIds for debugging
+            if portfolio:
+                con_ids = [item.contract.conId for item in portfolio]
+                logger.debug(f"Broker fetching: {len(portfolio)} positions, conIds: {con_ids}")
 
-            if not portfolio:
-                return
-
-            # Track which conIds we saw
+            # Track which conIds we saw (empty set if no portfolio)
             seen_ids = set()
 
-            for item in portfolio:
-                self._process_portfolio_item(item)
-                seen_ids.add(item.contract.conId)
+            if portfolio:
+                for item in portfolio:
+                    self._process_portfolio_item(item)
+                    seen_ids.add(item.contract.conId)
 
             # Remove positions that are no longer in portfolio
+            # This also handles the case when portfolio becomes empty
             removed = [cid for cid in self._positions if cid not in seen_ids]
             for cid in removed:
                 logger.info(f"Position removed: {self._positions[cid].symbol}")
@@ -681,21 +690,95 @@ class TWSBroker:
         return pos.market_price if pos else 0.0
 
     def _load_entry_prices(self):
-        """Load entry prices from recent executions (7 day history)."""
+        """Load entry prices from recent executions (7 day history).
+
+        Only considers OPENING trades (BUY for long, SELL for short).
+        Uses weighted average if multiple opening fills exist.
+        """
         try:
             self.ib.sleep(0.1)
             self.ib.reqExecutions()
             self.ib.sleep(0.2)
             fills = self.ib.fills()
 
-            if fills:
-                for fill in fills:
-                    con_id = fill.contract.conId
-                    # Store the fill price as entry price
-                    self._entry_prices[con_id] = fill.execution.price
-                logger.info(f"Loaded {len(fills)} entry prices from executions")
-            else:
+            if not fills:
                 logger.info("No recent executions found for entry prices")
+                return
+
+            # Group fills by contract and calculate weighted average for opening trades
+            # Key: con_id -> {"buys": [(qty, price), ...], "sells": [(qty, price), ...]}
+            fill_data: dict[int, dict] = {}
+
+            for fill in fills:
+                con_id = fill.contract.conId
+                action = fill.execution.side  # "BOT" or "SLD"
+                qty = fill.execution.shares
+                price = fill.execution.price
+
+                if con_id not in fill_data:
+                    fill_data[con_id] = {"buys": [], "sells": []}
+
+                if action == "BOT":
+                    fill_data[con_id]["buys"].append((qty, price))
+                else:  # SLD
+                    fill_data[con_id]["sells"].append((qty, price))
+
+            # For each position, determine entry price based on current position
+            for con_id, data in fill_data.items():
+                pos = self._positions.get(con_id)
+                if not pos:
+                    continue
+
+                # Determine which fills are "opening" based on position direction
+                if pos.quantity > 0:
+                    # Long position - BUY fills are opening trades
+                    opening_fills = data["buys"]
+                else:
+                    # Short position - SELL fills are opening trades
+                    opening_fills = data["sells"]
+
+                if opening_fills:
+                    # Calculate weighted average price from opening fills
+                    total_qty = sum(qty for qty, _ in opening_fills)
+                    total_value = sum(qty * price for qty, price in opening_fills)
+                    if total_qty > 0:
+                        avg_price = total_value / total_qty
+                        self._entry_prices[con_id] = avg_price
+                        logger.debug(f"Entry price for {con_id}: ${avg_price:.2f} "
+                                    f"(from {len(opening_fills)} fills, {total_qty} shares)")
+                else:
+                    # Fallback: use avg_cost from portfolio if no opening fills found
+                    # This handles cases where fills are older than 7 days
+                    multiplier = 1
+                    if pos.raw_contract and hasattr(pos.raw_contract, 'multiplier') and pos.raw_contract.multiplier:
+                        try:
+                            multiplier = int(pos.raw_contract.multiplier)
+                        except (ValueError, TypeError):
+                            multiplier = 100 if pos.sec_type in ("OPT", "FOP") else 1
+                    else:
+                        multiplier = 100 if pos.sec_type in ("OPT", "FOP") else 1
+
+                    avg_price = pos.avg_cost / multiplier if multiplier > 0 else pos.avg_cost
+                    self._entry_prices[con_id] = avg_price
+                    logger.debug(f"Entry price for {con_id}: ${avg_price:.2f} (from avg_cost fallback)")
+
+            # Also add positions without any fills (using avg_cost fallback)
+            for con_id, pos in self._positions.items():
+                if con_id not in self._entry_prices:
+                    multiplier = 1
+                    if pos.raw_contract and hasattr(pos.raw_contract, 'multiplier') and pos.raw_contract.multiplier:
+                        try:
+                            multiplier = int(pos.raw_contract.multiplier)
+                        except (ValueError, TypeError):
+                            multiplier = 100 if pos.sec_type in ("OPT", "FOP") else 1
+                    else:
+                        multiplier = 100 if pos.sec_type in ("OPT", "FOP") else 1
+
+                    avg_price = pos.avg_cost / multiplier if multiplier > 0 else pos.avg_cost
+                    self._entry_prices[con_id] = avg_price
+                    logger.debug(f"Entry price for {con_id}: ${avg_price:.2f} (avg_cost, no fills)")
+
+            logger.info(f"Loaded entry prices for {len(self._entry_prices)} positions")
         except Exception as e:
             logger.error(f"Error loading entry prices: {e}")
 
@@ -738,13 +821,25 @@ class TWSBroker:
             logger.error("No positions provided for combo contract")
             return None
 
+        # Log available vs requested positions for debugging
+        available_ids = list(self._positions.keys())
+        requested_ids = list(position_quantities.keys())
+        logger.debug(f"build_combo_contract: requested={requested_ids}, available={available_ids}")
+
         if len(position_quantities) == 1:
             # Single leg - return the position's contract
             con_id = list(position_quantities.keys())[0]
             pos = self._positions.get(con_id)
             if pos and pos.raw_contract:
-                return pos.raw_contract
-            logger.error(f"Position {con_id} not found")
+                contract = pos.raw_contract
+                # Ensure exchange is set (required for orders)
+                if not contract.exchange and contract.primaryExchange:
+                    contract.exchange = contract.primaryExchange
+                elif not contract.exchange:
+                    contract.exchange = "SMART"
+                logger.debug(f"Using single-leg contract: {contract.localSymbol} conId={con_id}")
+                return contract
+            logger.error(f"Position {con_id} not found in available positions: {available_ids}")
             return None
 
         # Multi-leg combo
@@ -795,7 +890,8 @@ class TWSBroker:
         stop_type: str,   # "market" or "limit"
         limit_offset: float,
         oca_group: str,
-        action: str = "SELL"  # SELL to close long, BUY to close short
+        action: str = "SELL",  # SELL to close long, BUY to close short
+        initial_stop_price: float = 0.0  # Required for TRAIL LIMIT
     ) -> Optional[Trade]:
         """Place a trailing stop order.
 
@@ -808,6 +904,7 @@ class TWSBroker:
             limit_offset: Offset for limit orders
             oca_group: OCA group identifier
             action: "SELL" or "BUY"
+            initial_stop_price: Initial stop price (required for TRAIL LIMIT)
 
         Returns:
             Trade object or None if failed
@@ -831,11 +928,15 @@ class TWSBroker:
                 order.trailingPercent = trail_amount
                 if stop_type == "limit":
                     order.lmtPriceOffset = limit_offset
+                    if initial_stop_price > 0:
+                        order.trailStopPrice = initial_stop_price
             else:  # absolute
                 order.orderType = "TRAIL" if stop_type == "market" else "TRAIL LIMIT"
                 order.auxPrice = trail_amount  # Trail amount in dollars
                 if stop_type == "limit":
                     order.lmtPriceOffset = limit_offset
+                    if initial_stop_price > 0:
+                        order.trailStopPrice = initial_stop_price
 
             trade = self.ib.placeOrder(contract, order)
 
@@ -847,6 +948,298 @@ class TWSBroker:
         except Exception as e:
             logger.error(f"Failed to place trailing stop: {e}")
             return None
+
+    # ==========================================================================
+    # TRIGGER METHOD MAPPING
+    # ==========================================================================
+
+    # Map UI trigger_price_type to IB triggerMethod for stop orders
+    # See: https://interactivebrokers.github.io/tws-api/trigger_method_limit.html
+    TRIGGER_METHOD_MAP = {
+        "mark": 0,    # Default (IB decides based on instrument)
+        "mid": 8,     # Mid-point
+        "bid": 4,     # Bid/Ask
+        "ask": 4,     # Bid/Ask
+        "last": 2,    # Last price
+    }
+
+    def get_trigger_method(self, trigger_price_type: str) -> int:
+        """Map UI trigger price type to IB triggerMethod.
+
+        Args:
+            trigger_price_type: "mark", "mid", "bid", "ask", or "last"
+
+        Returns:
+            IB triggerMethod value (0=default, 2=last, 4=bid/ask, 8=mid)
+        """
+        return self.TRIGGER_METHOD_MAP.get(trigger_price_type, 0)
+
+    # ==========================================================================
+    # APP-CONTROLLED STOP ORDERS (replaces TWS-native TRAIL orders for combos)
+    # ==========================================================================
+
+    # Cache for market rules by (conId, exchange)
+    _market_rules_cache: dict[tuple[int, str], list] = {}
+
+    def _get_price_increment(self, contract: Contract, price: float) -> float:
+        """Get price increment for a contract at a given price using MarketRules.
+
+        The tick size can vary based on the price level (e.g., SPX options have
+        different increments for prices above/below $3).
+
+        According to IB docs: marketRuleIds and validExchanges are positionally mapped.
+        marketRuleIds[n] corresponds to validExchanges[n].
+
+        Args:
+            contract: IB Contract
+            price: Current price to determine increment for
+
+        Returns:
+            Price increment (e.g., 0.01, 0.05, 0.10)
+        """
+        cache_key = (contract.conId, contract.exchange or "SMART")
+        default_tick = 0.01
+
+        try:
+            # Check cache first
+            if cache_key not in self._market_rules_cache:
+                details = self.ib.reqContractDetails(contract)
+                if not details:
+                    return default_tick
+
+                cd = details[0]
+                exchanges = cd.validExchanges.split(",")
+                rule_ids = cd.marketRuleIds.split(",")
+
+                # Find the rule ID for our exchange (positional mapping)
+                exchange = contract.exchange or "SMART"
+                rule_id_to_use = None
+
+                if exchange in exchanges:
+                    idx = exchanges.index(exchange)
+                    if idx < len(rule_ids) and rule_ids[idx]:
+                        rule_id_to_use = int(rule_ids[idx])
+
+                # Fallback: use first rule if exchange not found
+                if rule_id_to_use is None and rule_ids and rule_ids[0]:
+                    rule_id_to_use = int(rule_ids[0])
+                    logger.debug(f"Exchange {exchange} not in {exchanges}, using first rule")
+
+                if rule_id_to_use is not None:
+                    # Only fetch the single rule we need (not all rules)
+                    rule = self.ib.reqMarketRule(rule_id_to_use)
+                    self._market_rules_cache[cache_key] = rule if rule else []
+                else:
+                    self._market_rules_cache[cache_key] = []
+
+            # Find increment for this price level
+            rule = self._market_rules_cache.get(cache_key, [])
+            increment = default_tick
+
+            for price_rule in rule:
+                if price_rule.lowEdge <= price:
+                    increment = float(price_rule.increment)
+                else:
+                    break
+
+            logger.debug(f"Price increment for {contract.localSymbol or contract.symbol} "
+                        f"at ${price:.2f}: {increment}")
+            return increment
+
+        except Exception as e:
+            logger.warning(f"Error getting price increment for {contract.symbol}: {e}")
+            # Fallback for SPX options based on price level
+            if contract.symbol == "SPX" and contract.secType == "OPT":
+                if price >= 3.0:
+                    return 0.10
+                else:
+                    return 0.05
+            return default_tick
+
+    def _get_min_tick(self, contract: Contract) -> float:
+        """Get minTick (fallback, uses default price of 10).
+
+        For backwards compatibility. Prefer _get_price_increment() with actual price.
+        """
+        return self._get_price_increment(contract, 10.0)
+
+    def _round_to_tick(self, price: float, increment: float) -> float:
+        """Round price to valid tick size.
+
+        Args:
+            price: Price to round
+            increment: Price increment
+
+        Returns:
+            Rounded price
+        """
+        if increment <= 0:
+            increment = 0.01  # Fallback
+
+        # Round to nearest tick
+        return round(price / increment) * increment
+
+    def place_stop_order(
+        self,
+        contract: Contract,
+        quantity: int,
+        stop_price: float,
+        limit_price: float = 0.0,  # 0 = Stop-Market, >0 = Stop-Limit
+        oca_group: str = "",
+        action: str = "SELL",
+        trigger_method: int = 0,
+    ) -> Optional[Trade]:
+        """Place a Stop or Stop-Limit order (App controls trailing).
+
+        This replaces TWS-native TRAIL/TRAIL LIMIT orders which don't work
+        with BAG contracts (multi-leg combos). The app calculates the stop price
+        and modifies it dynamically via modify_stop_order().
+
+        Args:
+            contract: Contract or BAG contract for combo
+            quantity: Total quantity to trade
+            stop_price: Trigger price (auxPrice in TWS)
+            limit_price: Limit price for execution. If 0, places STP (market) order.
+            oca_group: OCA group identifier
+            action: "SELL" or "BUY"
+            trigger_method: IB trigger method (0=default, 2=last, 4=bid/ask, 8=mid)
+
+        Returns:
+            Trade object or None if failed
+        """
+        if not self.is_connected():
+            logger.error("Cannot place order: not connected")
+            return None
+
+        try:
+            order = Order()
+            order.action = action
+            order.totalQuantity = abs(quantity)
+
+            # Get price increment based on actual price level and round
+            stop_increment = self._get_price_increment(contract, abs(stop_price))
+            stop_price_rounded = self._round_to_tick(abs(stop_price), stop_increment)
+
+            if limit_price == 0 or limit_price is None:
+                # Stop-Market Order
+                order.orderType = "STP"
+                order.auxPrice = stop_price_rounded
+            else:
+                # Stop-Limit Order - limit price may have different increment
+                limit_increment = self._get_price_increment(contract, abs(limit_price))
+                limit_price_rounded = self._round_to_tick(abs(limit_price), limit_increment)
+                order.orderType = "STP LMT"
+                order.auxPrice = stop_price_rounded
+                order.lmtPrice = limit_price_rounded
+
+            order.triggerMethod = trigger_method
+            order.transmit = True
+            order.tif = "GTC"  # Good Till Cancelled
+
+            # OCA group settings
+            if oca_group:
+                order.ocaGroup = oca_group
+                order.ocaType = 1  # Cancel all remaining on fill
+
+            # Log contract details for debugging
+            logger.debug(f"Placing order on contract: {contract.secType} {contract.symbol} "
+                        f"conId={contract.conId} exchange={contract.exchange}")
+
+            trade = self.ib.placeOrder(contract, order)
+
+            # Brief wait to receive order status update from TWS
+            try:
+                self.ib.sleep(0.1)
+            except RuntimeError:
+                # "This event loop is already running" - fallback
+                try:
+                    self.ib.waitOnUpdate(timeout=0.1)
+                except Exception:
+                    pass
+
+            # Check order status
+            status = trade.orderStatus.status if trade.orderStatus else "Unknown"
+            logger.info(f"Placed {order.orderType} order: orderId={trade.order.orderId} "
+                       f"status={status} stop=${stop_price:.2f} action={action} "
+                       f"contract={contract.localSymbol or contract.symbol}")
+
+            # Warn if order not submitted
+            if status in ("PendingSubmit", "ApiCancelled", "Cancelled"):
+                logger.warning(f"Order {trade.order.orderId} may not have been accepted: {status}")
+
+            return trade
+
+        except Exception as e:
+            logger.error(f"Failed to place stop order: {e}")
+            return None
+
+    def modify_stop_order(
+        self,
+        order_id: int,
+        new_stop_price: float,
+        new_limit_price: float = 0.0,
+    ) -> bool:
+        """Modify an existing Stop or Stop-Limit order's prices.
+
+        Called by state.py tick_update() when HWM changes.
+
+        Args:
+            order_id: TWS Order ID
+            new_stop_price: New trigger price
+            new_limit_price: New limit price (0 for Stop-Market)
+
+        Returns:
+            True if modification successful, False otherwise
+        """
+        if not self.is_connected():
+            logger.warning("Cannot modify order: not connected")
+            return False
+
+        try:
+            # Find the existing trade
+            trades = [t for t in self.ib.openTrades() if t.order.orderId == order_id]
+            if not trades:
+                logger.warning(f"Order {order_id} not found in open trades - may have been filled")
+                return False
+
+            trade = trades[0]
+            order = trade.order
+
+            # Check if order is in a modifiable state
+            # Skip modification if order is still being submitted or already cancelled/filled
+            status = trade.orderStatus.status if trade.orderStatus else ""
+            if status in ("PendingSubmit", "PendingCancel", "Cancelled", "Filled"):
+                logger.debug(f"Order {order_id} not modifiable (status={status})")
+                return False
+
+            # Check if prices actually changed (avoid unnecessary modifications)
+            stop_changed = abs(order.auxPrice - abs(new_stop_price)) >= 0.01
+            limit_changed = (new_limit_price > 0 and
+                           hasattr(order, 'lmtPrice') and
+                           abs(order.lmtPrice - abs(new_limit_price)) >= 0.01)
+
+            if not stop_changed and not limit_changed:
+                return True  # No change needed
+
+            # Get price increment based on actual price level and round
+            stop_increment = self._get_price_increment(trade.contract, abs(new_stop_price))
+
+            # Update prices
+            order.auxPrice = self._round_to_tick(abs(new_stop_price), stop_increment)
+            if new_limit_price > 0:
+                limit_increment = self._get_price_increment(trade.contract, abs(new_limit_price))
+                order.lmtPrice = self._round_to_tick(abs(new_limit_price), limit_increment)
+
+            # Re-place the order (ib_insync handles modification)
+            self.ib.placeOrder(trade.contract, order)
+
+            limit_str = f"${new_limit_price:.2f}" if new_limit_price else "N/A"
+            logger.debug(f"Modified order {order_id}: stop=${new_stop_price:.2f} limit={limit_str}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to modify order {order_id}: {e}")
+            return False
 
     def place_time_exit_order(
         self,
@@ -903,14 +1296,32 @@ class TWSBroker:
         self,
         group_name: str,
         position_quantities: dict[int, int],
-        trail_value: float,
-        trail_mode: str,
         stop_type: str,
         limit_offset: float,
         time_exit_enabled: bool,
-        time_exit_time: str
+        time_exit_time: str,
+        initial_stop_price: float,
+        initial_limit_price: float = 0.0,
+        trigger_price_type: str = "mark",
+        is_credit: bool = False,
     ) -> Optional[dict]:
-        """Place complete OCA order group (trailing stop + optional time exit).
+        """Place complete OCA order group (stop order + optional time exit).
+
+        NOTE: This now uses app-controlled STP/STP LMT orders instead of
+        TWS-native TRAIL orders, because TRAIL doesn't work with BAG contracts.
+        The app will modify stop prices dynamically via modify_stop_order().
+
+        Args:
+            group_name: Name for logging and OCA group ID
+            position_quantities: {con_id: quantity} mapping
+            stop_type: "market" (STP) or "limit" (STP LMT)
+            limit_offset: Offset for limit price (only used if stop_type="limit")
+            time_exit_enabled: Whether to place time exit order
+            time_exit_time: Time for exit in HH:MM format
+            initial_stop_price: Initial stop trigger price
+            initial_limit_price: Initial limit price (0 for stop-market)
+            trigger_price_type: "mark", "mid", "bid", "ask", "last"
+            is_credit: True for credit/short positions (action=BUY to close)
 
         Returns:
             Dict with oca_group_id, trailing_order_id, time_exit_order_id
@@ -924,26 +1335,36 @@ class TWSBroker:
 
             total_qty = sum(abs(q) for q in position_quantities.values())
 
-            # Determine action: if net position is long, SELL to close
-            net_qty = sum(position_quantities.values())
-            action = "SELL" if net_qty > 0 else "BUY"
+            # Determine action based on position type:
+            # - LONG/Debit positions (is_credit=False): SELL to close
+            # - SHORT/Credit positions (is_credit=True): BUY to close
+            action = "BUY" if is_credit else "SELL"
 
             # Create OCA group
             oca_group = self.create_oca_group_id(group_name)
 
-            # Place trailing stop
-            trailing_trade = self.place_trailing_stop_order(
+            # Get trigger method from trigger_price_type
+            trigger_method = self.get_trigger_method(trigger_price_type)
+
+            # Calculate limit price based on stop_type
+            if stop_type == "market":
+                limit_price = 0.0  # STP order (no limit)
+            else:
+                # STP LMT order
+                limit_price = initial_limit_price if initial_limit_price > 0 else (initial_stop_price - limit_offset)
+
+            # Place app-controlled stop order (STP or STP LMT)
+            stop_trade = self.place_stop_order(
                 contract=contract,
                 quantity=total_qty,
-                trail_amount=trail_value,
-                trail_mode=trail_mode,
-                stop_type=stop_type,
-                limit_offset=limit_offset,
+                stop_price=initial_stop_price,
+                limit_price=limit_price,
                 oca_group=oca_group,
-                action=action
+                action=action,
+                trigger_method=trigger_method,
             )
 
-            if not trailing_trade:
+            if not stop_trade:
                 return None
 
             time_exit_order_id = 0
@@ -960,11 +1381,12 @@ class TWSBroker:
                 if time_trade:
                     time_exit_order_id = time_trade.order.orderId
 
-            logger.info(f"OCA group placed: {oca_group} trailing={trailing_trade.order.orderId} time_exit={time_exit_order_id}")
+            logger.info(f"OCA group placed: {oca_group} action={action} stop={stop_trade.order.orderId} "
+                       f"type={stop_trade.order.orderType} time_exit={time_exit_order_id}")
 
             return {
                 "oca_group_id": oca_group,
-                "trailing_order_id": trailing_trade.order.orderId,
+                "trailing_order_id": stop_trade.order.orderId,  # Keep field name for compatibility
                 "time_exit_order_id": time_exit_order_id
             }
 
@@ -1281,11 +1703,11 @@ class TWSBroker:
                     contract = Stock(symbol, "SMART", "USD")
                     await self.ib.qualifyContractsAsync(contract)
 
-                # Request just the latest bar (5 mins duration for 3-min bar)
+                # Request just the latest bar (300 seconds = 5 mins duration for 3-min bar)
                 bars = await self.ib.reqHistoricalDataAsync(
                     contract,
                     endDateTime="",
-                    durationStr="5 mins",
+                    durationStr="300 S",
                     barSizeSetting=bar_size,
                     whatToShow="TRADES",
                     useRTH=False,

@@ -74,21 +74,37 @@ class Group:
         return cls(**data)
 
 
-def calculate_stop_price(hwm: float, trail_mode: str, trail_value: float) -> float:
+def calculate_stop_price(hwm: float, trail_mode: str, trail_value: float,
+                         is_credit: bool = False) -> float:
     """Calculate stop price based on mode and value.
 
     Args:
         hwm: High water mark (current value)
         trail_mode: "percent" or "absolute"
         trail_value: Trail amount (10 = 10% or $10)
+        is_credit: True for credit positions (short, credit spreads)
 
     Returns:
         Calculated stop price
+
+    DEBIT positions: HWM is highest value, stop is BELOW HWM
+    CREDIT positions: HWM is best value (lowest for short, most negative for credit spread)
+                      Stop is in the OPPOSITE direction (ABOVE for shorts, less negative for spreads)
     """
     if trail_mode == "percent":
-        return round(hwm * (1 - trail_value / 100), 2)
+        if is_credit:
+            # Credit: stop is trail% ABOVE (worse direction)
+            return round(hwm * (1 + trail_value / 100), 2)
+        else:
+            # Debit: stop is trail% BELOW
+            return round(hwm * (1 - trail_value / 100), 2)
     else:  # absolute
-        return round(hwm - trail_value, 2)
+        if is_credit:
+            # Credit: stop is trail_value ABOVE (worse direction)
+            return round(hwm + trail_value, 2)
+        else:
+            # Debit: stop is trail_value BELOW
+            return round(hwm - trail_value, 2)
 
 
 class GroupManager:
@@ -96,16 +112,32 @@ class GroupManager:
 
     def __init__(self):
         self._groups: dict[str, Group] = {}
+        self._last_mtime: float = 0.0  # Track file modification time
         self._load()
+
+    def _check_reload(self):
+        """Reload groups if JSON file was modified externally (e.g., by another worker)."""
+        if GROUPS_FILE.exists():
+            try:
+                current_mtime = GROUPS_FILE.stat().st_mtime
+                if current_mtime > self._last_mtime:
+                    logger.debug(f"Groups file changed, reloading...")
+                    self._load()
+            except Exception as e:
+                logger.error(f"Error checking groups file: {e}")
 
     def _load(self):
         """Load groups from JSON file."""
         if GROUPS_FILE.exists():
             try:
+                # Clear existing groups before reloading
+                self._groups.clear()
                 data = json.loads(GROUPS_FILE.read_text())
                 for g in data.get("groups", []):
                     group = Group.from_dict(g)
                     self._groups[group.id] = group
+                # Track modification time to detect external changes
+                self._last_mtime = GROUPS_FILE.stat().st_mtime
                 logger.info(f"Loaded {len(self._groups)} groups from {GROUPS_FILE}")
             except Exception as e:
                 logger.error(f"Error loading groups: {e}")
@@ -121,6 +153,8 @@ class GroupManager:
             temp_file = GROUPS_FILE.with_suffix(".tmp")
             temp_file.write_text(json.dumps(data, indent=2))
             temp_file.rename(GROUPS_FILE)
+            # Update mtime to avoid unnecessary reloads in this worker
+            self._last_mtime = GROUPS_FILE.stat().st_mtime
             logger.debug(f"Saved {len(self._groups)} groups")
         except Exception as e:
             logger.error(f"Error saving groups: {e}")
@@ -145,6 +179,7 @@ class GroupManager:
             position_quantities: dict mapping con_id -> quantity to allocate
         """
         group_id = f"grp_{len(self._groups) + 1}_{datetime.now().strftime('%H%M%S')}"
+        # Note: stop_price will be recalculated with is_credit from metrics on each tick
         stop_price = calculate_stop_price(initial_value, trail_mode, trail_value)
 
         # Convert int keys to str for JSON serialization
@@ -185,10 +220,12 @@ class GroupManager:
 
     def get(self, group_id: str) -> Optional[Group]:
         """Get a group by ID."""
+        self._check_reload()  # Ensure we have latest data
         return self._groups.get(group_id)
 
     def get_all(self) -> list[Group]:
         """Get all groups."""
+        self._check_reload()  # Ensure we have latest data
         return list(self._groups.values())
 
     def update(self, group_id: str, **kwargs) -> bool:
@@ -204,13 +241,15 @@ class GroupManager:
         self._save()
         return True
 
-    def activate(self, group_id: str, current_value: float = None, order_result: dict = None) -> bool:
+    def activate(self, group_id: str, current_value: float = None, order_result: dict = None,
+                 is_credit: bool = False) -> bool:
         """Activate group monitoring and store order IDs.
 
         Args:
             group_id: The group to activate
             current_value: Initial value for high water mark
             order_result: Dict with oca_group_id, trailing_order_id, time_exit_order_id from broker
+            is_credit: True for SHORT/credit positions (stop is ABOVE HWM)
         """
         if group_id in self._groups:
             group = self._groups[group_id]
@@ -218,7 +257,7 @@ class GroupManager:
             if current_value is not None:
                 group.high_water_mark = current_value
                 group.stop_price = calculate_stop_price(
-                    current_value, group.trail_mode, group.trail_value
+                    current_value, group.trail_mode, group.trail_value, is_credit=is_credit
                 )
 
             # Store order IDs if provided
@@ -254,24 +293,56 @@ class GroupManager:
             return True
         return False
 
-    def update_hwm(self, group_id: str, new_value: float) -> bool:
-        """Update high water mark if value is higher."""
+    def update_hwm(self, group_id: str, new_value: float, is_credit: bool = False) -> bool:
+        """Update high water mark if value is better (higher for debit, lower for credit).
+
+        Args:
+            group_id: Group ID
+            new_value: Current trigger value
+            is_credit: True for credit positions (short, credit spreads)
+                       Credit: better = more negative (lower)
+                       Debit: better = higher
+
+        Returns:
+            True if HWM was updated
+        """
         if group_id not in self._groups:
             return False
 
         group = self._groups[group_id]
-        if new_value > group.high_water_mark:
+
+        # Determine if this is a "better" value (new HWM)
+        # Debit: higher is better
+        # Credit: lower (more negative) is better
+        if is_credit:
+            is_better = new_value < group.high_water_mark or group.high_water_mark == 0
+        else:
+            is_better = new_value > group.high_water_mark
+
+        if is_better:
+            old_hwm = group.high_water_mark
             group.high_water_mark = new_value
             group.stop_price = calculate_stop_price(
-                new_value, group.trail_mode, group.trail_value
+                new_value, group.trail_mode, group.trail_value, is_credit=is_credit
             )
             self._save()
-            logger.debug(f"Group {group.name} new HWM=${new_value:.2f} Stop=${group.stop_price:.2f}")
+            logger.debug(f"Group {group.name} new HWM=${new_value:.2f} (was ${old_hwm:.2f}) "
+                        f"Stop=${group.stop_price:.2f} credit={is_credit}")
             return True
         return False
 
-    def check_stop_triggered(self, group_id: str, current_value: float) -> bool:
-        """Check if stop price was breached. Returns True if triggered."""
+    def check_stop_triggered(self, group_id: str, current_value: float,
+                             is_credit: bool = False) -> bool:
+        """Check if stop price was breached. Returns True if triggered.
+
+        Credit-Spreads: current_value and stop_price are negative
+        - Stop triggered when current_value >= stop_price (less negative = worse)
+        - Example: current=-$5.00, stop=-$5.50 → -5.00 >= -5.50? YES! TRIGGER!
+
+        Debit-Spreads: current_value and stop_price are positive
+        - Stop triggered when current_value <= stop_price (lower = worse)
+        - Example: current=$5.00, stop=$5.50 → 5.00 <= 5.50? YES! TRIGGER!
+        """
         if group_id not in self._groups:
             return False
 
@@ -279,10 +350,23 @@ class GroupManager:
         if not group.is_active:
             return False
 
-        if current_value <= group.stop_price:
-            logger.warning(f"STOP TRIGGERED: {group.name} at ${current_value:.2f} (stop=${group.stop_price:.2f})")
-            return True
-        return False
+        # IMPORTANT: Don't trigger on invalid/zero prices
+        # This can happen when market data is temporarily unavailable
+        if current_value == 0 or group.stop_price == 0:
+            logger.debug(f"Skipping stop check for {group.name}: current={current_value}, stop={group.stop_price}")
+            return False
+
+        if is_credit:
+            # Credit: less negative is worse (value rising towards 0 or positive)
+            triggered = current_value >= group.stop_price
+        else:
+            # Debit: lower is worse
+            triggered = current_value <= group.stop_price
+
+        if triggered:
+            logger.warning(f"STOP TRIGGERED: {group.name} at ${current_value:.2f} "
+                          f"(stop=${group.stop_price:.2f}, credit={is_credit})")
+        return triggered
 
     def remove_if_order_triggered(self, group_id: str):
         """Auto-cleanup: Remove group when order is triggered."""

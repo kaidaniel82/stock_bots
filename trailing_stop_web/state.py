@@ -116,6 +116,11 @@ class AppState(rx.State):
     # }
     chart_data: dict[str, dict] = {}
 
+    # === Rate limiting for order modifications ===
+    # Tracks last sent stop/limit prices to avoid excessive TWS API calls
+    # {group_id: {"stop": float, "limit": float, "timestamp": float}}
+    last_sent_stop_prices: dict[str, dict] = {}
+
     # Pre-rendered Plotly figures (stored as Figure, NOT @rx.var!)
     # Reflex serializes go.Figure to dict automatically
     underlying_figure: go.Figure = go.Figure()
@@ -321,9 +326,11 @@ class AppState(rx.State):
         # Convert string keys to int for GroupManager (it will convert back to str for JSON)
         position_quantities = {int(k): v for k, v in self.selected_quantities.items()}
 
-        # Calculate initial value (using con_ids list for compatibility)
+        # Calculate initial value and determine if credit position
         con_ids = list(position_quantities.keys())
         value = self._calc_group_value(con_ids)
+        metrics = self._calc_group_metrics(con_ids, position_quantities, "mark")
+        is_credit = metrics.get("is_credit", False)
 
         # Create via GroupManager (persisted to JSON)
         group = GROUP_MANAGER.create(
@@ -364,7 +371,7 @@ class AppState(rx.State):
             if metrics_cache and g.id in metrics_cache:
                 metrics = metrics_cache[g.id]
             else:
-                metrics = self._calc_group_metrics(g.con_ids, g.position_quantities, g.trigger_price_type)
+                metrics = self._calc_group_metrics(g.con_ids, g.position_quantities, g.trigger_price_type, group=g)
             # Calculate total allocated quantity
             total_allocated_qty = sum(g.position_quantities.values())
 
@@ -412,8 +419,8 @@ class AppState(rx.State):
                 # HWM and Stop from chart_data (trigger-based) or fallback to metrics trigger_value
                 "high_water_mark": self._get_group_hwm(g.id, metrics.get("trigger_value", 0)),
                 "hwm_str": f"${self._get_group_hwm(g.id, metrics.get('trigger_value', 0)):.2f}",
-                "stop_price": self._get_group_stop(g.id, g.trail_mode, g.trail_value, metrics.get("trigger_value", 0)),
-                "stop_str": f"${self._get_group_stop(g.id, g.trail_mode, g.trail_value, metrics.get('trigger_value', 0)):.2f}",
+                "stop_price": self._get_group_stop(g.id, g.trail_mode, g.trail_value, metrics.get("trigger_value", 0), is_credit=metrics.get("is_credit", False)),
+                "stop_str": f"${self._get_group_stop(g.id, g.trail_mode, g.trail_value, metrics.get('trigger_value', 0), is_credit=metrics.get('is_credit', False)):.2f}",
                 # Trigger value for highlighting in UI
                 "trigger_value": metrics.get("trigger_value", 0),
                 "trigger_value_str": f"${metrics.get('trigger_value', 0):.2f}",
@@ -459,24 +466,35 @@ class AppState(rx.State):
         """Get trigger-based HWM from chart_data, or fallback to current trigger_value."""
         if group_id in self.chart_data:
             hwm = self.chart_data[group_id].get("current_hwm", 0)
-            if hwm > 0:
+            if hwm != 0:  # Allow negative HWM for credit spreads
                 return hwm
         return fallback_value
 
-    def _get_group_stop(self, group_id: str, trail_mode: str, trail_value: float, fallback_value: float = 0) -> float:
+    def _get_group_stop(self, group_id: str, trail_mode: str, trail_value: float,
+                        fallback_value: float = 0, is_credit: bool = False) -> float:
         """Get trigger-based stop price from chart_data HWM."""
         hwm = self._get_group_hwm(group_id, fallback_value)
-        if hwm > 0:
-            return calculate_stop_price(hwm, trail_mode, trail_value)
+        if hwm != 0:  # Allow negative HWM for credit spreads
+            return calculate_stop_price(hwm, trail_mode, trail_value, is_credit=is_credit)
         return 0.0
 
-    def _calc_group_metrics(self, con_ids: list[int], position_quantities: dict = None, trigger_price_type: str = "mid") -> dict:
-        """Calculate detailed metrics for a group.
+    def _is_group_market_open(self, con_ids: list[int]) -> bool:
+        """Check if all markets for a group's positions are open."""
+        for pos in self.positions:
+            if pos["con_id"] in con_ids:
+                if pos.get("market_status") == "Closed":
+                    return False
+        return True
+
+    def _calc_group_metrics(self, con_ids: list[int], position_quantities: dict = None,
+                            trigger_price_type: str = "mid", group=None) -> dict:
+        """Calculate detailed metrics for a group including trailing stop values.
 
         Args:
             con_ids: List of contract IDs in the group
             position_quantities: Optional dict mapping con_id_str -> allocated qty
             trigger_price_type: Price type for trailing stop trigger (mark, mid, bid, ask, last)
+            group: Optional Group object for trailing stop calculation
         """
         # Build leg data from positions
         legs = []
@@ -514,8 +532,25 @@ class AppState(rx.State):
                 )
                 legs.append(leg)
 
-        # Compute metrics
-        metrics = compute_group_metrics(legs)
+        # Get current HWM from chart_data if group provided
+        current_hwm = 0.0
+        market_open = True
+        if group and group.id in self.chart_data:
+            current_hwm = self.chart_data[group.id].get("current_hwm", 0)
+            # Check if markets are open for this group
+            market_open = self._is_group_market_open(group.con_ids)
+
+        # Compute metrics with trigger price type and trailing stop params
+        metrics = compute_group_metrics(
+            legs=legs,
+            trigger_price_type=trigger_price_type,
+            trail_mode=group.trail_mode if group else None,
+            trail_value=group.trail_value if group else 0,
+            current_hwm=current_hwm,
+            stop_type=group.stop_type if group else "market",
+            limit_offset=group.limit_offset if group else 0,
+            market_open=market_open,
+        )
 
         # Build leg info for UI display - per-leg Mark and Mid
         leg_infos = []
@@ -543,39 +578,63 @@ class AppState(rx.State):
         return {
             "legs": leg_infos,
             "legs_str": legs_str,
-            # Per-leg aggregated values
-            "mark_value": metrics.group_mark_value,
-            "mark_value_str": metrics.mark_str,
-            "mid_value": metrics.group_mid_value,
-            "mid_value_str": metrics.mid_str,
-            # Spread-level Natural Bid/Ask
-            "spread_bid": metrics.spread_bid,
-            "spread_bid_str": metrics.spread_bid_str,
-            "spread_ask": metrics.spread_ask,
-            "spread_ask_str": metrics.spread_ask_str,
-            # Cost and PnL
-            "entry_price": metrics.entry_price,
-            "entry_price_str": metrics.entry_price_str,
-            "total_cost": metrics.total_cost,
-            "cost_str": metrics.cost_str,
-            "pnl_mark": metrics.pnl_mark,
-            "pnl_mark_str": metrics.pnl_mark_str,
-            "pnl_mid": metrics.pnl_mid,
-            "pnl_mid_str": metrics.pnl_mid_str,
-            "pnl_close": metrics.pnl_close,
-            "pnl_close_str": metrics.pnl_close_str,
-            # Greeks (aggregated for group)
-            "delta": metrics.group_delta,
-            "delta_str": metrics.delta_str,
-            "gamma": metrics.group_gamma,
-            "gamma_str": metrics.gamma_str,
-            "theta": metrics.group_theta,
-            "theta_str": metrics.theta_str,
-            "vega": metrics.group_vega,
-            "vega_str": metrics.vega_str,
-            # Trigger value based on trigger_price_type
-            "trigger_value": self._get_trigger_value(metrics, trigger_price_type),
+            # Position type info
+            "position_type": metrics.position_type,
+            "is_credit": metrics.is_credit,
+            # Per-unit prices (always positive, like option chain)
+            "mark": metrics.mark,
+            "mark_str": metrics.mark_str,
+            "mid": metrics.mid,
+            "mid_str": metrics.mid_str,
+            "bid": metrics.bid,
+            "bid_str": metrics.bid_str,
+            "ask": metrics.ask,
+            "ask_str": metrics.ask_str,
+            "entry": metrics.entry,
+            "entry_str": metrics.entry_str,
+            # Trigger value for trailing stop
+            "trigger_value": metrics.trigger_value,
+            "trigger_value_str": metrics.trigger_value_str,
             "trigger_price_type": trigger_price_type,
+            # Total position values (with qty * multiplier)
+            "total_current_value": metrics.total_current_value,
+            "total_entry_cost": metrics.total_entry_cost,
+            # P&L
+            "pnl": metrics.pnl,
+            "pnl_str": metrics.pnl_str,
+            # Greeks (aggregated for group)
+            "delta": metrics.delta,
+            "delta_str": metrics.delta_str,
+            "gamma": metrics.gamma,
+            "gamma_str": metrics.gamma_str,
+            "theta": metrics.theta,
+            "theta_str": metrics.theta_str,
+            "vega": metrics.vega,
+            "vega_str": metrics.vega_str,
+            # Legacy compatibility (for existing code that uses old field names)
+            "mark_value": metrics.mark,
+            "mark_value_str": metrics.mark_str,
+            "mid_value": metrics.mid,
+            "mid_value_str": metrics.mid_str,
+            "spread_bid": metrics.bid,
+            "spread_bid_str": metrics.bid_str,
+            "spread_ask": metrics.ask,
+            "spread_ask_str": metrics.ask_str,
+            "entry_price": metrics.entry,
+            "entry_price_str": metrics.entry_str,
+            "total_cost": metrics.total_entry_cost,
+            "cost_str": metrics.entry_str,
+            "pnl_mark": metrics.pnl,
+            "pnl_mark_str": metrics.pnl_str,
+            "pnl_mid": metrics.pnl,
+            "pnl_close": metrics.pnl,
+            "pnl_close_str": metrics.pnl_str,
+            # Trailing Stop fields (from centralized calculation in metrics.py)
+            "current_hwm": metrics.current_hwm,
+            "updated_hwm": metrics.updated_hwm,
+            "hwm_updated": metrics.hwm_updated,
+            "trail_stop_price": metrics.trail_stop_price,
+            "trail_limit_price": metrics.trail_limit_price,
         }
 
     def _get_trigger_value(self, metrics, trigger_price_type: str) -> float:
@@ -588,19 +647,8 @@ class AppState(rx.State):
         Returns:
             The appropriate value for trailing stop calculations
         """
-        if trigger_price_type == "mark":
-            return metrics.group_mark_value
-        elif trigger_price_type == "mid":
-            return metrics.group_mid_value
-        elif trigger_price_type == "bid":
-            return metrics.spread_bid
-        elif trigger_price_type == "ask":
-            return metrics.spread_ask
-        elif trigger_price_type == "last":
-            # For "last", use mid as fallback (last not aggregated in metrics)
-            return metrics.group_mid_value
-        else:
-            return metrics.group_mid_value
+        # trigger_value is now calculated in compute_group_metrics()
+        return metrics.trigger_value
 
     def delete_group(self, group_id: str):
         """Delete a group."""
@@ -625,25 +673,62 @@ class AppState(rx.State):
                 if group.oca_group_id:
                     BROKER.cancel_oca_group(group.oca_group_id)
                 GROUP_MANAGER.deactivate(group_id, clear_orders=True)
+                # Clear rate limiting state for this group
+                if group_id in self.last_sent_stop_prices:
+                    new_sent = dict(self.last_sent_stop_prices)
+                    del new_sent[group_id]
+                    self.last_sent_stop_prices = new_sent
                 self.status_message = f"Deactivated: {group.name}"
             else:
                 # Activating - place orders at TWS
-                value = self._calc_group_value(group.con_ids)
+                # Get current metrics for proper stop price calculation
+                metrics = self._calc_group_metrics(group.con_ids, group.position_quantities, group.trigger_price_type, group=group)
+                trigger_value = metrics.get("trigger_value", 0)
+                is_credit = metrics.get("is_credit", False)
 
-                # Place OCA order group
+                # At activation, ALWAYS use current trigger_value as HWM
+                # This ensures the stop is placed relative to CURRENT price, not some old saved HWM
+                # The trailing stop logic will update HWM as price moves favorably
+                effective_hwm = trigger_value
+
+                logger.info(f"Activation {group.name}: trigger=${trigger_value:.2f} -> HWM=${effective_hwm:.2f} "
+                           f"credit={is_credit}")
+
+                # Calculate initial stop and limit prices using effective HWM
+                initial_stop_price = calculate_stop_price(
+                    effective_hwm, group.trail_mode, group.trail_value, is_credit=is_credit
+                )
+
+                # Calculate limit price if using limit order type
+                if group.stop_type == "limit":
+                    initial_limit_price = initial_stop_price - group.limit_offset
+                else:
+                    initial_limit_price = 0.0  # Stop-Market has no limit
+
+                # Place OCA order group (using new app-controlled stop order)
                 order_result = BROKER.place_oca_group(
                     group_name=group.name,
                     position_quantities={int(k): v for k, v in group.position_quantities.items()},
-                    trail_value=group.trail_value,
-                    trail_mode=group.trail_mode,
                     stop_type=group.stop_type,
                     limit_offset=group.limit_offset,
                     time_exit_enabled=group.time_exit_enabled,
-                    time_exit_time=group.time_exit_time
+                    time_exit_time=group.time_exit_time,
+                    initial_stop_price=abs(initial_stop_price),
+                    initial_limit_price=abs(initial_limit_price) if initial_limit_price else 0.0,
+                    trigger_price_type=group.trigger_price_type,
+                    is_credit=is_credit,  # BUY to close short, SELL to close long
                 )
 
                 if order_result:
-                    GROUP_MANAGER.activate(group_id, value, order_result)
+                    GROUP_MANAGER.activate(group_id, effective_hwm, order_result, is_credit=is_credit)
+                    # Initialize rate limiting state
+                    new_sent = dict(self.last_sent_stop_prices)
+                    new_sent[group_id] = {
+                        "stop": abs(initial_stop_price),
+                        "limit": abs(initial_limit_price) if initial_limit_price else 0.0,
+                        "timestamp": time.time()
+                    }
+                    self.last_sent_stop_prices = new_sent
                     self.status_message = f"Activated: {group.name} (Order #{order_result['trailing_order_id']})"
                 else:
                     self.status_message = f"Failed to place orders for {group.name}"
@@ -661,11 +746,14 @@ class AppState(rx.State):
             trail = float(value)
             if trail > 0:
                 GROUP_MANAGER.update(str(group_id), trail_value=trail)
-                # Recalculate stop price based on new trail value and mode
+                # Recalculate stop price based on new trail value
                 group = GROUP_MANAGER.get(group_id)
-                if group and group.high_water_mark > 0:
+                if group and group.high_water_mark != 0:
+                    # Get is_credit dynamically from metrics
+                    metrics = self._calc_group_metrics(group.con_ids, group.position_quantities, group.trigger_price_type)
+                    is_credit = metrics.get("is_credit", False)
                     new_stop = calculate_stop_price(
-                        group.high_water_mark, group.trail_mode, trail
+                        group.high_water_mark, group.trail_mode, trail, is_credit=is_credit
                     )
                     GROUP_MANAGER.update(group_id, stop_price=new_stop)
                 # Sync connection state and refresh positions
@@ -683,9 +771,12 @@ class AppState(rx.State):
             GROUP_MANAGER.update(str(group_id), trail_mode=value)
             # Recalculate stop price
             group = GROUP_MANAGER.get(group_id)
-            if group and group.high_water_mark > 0:
+            if group and group.high_water_mark != 0:
+                # Get is_credit dynamically from metrics
+                metrics = self._calc_group_metrics(group.con_ids, group.position_quantities, group.trigger_price_type)
+                is_credit = metrics.get("is_credit", False)
                 new_stop = calculate_stop_price(
-                    group.high_water_mark, value, group.trail_value
+                    group.high_water_mark, value, group.trail_value, is_credit=is_credit
                 )
                 GROUP_MANAGER.update(group_id, stop_price=new_stop)
             self._sync_broker_state()
@@ -962,7 +1053,7 @@ class AppState(rx.State):
         metrics_cache = {}
         for g in GROUP_MANAGER.get_all():
             value = self._calc_group_value(g.con_ids)
-            metrics = self._calc_group_metrics(g.con_ids, g.position_quantities, g.trigger_price_type)
+            metrics = self._calc_group_metrics(g.con_ids, g.position_quantities, g.trigger_price_type, group=g)
             metrics_cache[g.id] = metrics
 
             # Accumulate tick into current bar (in-place, fast)
@@ -980,10 +1071,32 @@ class AppState(rx.State):
             # IMPORTANT: Only update HWM and check triggers when market is OPEN
             if g.is_active:
                 if group_market_open:
-                    GROUP_MANAGER.update_hwm(g.id, value)
-                    if GROUP_MANAGER.check_stop_triggered(g.id, value):
-                        self.status_message = f"STOP TRIGGERED: {g.name} at ${value:.2f}!"
+                    is_credit = metrics.get("is_credit", False)
+                    trigger_value = metrics.get("trigger_value", 0)
+
+                    # NOTE: Use trigger_value (per-contract price) NOT value (total net value)
+                    # trigger_value is based on trigger_price_type (mark/mid/bid/ask/last)
+                    # value is net_value = price × qty × multiplier (much larger!)
+
+                    # DEBUG: Log every check to track deactivation issue
+                    logger.debug(f"TRAIL CHECK {g.name}: trigger_value=${trigger_value:.2f} "
+                                f"HWM=${g.high_water_mark:.2f} Stop=${g.stop_price:.2f} "
+                                f"credit={is_credit}")
+
+                    # Update HWM with is_credit flag for proper comparison
+                    GROUP_MANAGER.update_hwm(g.id, trigger_value, is_credit=is_credit)
+
+                    # Check if stop triggered
+                    if GROUP_MANAGER.check_stop_triggered(g.id, trigger_value, is_credit=is_credit):
+                        logger.warning(f"STOP TRIGGERED: {g.name} trigger=${trigger_value:.2f} "
+                                      f"stop=${g.stop_price:.2f} credit={is_credit}")
+                        self.status_message = f"STOP TRIGGERED: {g.name} at ${trigger_value:.2f}!"
                         GROUP_MANAGER.deactivate(g.id)
+
+                    # === APP-CONTROLLED TRAILING: Sync TWS order with current stop price ===
+                    # Always check (rate limiting is inside the method)
+                    # This ensures TWS order stays in sync with groups.json
+                    self._check_and_modify_orders(g.id, metrics)
         timings["3_groups_metrics"] = (time.perf_counter() - t0) * 1000
 
         # 4. Bar completion every 3 min (BAR_INTERVAL_TICKS = 360)
@@ -1182,16 +1295,14 @@ class AppState(rx.State):
     def _accumulate_tick(self, group_id: str, metrics: dict):
         """Accumulate tick into current bar (in-place update).
 
-        Also implements the trailing mechanism:
-        - Track HWM (High Water Mark) which only moves UP
-        - Calculate stop price based on trail settings
-        - Update GROUP_MANAGER with new HWM (for persistence)
-
-        IMPORTANT: HWM is only updated when ALL markets for the group are open.
-        This prevents false triggers due to stale prices during market closed hours.
+        Uses pre-calculated trailing stop values from metrics (computed in metrics.py):
+        - updated_hwm: New HWM value (already handles credit/debit and market open check)
+        - hwm_updated: True if HWM changed this tick
+        - trail_stop_price: Calculated stop price
+        - trail_limit_price: Calculated limit price
 
         Uses trigger_value (based on trigger_price_type: mark, mid, bid, ask, last)
-        for OHLC candlesticks and HWM tracking.
+        for OHLC candlesticks.
         """
         trigger_value = metrics.get("trigger_value", 0)
         pnl = metrics.get("pnl_mark", 0)
@@ -1202,16 +1313,6 @@ class AppState(rx.State):
 
         if group_id not in self.chart_data:
             self._init_chart_state(group_id)
-
-        # Check if all markets for this group are open
-        group = GROUP_MANAGER.get(group_id)
-        market_open = True
-        if group:
-            for pos in self.positions:
-                if pos["con_id"] in group.con_ids:
-                    if pos.get("market_status") == "Closed":
-                        market_open = False
-                        break
 
         state = self.chart_data[group_id]
 
@@ -1232,47 +1333,103 @@ class AppState(rx.State):
             state["current_pnl"]["close"] = pnl
 
         # === TRAILING MECHANISM ===
-        # Track HWM based on trigger_value (mark, mid, bid, ask, or last)
-        # IMPORTANT: Only update HWM when market is OPEN to prevent false triggers
-        current_hwm = state.get("current_hwm", 0)
-        if market_open and trigger_value > current_hwm:
-            # New high water mark!
-            state["current_hwm"] = trigger_value
+        # HWM update logic is now centralized in metrics.py
+        # Just apply the pre-calculated values
+        if metrics.get("hwm_updated", False):
+            state["current_hwm"] = metrics["updated_hwm"]
             trigger_type = metrics.get("trigger_price_type", "mid")
-            logger.debug(f"Trailing: HWM ({trigger_type}) updated ${current_hwm:.2f} -> ${trigger_value:.2f}")
-        elif not market_open and trigger_value > current_hwm:
-            # Market closed - log but don't update HWM
-            logger.debug(f"Trailing: Market CLOSED - HWM NOT updated (value=${trigger_value:.2f}, current HWM=${current_hwm:.2f})")
+            is_credit = metrics.get("is_credit", False)
+            direction = "down" if is_credit else "up"
+            logger.debug(f"Trailing: HWM ({trigger_type}) updated {direction} -> ${metrics['updated_hwm']:.2f}")
 
         # === LIVE UPDATE: Store current HWM/Stop/Limit in current slot ===
         # This creates the time-series history for visualization
         slot = state["current_slot"]
         time_label = self._slot_to_time_label(state["start_timestamp"], slot)
-        hwm = state.get("current_hwm", 0)
 
-        if hwm > 0:
-            # Get group settings for stop calculation
-            group = GROUP_MANAGER.get(group_id)
-            if group:
-                stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value)
-                state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm}
+        # Use updated_hwm from metrics (falls back to current_hwm in state if not calculated)
+        hwm = metrics.get("updated_hwm", 0) or state.get("current_hwm", 0)
+        stop_price = metrics.get("trail_stop_price", 0)
+        limit_price = metrics.get("trail_limit_price", 0)
+
+        if hwm != 0:  # Allow negative HWM for credit spreads
+            state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm}
+
+            if stop_price != 0:
                 state["stop_bars"][slot] = {"time": time_label, "stop": stop_price}
 
                 # Limit price (only for limit orders)
-                if group.stop_type == "limit":
-                    limit_price = stop_price - group.limit_offset
+                if limit_price != 0:
                     state["limit_bars"][slot] = {"time": time_label, "limit": limit_price}
 
                 # Stop P&L calculation (for P&L chart)
-                # Convert stop_price to P&L: What would P&L be if trigger_value dropped to stop_price?
                 total_cost = metrics.get("total_cost", 0)
-
-                if total_cost > 0:
-                    # stop_price is already a VALUE (not price), so stop_pnl is simply:
+                if total_cost != 0:
                     stop_pnl = stop_price - total_cost
                     state["stop_pnl_bars"][slot] = {"time": time_label, "stop_pnl": stop_pnl}
 
         state["tick_count"] += 1
+
+    def _check_and_modify_orders(self, group_id: str, metrics: dict):
+        """Check if order needs modification and send to TWS if changed.
+
+        Rate limiting:
+        - Only modify if stop price changed by >= $0.01
+        - Minimum 1 second between modifications per group
+
+        Args:
+            group_id: Group ID
+            metrics: Pre-computed metrics containing trail_stop_price, trail_limit_price
+        """
+        group = GROUP_MANAGER.get(group_id)
+        if not group or not group.is_active or not group.trailing_order_id:
+            return
+
+        # Get new stop and limit prices from metrics
+        new_stop = metrics.get("trail_stop_price", 0)
+        new_limit = metrics.get("trail_limit_price", 0)
+
+        if new_stop == 0:
+            return  # No valid stop price calculated
+
+        # Rate limiting: check last sent values
+        last_sent = self.last_sent_stop_prices.get(group_id, {})
+        last_stop = last_sent.get("stop", 0)
+        last_limit = last_sent.get("limit", 0)
+        last_time = last_sent.get("timestamp", 0)
+
+        # Check if stop price changed significantly (>= $0.01)
+        stop_changed = abs(new_stop - last_stop) >= 0.01
+        limit_changed = new_limit > 0 and abs(new_limit - last_limit) >= 0.01
+
+        if not stop_changed and not limit_changed:
+            return  # No significant change
+
+        # Check minimum time between modifications (1 second)
+        now = time.time()
+        if now - last_time < 1.0:
+            return  # Too fast, skip this tick
+
+        # Modify order at TWS
+        success = BROKER.modify_stop_order(
+            group.trailing_order_id,
+            abs(new_stop),
+            abs(new_limit) if new_limit else 0.0
+        )
+
+        if success:
+            # Update rate limiting state
+            new_sent = dict(self.last_sent_stop_prices)
+            new_sent[group_id] = {
+                "stop": abs(new_stop),
+                "limit": abs(new_limit) if new_limit else 0.0,
+                "timestamp": now
+            }
+            self.last_sent_stop_prices = new_sent
+            limit_str = f"${new_limit:.2f}" if new_limit else "N/A"
+            logger.debug(f"Modified order for {group.name}: stop=${new_stop:.2f} limit={limit_str}")
+        else:
+            logger.warning(f"Failed to modify order for {group.name}")
 
     def _complete_bars(self):
         """Finalize bars, store, advance slot (called every 3 min)."""
@@ -1304,8 +1461,11 @@ class AppState(rx.State):
             group = GROUP_MANAGER.get(group_id)
             if group:
                 hwm = state.get("current_hwm", 0)
-                if hwm > 0:
-                    stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value)
+                if hwm != 0:
+                    # Get is_credit dynamically from metrics
+                    metrics = self._calc_group_metrics(group.con_ids, group.position_quantities, group.trigger_price_type)
+                    is_credit = metrics.get("is_credit", False)
+                    stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value, is_credit=is_credit)
                     state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm}
                     state["stop_bars"][slot] = {"time": time_label, "stop": stop_price}
 
@@ -1338,13 +1498,14 @@ class AppState(rx.State):
         group = GROUP_MANAGER.get(group_id)
         group_info = None
         if group:
+            # Get metrics for P&L calculation (also provides is_credit)
+            metrics = self._calc_group_metrics(group.con_ids, group.position_quantities, group.trigger_price_type, group=group)
+            is_credit = metrics.get("is_credit", False)
+
             # Get trigger-price based HWM from chart state
             hwm = state.get("current_hwm", 0)
-            # Calculate stop price based on trigger-price HWM
-            stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value) if hwm > 0 else 0
-
-            # Get metrics for P&L calculation
-            metrics = self._calc_group_metrics(group.con_ids, group.position_quantities, group.trigger_price_type)
+            # Calculate stop price based on trigger-price HWM (allow negative for credit spreads)
+            stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value, is_credit=is_credit) if hwm != 0 else 0
 
             group_info = {
                 # Position OHLC uses trigger-price based values
@@ -1384,10 +1545,10 @@ class AppState(rx.State):
             # Set trigger label (capitalize first letter)
             self.chart_trigger_label = trigger_type.capitalize()
 
-            self.chart_pos_close = f"${trigger_value:.2f}" if trigger_value > 0 else "-"
-            self.chart_pos_stop = f"${stop_price:.2f}" if stop_price > 0 else "-"
-            self.chart_pos_hwm = f"${hwm:.2f}" if hwm > 0 else "-"
-            if stop_type == "limit" and stop_price > 0:
+            self.chart_pos_close = f"${trigger_value:.2f}" if trigger_value != 0 else "-"
+            self.chart_pos_stop = f"${stop_price:.2f}" if stop_price != 0 else "-"
+            self.chart_pos_hwm = f"${hwm:.2f}" if hwm != 0 else "-"
+            if stop_type == "limit" and stop_price != 0:
                 limit_price = stop_price - limit_offset
                 self.chart_pos_limit = f"${limit_price:.2f}"
             else:
@@ -1404,7 +1565,7 @@ class AppState(rx.State):
             # Calculate stop P&L: (stop_price - entry_price) per-contract, then scale
             # stop_price and entry_price are both per-contract values
             # To get total P&L we need qty * multiplier from metrics
-            if stop_price > 0 and entry_price != 0:
+            if stop_price != 0 and entry_price != 0:
                 # Per-contract P&L at stop level
                 per_contract_pnl = stop_price - entry_price
                 # Scale by total position (total_cost / entry_price gives qty * mult)
@@ -1498,9 +1659,9 @@ class AppState(rx.State):
         for i, bar in enumerate(state.get("hwm_bars", [])):
             if bar is not None:
                 hwm_vals[i] = bar.get("hwm")
-        # Fill future slots with current value
+        # Fill future slots with current value (allow negative for credit spreads)
         for i in range(slot + 1, 240):
-            if current_hwm > 0:
+            if current_hwm != 0:
                 hwm_vals[i] = current_hwm
 
         if any(v is not None for v in hwm_vals):
@@ -1518,9 +1679,9 @@ class AppState(rx.State):
         for i, bar in enumerate(state.get("stop_bars", [])):
             if bar is not None:
                 stop_vals[i] = bar.get("stop")
-        # Fill future slots with current value
+        # Fill future slots with current value (allow negative for credit spreads)
         for i in range(slot + 1, 240):
-            if current_stop > 0:
+            if current_stop != 0:
                 stop_vals[i] = current_stop
 
         if any(v is not None for v in stop_vals):
@@ -1540,9 +1701,9 @@ class AppState(rx.State):
             for i, bar in enumerate(state.get("limit_bars", [])):
                 if bar is not None:
                     limit_vals[i] = bar.get("limit")
-            # Fill future slots with current value
+            # Fill future slots with current value (allow negative for credit spreads)
             for i in range(slot + 1, 240):
-                if current_limit > 0:
+                if current_limit != 0:
                     limit_vals[i] = current_limit
 
             if any(v is not None for v in limit_vals):
@@ -1644,7 +1805,7 @@ class AppState(rx.State):
         # stop_price and entry_price are both per-contract values
         # stop_pnl = (stop_price - entry_price) * scale
         current_stop_pnl = None
-        if group_info and group_info.get("stop_price", 0) > 0:
+        if group_info and group_info.get("stop_price", 0) != 0:
             stop_price = group_info["stop_price"]
             entry_price = group_info.get("entry_price", 0)
             total_cost = group_info.get("total_cost", 0)
