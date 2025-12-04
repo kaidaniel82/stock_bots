@@ -122,10 +122,6 @@ class AppState(rx.State):
     position_figure: go.Figure = go.Figure()
     pnl_figure: go.Figure = go.Figure()
 
-    # Chart rendering optimization - track last rendered state
-    _last_chart_slot: int = -1
-    _last_chart_group: str = ""
-
     # Underlying history for Chart 1 (loaded from TWS)
     underlying_history: dict[str, list[dict]] = {}  # symbol -> OHLC bars
 
@@ -1232,17 +1228,11 @@ class AppState(rx.State):
         self.chart_data = dict(self.chart_data)
 
     def _render_all_charts(self):
-        """Render all 3 charts for selected group.
-
-        Optimization: Only re-render if slot changed or group changed.
-        This reduces CPU load significantly since Plotly rendering is expensive (~100ms).
-        """
+        """Render all 3 charts for selected group (called every 1 second)."""
         if not self.selected_group_id:
-            if self._last_chart_group != "":
-                self.position_figure = self._empty_figure("Select a group")
-                self.pnl_figure = self._empty_figure("Select a group")
-                self.underlying_figure = self._empty_figure("Select a group")
-                self._last_chart_group = ""
+            self.position_figure = self._empty_figure("Select a group")
+            self.pnl_figure = self._empty_figure("Select a group")
+            self.underlying_figure = self._empty_figure("Select a group")
             return
 
         group_id = self.selected_group_id
@@ -1250,16 +1240,6 @@ class AppState(rx.State):
             self._init_chart_state(group_id)
 
         state = self.chart_data[group_id]
-        current_slot = state.get("current_slot", 0)
-
-        # Skip render if nothing changed (same slot, same group)
-        if current_slot == self._last_chart_slot and group_id == self._last_chart_group:
-            # Still update header values (cheap operation)
-            self._update_chart_headers(state, group_id)
-            return
-
-        self._last_chart_slot = current_slot
-        self._last_chart_group = group_id
 
         # Get group data for stop/limit visualization
         group = GROUP_MANAGER.get(group_id)
@@ -1296,47 +1276,42 @@ class AppState(rx.State):
         # Render underlying chart
         self.underlying_figure = self._render_underlying_chart()
 
-        # Update header values
-        self._update_chart_headers(state, group_id)
+        # === Update chart header info ===
+        if group_info:
+            # Position OHLC header: Close, Stop, Limit, HWM
+            mid_value = group_info.get("mid_value", 0)
+            stop_mid = group_info.get("stop_price", 0)
+            hwm_mid = group_info.get("high_water_mark", 0)
+            limit_offset = group_info.get("limit_offset", 0)
+            stop_type = group_info.get("stop_type", "market")
 
-    def _update_chart_headers(self, state: dict, group_id: str):
-        """Update chart header values (cheap operation, called every tick)."""
-        group = GROUP_MANAGER.get(group_id)
-        if not group:
+            self.chart_pos_close = f"${mid_value:.2f}" if mid_value > 0 else "-"
+            self.chart_pos_stop = f"${stop_mid:.2f}" if stop_mid > 0 else "-"
+            self.chart_pos_hwm = f"${hwm_mid:.2f}" if hwm_mid > 0 else "-"
+            if stop_type == "limit" and stop_mid > 0:
+                limit_price = stop_mid - limit_offset
+                self.chart_pos_limit = f"${limit_price:.2f}"
+            else:
+                self.chart_pos_limit = "-"
+
+            # P&L History header: Current P&L, Stop P&L
+            pnl_mark = group_info.get("pnl_mark", 0)
+            total_cost = group_info.get("total_cost", 0)
+            self.chart_pnl_current = f"${pnl_mark:.2f}" if pnl_mark != 0 else "$0.00"
+
+            # Calculate stop P&L: stop_mid is already a VALUE, so stop_pnl = stop_mid - total_cost
+            if stop_mid > 0 and total_cost > 0:
+                stop_pnl = stop_mid - total_cost
+                self.chart_pnl_stop = f"${stop_pnl:.2f}"
+            else:
+                self.chart_pnl_stop = "-"
+        else:
+            # Reset headers
             self.chart_pos_close = "-"
             self.chart_pos_stop = "-"
             self.chart_pos_limit = "-"
             self.chart_pos_hwm = "-"
             self.chart_pnl_current = "-"
-            self.chart_pnl_stop = "-"
-            return
-
-        # Calculate current values
-        hwm_mid = state.get("current_hwm_mid", 0)
-        stop_mid = calculate_stop_price(hwm_mid, group.trail_mode, group.trail_value) if hwm_mid > 0 else 0
-        metrics = self._calc_group_metrics(group.con_ids, group.position_quantities)
-
-        mid_value = metrics.get("mid_value", 0)
-        pnl_mark = metrics.get("pnl_mark", 0)
-        total_cost = metrics.get("total_cost", 0)
-
-        # Position OHLC header
-        self.chart_pos_close = f"${mid_value:.2f}" if mid_value > 0 else "-"
-        self.chart_pos_stop = f"${stop_mid:.2f}" if stop_mid > 0 else "-"
-        self.chart_pos_hwm = f"${hwm_mid:.2f}" if hwm_mid > 0 else "-"
-
-        if group.stop_type == "limit" and stop_mid > 0:
-            limit_price = stop_mid - group.limit_offset
-            self.chart_pos_limit = f"${limit_price:.2f}"
-        else:
-            self.chart_pos_limit = "-"
-
-        # P&L header
-        self.chart_pnl_current = f"${pnl_mark:.2f}" if pnl_mark != 0 else "$0.00"
-        if stop_mid > 0 and total_cost > 0:
-            stop_pnl = stop_mid - total_cost
-            self.chart_pnl_stop = f"${stop_pnl:.2f}"
-        else:
             self.chart_pnl_stop = "-"
 
     def _render_position_chart(self, state: dict, group_info: dict = None) -> go.Figure:

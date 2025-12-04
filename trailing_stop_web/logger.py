@@ -2,7 +2,7 @@
 
 Log Levels:
 - INFO: Zusammenfassungen, wichtige Events (Connection, Stop Triggered, etc.)
-- DEBUG: Detail-Logs pro Tick (nur in Datei, für Entwicklung)
+- DEBUG: Detail-Logs pro Tick (für Entwicklung)
 """
 from pathlib import Path
 from loguru import logger
@@ -14,7 +14,7 @@ LOG_DIR.mkdir(exist_ok=True)
 # Remove default handler (no console output!)
 logger.remove()
 
-# File handler - DEBUG level (all details for development)
+# Single file handler - DEBUG level (all logs)
 logger.add(
     LOG_DIR / "trailing_stop_{time:YYYY-MM-DD}.log",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
@@ -22,16 +22,6 @@ logger.add(
     rotation="00:00",
     retention="7 days",
     compression="gz",
-)
-
-# Separate INFO-only log for summaries (smaller, easier to read)
-logger.add(
-    LOG_DIR / "trailing_stop_summary_{time:YYYY-MM-DD}.log",
-    format="{time:HH:mm:ss} | {level: <8} | {message}",
-    level="INFO",
-    filter=lambda record: record["level"].name == "INFO",
-    rotation="00:00",
-    retention="7 days",
 )
 
 # Export logger
