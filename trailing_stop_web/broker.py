@@ -34,6 +34,10 @@ class PortfolioPosition:
     combo_legs: list = field(default_factory=list)
     # Raw contract for debugging
     raw_contract: Contract = None
+    # Trading hours info (from ContractDetails)
+    trading_hours: str = ""  # Raw string from TWS
+    liquid_hours: str = ""   # Liquid hours from TWS
+    time_zone_id: str = ""   # e.g. "US/Eastern"
 
     @property
     def display_name(self) -> str:
@@ -467,6 +471,8 @@ class TWSBroker:
         if is_new and self._market_data and pos.raw_contract:
             if self._market_data.subscribe(contract.conId, pos.raw_contract):
                 logger.info(f"Subscribed new position to market data: {contract.symbol} (conId={contract.conId})")
+            # Fetch trading hours for new position
+            self._fetch_trading_hours(contract.conId, contract)
 
         # Log if enabled - always log first position for debugging
         if VERBOSE_PORTFOLIO_UPDATES:
@@ -503,6 +509,81 @@ class TWSBroker:
                     return True
 
         return self._connected
+
+    def _fetch_trading_hours(self, con_id: int, contract: Contract):
+        """Fetch trading hours for a contract from TWS ContractDetails."""
+        try:
+            details = self.ib.reqContractDetails(contract)
+            if details:
+                detail = details[0]
+                pos = self._positions.get(con_id)
+                if pos:
+                    # Update position with trading hours
+                    pos.trading_hours = getattr(detail, 'tradingHours', '') or ''
+                    pos.liquid_hours = getattr(detail, 'liquidHours', '') or ''
+                    pos.time_zone_id = getattr(detail, 'timeZoneId', '') or ''
+                    logger.debug(f"Trading hours for {contract.symbol}: tz={pos.time_zone_id}")
+        except Exception as e:
+            logger.debug(f"Could not fetch trading hours for {contract.symbol}: {e}")
+
+    def is_market_open(self, con_id: int) -> bool:
+        """Check if market is currently open for this contract.
+
+        Uses trading hours from ContractDetails if available,
+        otherwise falls back to heuristic (bid/ask > 0).
+        """
+        from datetime import datetime
+        import pytz
+
+        pos = self._positions.get(con_id)
+        if not pos:
+            return False
+
+        # If we have trading hours, parse them
+        if pos.trading_hours and pos.time_zone_id:
+            try:
+                tz = pytz.timezone(pos.time_zone_id)
+                now = datetime.now(tz)
+
+                # Parse trading hours format: "20241204:0930-20241204:1600;20241205:0930-..."
+                for session in pos.trading_hours.split(';'):
+                    if 'CLOSED' in session or not session.strip():
+                        continue
+                    # Parse session: "20241204:0930-20241204:1600"
+                    if '-' in session:
+                        start_str, end_str = session.split('-')
+                        start = datetime.strptime(start_str, '%Y%m%d:%H%M')
+                        end = datetime.strptime(end_str, '%Y%m%d:%H%M')
+                        start = tz.localize(start)
+                        end = tz.localize(end)
+                        if start <= now <= end:
+                            return True
+                return False
+            except Exception as e:
+                logger.debug(f"Error parsing trading hours: {e}")
+
+        # Fallback: Check if bid/ask are valid
+        quote = self.get_quote_data(con_id)
+        return quote.get('bid', 0) > 0 and quote.get('ask', 0) > 0
+
+    def get_market_status(self, con_id: int) -> str:
+        """Get human-readable market status for a contract.
+
+        Returns: "Open", "Closed", or "Unknown"
+        """
+        pos = self._positions.get(con_id)
+        if not pos:
+            return "Unknown"
+
+        if self.is_market_open(con_id):
+            return "Open"
+
+        # Check if we have trading hours info
+        if pos.trading_hours:
+            return "Closed"
+
+        # No trading hours, can't determine
+        return "Unknown"
 
     def disconnect(self):
         """Disconnect from TWS and stop reconnection attempts."""
