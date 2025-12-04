@@ -7,8 +7,9 @@ from typing import Optional
 
 from .logger import logger
 
-# Data directory for persistence - in project folder for easier backup/versioning
-DATA_DIR = Path(__file__).parent.parent / "data"
+# Data directory for persistence - OUTSIDE project folder to avoid hot-reload triggers
+# Using ~/.trailing_stop_web/ to prevent Reflex from restarting on file changes
+DATA_DIR = Path.home() / ".trailing_stop_web"
 GROUPS_FILE = DATA_DIR / "groups.json"
 
 

@@ -247,6 +247,10 @@ class TWSBroker:
         self._auto_reconnect = True
         self._connection_status_callback: Optional[Callable[[str], None]] = None
 
+        # Trading hours cache: {symbol: {date: str, trading_hours: str, liquid_hours: str, time_zone_id: str}}
+        # Cached per symbol (not per position) and invalidated on date change
+        self._trading_hours_cache: dict[str, dict] = {}
+
     def _run_loop(self):
         """Run ib_insync event loop in separate thread with reconnection support."""
         self._loop = asyncio.new_event_loop()
@@ -511,20 +515,60 @@ class TWSBroker:
         return self._connected
 
     def _fetch_trading_hours(self, con_id: int, contract: Contract):
-        """Fetch trading hours for a contract from TWS ContractDetails."""
+        """Fetch trading hours for a contract from TWS ContractDetails.
+
+        Uses a cache per symbol+secType to avoid repeated API calls. Cache is invalidated
+        when the date changes (to handle day transitions correctly).
+
+        Cache key is symbol_secType (e.g. "TSLA_STK", "TSLA_OPT") because:
+        - Stocks and options on same underlying can have different trading hours
+        - All options on same underlying share the same trading hours
+        """
+        cache_key = f"{contract.symbol}_{contract.secType}"
+        today = datetime.now().strftime('%Y%m%d')
+
+        # Check cache first
+        cached = self._trading_hours_cache.get(cache_key)
+        if cached and cached.get('date') == today:
+            # Use cached data
+            pos = self._positions.get(con_id)
+            if pos:
+                pos.trading_hours = cached.get('trading_hours', '')
+                pos.liquid_hours = cached.get('liquid_hours', '')
+                pos.time_zone_id = cached.get('time_zone_id', '')
+                logger.debug(f"Trading hours for {cache_key}: tz={pos.time_zone_id} (cached)")
+            return
+
+        # Fetch from TWS
         try:
             details = self.ib.reqContractDetails(contract)
             if details:
                 detail = details[0]
+                trading_hours = getattr(detail, 'tradingHours', '') or ''
+                liquid_hours = getattr(detail, 'liquidHours', '') or ''
+                time_zone_id = getattr(detail, 'timeZoneId', '') or ''
+
+                # Log full trading hours data for analysis
+                logger.debug(f"Trading hours for {cache_key}:")
+                logger.debug(f"  timeZoneId: {time_zone_id}")
+                logger.debug(f"  tradingHours: {trading_hours[:300]}..." if len(trading_hours) > 300 else f"  tradingHours: {trading_hours}")
+
+                # Update cache
+                self._trading_hours_cache[cache_key] = {
+                    'date': today,
+                    'trading_hours': trading_hours,
+                    'liquid_hours': liquid_hours,
+                    'time_zone_id': time_zone_id,
+                }
+
+                # Update position
                 pos = self._positions.get(con_id)
                 if pos:
-                    # Update position with trading hours
-                    pos.trading_hours = getattr(detail, 'tradingHours', '') or ''
-                    pos.liquid_hours = getattr(detail, 'liquidHours', '') or ''
-                    pos.time_zone_id = getattr(detail, 'timeZoneId', '') or ''
-                    logger.debug(f"Trading hours for {contract.symbol}: tz={pos.time_zone_id}")
+                    pos.trading_hours = trading_hours
+                    pos.liquid_hours = liquid_hours
+                    pos.time_zone_id = time_zone_id
         except Exception as e:
-            logger.debug(f"Could not fetch trading hours for {contract.symbol}: {e}")
+            logger.debug(f"Could not fetch trading hours for {cache_key}: {e}")
 
     def is_market_open(self, con_id: int) -> bool:
         """Check if market is currently open for this contract.

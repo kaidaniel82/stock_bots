@@ -94,6 +94,9 @@ echo ""
 echo "Starting Reflex app..."
 echo ""
 
+# Exclude data and logs from hot-reload to prevent TWS disconnect
+export REFLEX_HOT_RELOAD_EXCLUDE_PATHS="data:logs"
+
 # Start reflex in background
 .venv/bin/reflex run &
 REFLEX_PID=$!

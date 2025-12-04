@@ -131,7 +131,8 @@ class AppState(rx.State):
     selected_group_id: str = ""  # Currently selected group in monitor tab
 
     # === Chart Header Info (updated every render cycle) ===
-    # Position OHLC Header: Close, Stop, Limit, HWM
+    # Position OHLC Header: Trigger value (based on trigger_price_type), Stop, Limit, HWM
+    chart_trigger_label: str = "Mid"  # "Mark", "Mid", "Bid", "Ask", "Last"
     chart_pos_close: str = "-"
     chart_pos_stop: str = "-"
     chart_pos_limit: str = "-"
@@ -144,9 +145,10 @@ class AppState(rx.State):
     def position_rows(self) -> list[list[str]]:
         """Computed var - returns position data as simple list of lists for table.
 
-        Column order: [con_id, symbol, type, expiry, strike, qty, fill_price,
+        Column order: [con_id, symbol, type, expiry, strike, side, qty, fill_price,
                        bid, mid, ask, last, mark, net_cost, net_value, pnl, pnl_color,
-                       is_selected, qty_usage_str, is_fully_used, selected_qty]
+                       is_selected, qty_usage_str, is_fully_used, selected_qty,
+                       available_qty, qty_options, market_status]
         """
         # Access refresh_tick to force recomputation on every tick
         _ = self.refresh_tick
@@ -164,23 +166,25 @@ class AppState(rx.State):
                 p["type_str"],          # 2
                 p["expiry"],            # 3
                 p["strike_str"],        # 4
-                p["quantity_str"],      # 5
-                p["fill_price_str"],    # 6 - Fill Price
-                p["bid_str"],           # 7 - Bid
-                p["mid_str"],           # 8 - Mid
-                p["ask_str"],           # 9 - Ask
-                p["last_str"],          # 10 - Last
-                p["mark_str"],          # 11 - Mark (portfolio price, sync)
-                p["net_cost_str"],      # 12 - Net Cost
-                p["net_value_str"],     # 13 - Net Value
-                p["pnl_str"],           # 14 - PnL
-                "green" if pnl_val >= 0 else "red",  # 15 - pnl_color
-                "true" if is_selected else "false",  # 16 - is_selected (as string for frontend)
-                p.get("qty_usage_str", "0/0"),       # 17 - qty_usage_str (e.g., "2/3")
-                "true" if is_fully_used else "false",  # 18 - is_fully_used
-                str(selected_qty),      # 19 - selected_qty for this group
-                str(p.get("available_qty", 0)),  # 20 - available_qty for dropdown
-                ",".join(p.get("qty_options", ["0"])),  # 21 - qty_options as comma-separated string
+                p.get("side_str", "-"), # 5 - Side (C/P)
+                p["quantity_str"],      # 6
+                p["fill_price_str"],    # 7 - Fill Price
+                p["bid_str"],           # 8 - Bid
+                p["mid_str"],           # 9 - Mid
+                p["ask_str"],           # 10 - Ask
+                p["last_str"],          # 11 - Last
+                p["mark_str"],          # 12 - Mark (portfolio price, sync)
+                p["net_cost_str"],      # 13 - Net Cost
+                p["net_value_str"],     # 14 - Net Value
+                p["pnl_str"],           # 15 - PnL
+                "green" if pnl_val >= 0 else "red",  # 16 - pnl_color
+                "true" if is_selected else "false",  # 17 - is_selected (as string for frontend)
+                p.get("qty_usage_str", "0/0"),       # 18 - qty_usage_str (e.g., "2/3")
+                "true" if is_fully_used else "false",  # 19 - is_fully_used
+                str(selected_qty),      # 20 - selected_qty for this group
+                str(p.get("available_qty", 0)),  # 21 - available_qty for dropdown
+                ",".join(p.get("qty_options", ["0"])),  # 22 - qty_options as comma-separated string
+                p.get("market_status", "Unknown"),  # 23 - market_status (Open/Closed/Unknown)
             ]
             rows.append(row)
         # Log first row to verify data
@@ -359,7 +363,7 @@ class AppState(rx.State):
             if metrics_cache and g.id in metrics_cache:
                 metrics = metrics_cache[g.id]
             else:
-                metrics = self._calc_group_metrics(g.con_ids, g.position_quantities)
+                metrics = self._calc_group_metrics(g.con_ids, g.position_quantities, g.trigger_price_type)
             # Calculate total allocated quantity
             total_allocated_qty = sum(g.position_quantities.values())
 
@@ -369,6 +373,17 @@ class AppState(rx.State):
             else:
                 trail_display = f"${g.trail_value}"
 
+            # Calculate group market status (worst case of all positions)
+            group_market_status = "Open"
+            for pos in self.positions:
+                if pos["con_id"] in g.con_ids:
+                    pos_status = pos.get("market_status", "Unknown")
+                    if pos_status == "Closed":
+                        group_market_status = "Closed"
+                        break
+                    elif pos_status == "Unknown" and group_market_status == "Open":
+                        group_market_status = "Unknown"
+
             self.groups.append({
                 "id": g.id,
                 "name": g.name,
@@ -376,6 +391,7 @@ class AppState(rx.State):
                 "positions_str": ", ".join(str(c) for c in g.con_ids),
                 "total_qty": total_allocated_qty,
                 "total_qty_str": f"{total_allocated_qty} qty",
+                "market_status": group_market_status,
                 # Trailing Stop config
                 "trail_enabled": g.trail_enabled,
                 "trail_mode": g.trail_mode,
@@ -392,11 +408,14 @@ class AppState(rx.State):
                 "time_exit_time": g.time_exit_time,
                 # Runtime state
                 "is_active": g.is_active,
-                # HWM and Stop from chart_data (mid-based) or fallback to metrics mid_value
-                "high_water_mark": self._get_group_hwm_mid(g.id, metrics.get("mid_value", 0)),
-                "hwm_str": f"${self._get_group_hwm_mid(g.id, metrics.get('mid_value', 0)):.2f}",
-                "stop_price": self._get_group_stop_mid(g.id, g.trail_mode, g.trail_value, metrics.get("mid_value", 0)),
-                "stop_str": f"${self._get_group_stop_mid(g.id, g.trail_mode, g.trail_value, metrics.get('mid_value', 0)):.2f}",
+                # HWM and Stop from chart_data (trigger-based) or fallback to metrics trigger_value
+                "high_water_mark": self._get_group_hwm(g.id, metrics.get("trigger_value", 0)),
+                "hwm_str": f"${self._get_group_hwm(g.id, metrics.get('trigger_value', 0)):.2f}",
+                "stop_price": self._get_group_stop(g.id, g.trail_mode, g.trail_value, metrics.get("trigger_value", 0)),
+                "stop_str": f"${self._get_group_stop(g.id, g.trail_mode, g.trail_value, metrics.get('trigger_value', 0)):.2f}",
+                # Trigger value for highlighting in UI
+                "trigger_value": metrics.get("trigger_value", 0),
+                "trigger_value_str": f"${metrics.get('trigger_value', 0):.2f}",
                 "current_value": value,
                 "value_str": f"${value:.2f}",
                 # Metrics - Legs info
@@ -434,27 +453,28 @@ class AppState(rx.State):
                 total += pos["net_value"]
         return round(total, 2)
 
-    def _get_group_hwm_mid(self, group_id: str, fallback_mid: float = 0) -> float:
-        """Get mid-based HWM from chart_data, or fallback to current mid_value."""
+    def _get_group_hwm(self, group_id: str, fallback_value: float = 0) -> float:
+        """Get trigger-based HWM from chart_data, or fallback to current trigger_value."""
         if group_id in self.chart_data:
-            hwm = self.chart_data[group_id].get("current_hwm_mid", 0)
+            hwm = self.chart_data[group_id].get("current_hwm", 0)
             if hwm > 0:
                 return hwm
-        return fallback_mid
+        return fallback_value
 
-    def _get_group_stop_mid(self, group_id: str, trail_mode: str, trail_value: float, fallback_mid: float = 0) -> float:
-        """Get mid-based stop price from chart_data HWM."""
-        hwm_mid = self._get_group_hwm_mid(group_id, fallback_mid)
-        if hwm_mid > 0:
-            return calculate_stop_price(hwm_mid, trail_mode, trail_value)
+    def _get_group_stop(self, group_id: str, trail_mode: str, trail_value: float, fallback_value: float = 0) -> float:
+        """Get trigger-based stop price from chart_data HWM."""
+        hwm = self._get_group_hwm(group_id, fallback_value)
+        if hwm > 0:
+            return calculate_stop_price(hwm, trail_mode, trail_value)
         return 0.0
 
-    def _calc_group_metrics(self, con_ids: list[int], position_quantities: dict = None) -> dict:
+    def _calc_group_metrics(self, con_ids: list[int], position_quantities: dict = None, trigger_price_type: str = "mid") -> dict:
         """Calculate detailed metrics for a group.
 
         Args:
             con_ids: List of contract IDs in the group
             position_quantities: Optional dict mapping con_id_str -> allocated qty
+            trigger_price_type: Price type for trailing stop trigger (mark, mid, bid, ask, last)
         """
         # Build leg data from positions
         legs = []
@@ -549,7 +569,34 @@ class AppState(rx.State):
             "theta_str": metrics.theta_str,
             "vega": metrics.group_vega,
             "vega_str": metrics.vega_str,
+            # Trigger value based on trigger_price_type
+            "trigger_value": self._get_trigger_value(metrics, trigger_price_type),
+            "trigger_price_type": trigger_price_type,
         }
+
+    def _get_trigger_value(self, metrics, trigger_price_type: str) -> float:
+        """Get the trigger value based on trigger_price_type.
+
+        Args:
+            metrics: GroupMetrics object from compute_group_metrics()
+            trigger_price_type: One of "mark", "mid", "bid", "ask", "last"
+
+        Returns:
+            The appropriate value for trailing stop calculations
+        """
+        if trigger_price_type == "mark":
+            return metrics.group_mark_value
+        elif trigger_price_type == "mid":
+            return metrics.group_mid_value
+        elif trigger_price_type == "bid":
+            return metrics.spread_bid
+        elif trigger_price_type == "ask":
+            return metrics.spread_ask
+        elif trigger_price_type == "last":
+            # For "last", use mid as fallback (last not aggregated in metrics)
+            return metrics.group_mid_value
+        else:
+            return metrics.group_mid_value
 
     def delete_group(self, group_id: str):
         """Delete a group."""
@@ -759,14 +806,18 @@ class AppState(rx.State):
             theta = quote.get("theta", 0.0)
             vega = quote.get("vega", 0.0)
 
-            # Calculate net cost (fill_price * qty * multiplier)
+            # Calculate net cost (fill_price * abs(qty) * multiplier) - always positive
             net_cost = fill_price * abs(p.quantity) * multiplier
 
             # Calculate net value using mark price (same as TWS)
+            # For Long: positive value, For Short: negative value
             net_value = mark * p.quantity * multiplier
 
-            # Calculate PnL
-            pnl = net_value - net_cost
+            # Calculate PnL correctly for Long and Short positions:
+            # Long (qty > 0):  P&L = (mark - fill) × qty × mult  (profit if mark > fill)
+            # Short (qty < 0): P&L = (fill - mark) × |qty| × mult (profit if mark < fill)
+            # Simplified: P&L = (mark - fill) × qty × mult (qty is negative for short)
+            pnl = (mark - fill_price) * p.quantity * multiplier
 
             # Calculate quantity usage across groups
             total_qty = abs(p.quantity)
@@ -778,18 +829,23 @@ class AppState(rx.State):
             if p.is_combo:
                 type_str = f"COMBO ({len(p.combo_legs)} legs)"
                 strike_str = "-"
+                side_str = "-"
             elif p.sec_type == "OPT":
                 type_str = "OPT"
-                strike_str = f"{p.strike}{p.right}"
+                strike_str = f"{p.strike:g}"
+                side_str = p.right  # "C" or "P"
             elif p.sec_type == "FOP":
                 type_str = "FOP"
-                strike_str = f"{p.strike}{p.right}"
+                strike_str = f"{p.strike:g}"
+                side_str = p.right  # "C" or "P"
             elif p.sec_type == "STK":
                 type_str = "STK"
                 strike_str = "-"
+                side_str = "-"
             else:
                 type_str = p.sec_type
                 strike_str = "-"
+                side_str = "-"
 
             # Use dict instead of PositionData for proper Reflex serialization
             result.append({
@@ -799,6 +855,7 @@ class AppState(rx.State):
                 "type_str": type_str,
                 "expiry": p.expiry or "-",
                 "strike_str": strike_str,
+                "side_str": side_str,
                 "quantity": p.quantity,
                 "quantity_str": f"{p.quantity:g}",
                 "fill_price": fill_price,
@@ -836,6 +893,9 @@ class AppState(rx.State):
                 "gamma": gamma,
                 "theta": theta,
                 "vega": vega,
+                # Market status
+                "market_open": BROKER.is_market_open(p.con_id),
+                "market_status": BROKER.get_market_status(p.con_id),
             })
 
         # Log first position to verify live data
@@ -898,18 +958,28 @@ class AppState(rx.State):
         metrics_cache = {}
         for g in GROUP_MANAGER.get_all():
             value = self._calc_group_value(g.con_ids)
-            metrics = self._calc_group_metrics(g.con_ids, g.position_quantities)
+            metrics = self._calc_group_metrics(g.con_ids, g.position_quantities, g.trigger_price_type)
             metrics_cache[g.id] = metrics
 
             # Accumulate tick into current bar (in-place, fast)
             self._accumulate_tick(g.id, metrics)
 
+            # Check if all markets for this group are open
+            group_market_open = True
+            for pos in self.positions:
+                if pos["con_id"] in g.con_ids:
+                    if pos.get("market_status") == "Closed":
+                        group_market_open = False
+                        break
+
             # Check stop trigger for active groups
+            # IMPORTANT: Only update HWM and check triggers when market is OPEN
             if g.is_active:
-                GROUP_MANAGER.update_hwm(g.id, value)
-                if GROUP_MANAGER.check_stop_triggered(g.id, value):
-                    self.status_message = f"STOP TRIGGERED: {g.name} at ${value:.2f}!"
-                    GROUP_MANAGER.deactivate(g.id)
+                if group_market_open:
+                    GROUP_MANAGER.update_hwm(g.id, value)
+                    if GROUP_MANAGER.check_stop_triggered(g.id, value):
+                        self.status_message = f"STOP TRIGGERED: {g.name} at ${value:.2f}!"
+                        GROUP_MANAGER.deactivate(g.id)
         timings["3_groups_metrics"] = (time.perf_counter() - t0) * 1000
 
         # 4. Bar completion every 3 min (BAR_INTERVAL_TICKS = 360)
@@ -1077,8 +1147,8 @@ class AppState(rx.State):
     def _init_chart_state(self, group_id: str):
         """Initialize 240-slot chart arrays for a group."""
         import time
-        # HWM starts at 0 - will be set from first mid_value tick
-        # (old HWM in GROUP_MANAGER is net value, we track mid_price here)
+        # HWM starts at 0 - will be set from first trigger_value tick
+        # (based on trigger_price_type: mark, mid, bid, ask, or last)
 
         state = {
             "start_timestamp": time.time(),
@@ -1092,7 +1162,7 @@ class AppState(rx.State):
             "stop_pnl_bars": [None] * 240,  # Stop P&L per slot for visualization
             "current_pos": None,  # Accumulator for current position bar
             "current_pnl": None,  # Accumulator for current PnL bar
-            "current_hwm_mid": 0.0,  # Track HWM as mid_price (for Position OHLC)
+            "current_hwm": 0.0,  # Track HWM based on trigger_value
         }
         new_data = dict(self.chart_data)
         new_data[group_id] = state
@@ -1112,26 +1182,42 @@ class AppState(rx.State):
         - Track HWM (High Water Mark) which only moves UP
         - Calculate stop price based on trail settings
         - Update GROUP_MANAGER with new HWM (for persistence)
+
+        IMPORTANT: HWM is only updated when ALL markets for the group are open.
+        This prevents false triggers due to stale prices during market closed hours.
+
+        Uses trigger_value (based on trigger_price_type: mark, mid, bid, ask, last)
+        for OHLC candlesticks and HWM tracking.
         """
-        mid = metrics.get("mid_value", 0)
+        trigger_value = metrics.get("trigger_value", 0)
         pnl = metrics.get("pnl_mark", 0)
 
-        # Skip if no valid mid value (positions not loaded yet)
-        if mid == 0:
+        # Skip if no valid trigger value (positions not loaded yet)
+        if trigger_value == 0:
             return
 
         if group_id not in self.chart_data:
             self._init_chart_state(group_id)
 
+        # Check if all markets for this group are open
+        group = GROUP_MANAGER.get(group_id)
+        market_open = True
+        if group:
+            for pos in self.positions:
+                if pos["con_id"] in group.con_ids:
+                    if pos.get("market_status") == "Closed":
+                        market_open = False
+                        break
+
         state = self.chart_data[group_id]
 
-        # Position OHLC accumulator
+        # Position OHLC accumulator (uses trigger_value based on trigger_price_type)
         if state["current_pos"] is None:
-            state["current_pos"] = {"open": mid, "high": mid, "low": mid, "close": mid}
+            state["current_pos"] = {"open": trigger_value, "high": trigger_value, "low": trigger_value, "close": trigger_value}
         else:
-            state["current_pos"]["high"] = max(state["current_pos"]["high"], mid)
-            state["current_pos"]["low"] = min(state["current_pos"]["low"], mid)
-            state["current_pos"]["close"] = mid
+            state["current_pos"]["high"] = max(state["current_pos"]["high"], trigger_value)
+            state["current_pos"]["low"] = min(state["current_pos"]["low"], trigger_value)
+            state["current_pos"]["close"] = trigger_value
 
         # PnL accumulator (track extremum) - PnL can be 0 or negative, so always update
         if state["current_pnl"] is None:
@@ -1142,41 +1228,44 @@ class AppState(rx.State):
             state["current_pnl"]["close"] = pnl
 
         # === TRAILING MECHANISM ===
-        # Track HWM as mid_price (for Position OHLC chart visualization)
-        current_hwm_mid = state.get("current_hwm_mid", 0)
-        if mid > current_hwm_mid:
-            # New high water mark (mid-price based)!
-            state["current_hwm_mid"] = mid
-            logger.debug(f"Trailing: HWM mid updated ${current_hwm_mid:.2f} -> ${mid:.2f}")
+        # Track HWM based on trigger_value (mark, mid, bid, ask, or last)
+        # IMPORTANT: Only update HWM when market is OPEN to prevent false triggers
+        current_hwm = state.get("current_hwm", 0)
+        if market_open and trigger_value > current_hwm:
+            # New high water mark!
+            state["current_hwm"] = trigger_value
+            trigger_type = metrics.get("trigger_price_type", "mid")
+            logger.debug(f"Trailing: HWM ({trigger_type}) updated ${current_hwm:.2f} -> ${trigger_value:.2f}")
+        elif not market_open and trigger_value > current_hwm:
+            # Market closed - log but don't update HWM
+            logger.debug(f"Trailing: Market CLOSED - HWM NOT updated (value=${trigger_value:.2f}, current HWM=${current_hwm:.2f})")
 
         # === LIVE UPDATE: Store current HWM/Stop/Limit in current slot ===
         # This creates the time-series history for visualization
         slot = state["current_slot"]
         time_label = self._slot_to_time_label(state["start_timestamp"], slot)
-        hwm_mid = state.get("current_hwm_mid", 0)
+        hwm = state.get("current_hwm", 0)
 
-        if hwm_mid > 0:
+        if hwm > 0:
             # Get group settings for stop calculation
             group = GROUP_MANAGER.get(group_id)
             if group:
-                stop_mid = calculate_stop_price(hwm_mid, group.trail_mode, group.trail_value)
-                state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm_mid}
-                state["stop_bars"][slot] = {"time": time_label, "stop": stop_mid}
+                stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value)
+                state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm}
+                state["stop_bars"][slot] = {"time": time_label, "stop": stop_price}
 
                 # Limit price (only for limit orders)
                 if group.stop_type == "limit":
-                    limit_mid = stop_mid - group.limit_offset
-                    state["limit_bars"][slot] = {"time": time_label, "limit": limit_mid}
+                    limit_price = stop_price - group.limit_offset
+                    state["limit_bars"][slot] = {"time": time_label, "limit": limit_price}
 
                 # Stop P&L calculation (for P&L chart)
-                # Convert stop_mid to P&L: What would P&L be if mid dropped to stop_mid?
+                # Convert stop_price to P&L: What would P&L be if trigger_value dropped to stop_price?
                 total_cost = metrics.get("total_cost", 0)
-                mid_value = metrics.get("mid_value", 0)
-                pnl_mark = metrics.get("pnl_mark", 0)
 
                 if total_cost > 0:
-                    # stop_mid is already a VALUE (not price), so stop_pnl is simply:
-                    stop_pnl = stop_mid - total_cost
+                    # stop_price is already a VALUE (not price), so stop_pnl is simply:
+                    stop_pnl = stop_price - total_cost
                     state["stop_pnl_bars"][slot] = {"time": time_label, "stop_pnl": stop_pnl}
 
         state["tick_count"] += 1
@@ -1207,14 +1296,14 @@ class AppState(rx.State):
                     "pnl": extremum,
                 }
 
-            # Finalize HWM and Stop bars for historical visualization (mid-price based)
+            # Finalize HWM and Stop bars for historical visualization (trigger-price based)
             group = GROUP_MANAGER.get(group_id)
             if group:
-                hwm_mid = state.get("current_hwm_mid", 0)
-                if hwm_mid > 0:
-                    stop_mid = calculate_stop_price(hwm_mid, group.trail_mode, group.trail_value)
-                    state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm_mid}
-                    state["stop_bars"][slot] = {"time": time_label, "stop": stop_mid}
+                hwm = state.get("current_hwm", 0)
+                if hwm > 0:
+                    stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value)
+                    state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm}
+                    state["stop_bars"][slot] = {"time": time_label, "stop": stop_price}
 
             # Advance slot (wrap around at 240)
             state["current_slot"] = (slot + 1) % 240
@@ -1245,26 +1334,27 @@ class AppState(rx.State):
         group = GROUP_MANAGER.get(group_id)
         group_info = None
         if group:
-            # Get mid-price based HWM from chart state
-            hwm_mid = state.get("current_hwm_mid", 0)
-            # Calculate stop price based on mid-price HWM
-            stop_mid = calculate_stop_price(hwm_mid, group.trail_mode, group.trail_value) if hwm_mid > 0 else 0
+            # Get trigger-price based HWM from chart state
+            hwm = state.get("current_hwm", 0)
+            # Calculate stop price based on trigger-price HWM
+            stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value) if hwm > 0 else 0
 
             # Get metrics for P&L calculation
-            metrics = self._calc_group_metrics(group.con_ids, group.position_quantities)
+            metrics = self._calc_group_metrics(group.con_ids, group.position_quantities, group.trigger_price_type)
 
             group_info = {
-                # Position OHLC uses mid-price based values
-                "stop_price": stop_mid,  # Stop as mid-price
-                "high_water_mark": hwm_mid,  # HWM as mid-price
+                # Position OHLC uses trigger-price based values
+                "stop_price": stop_price,
+                "high_water_mark": hwm,
                 "trail_mode": group.trail_mode,
                 "trail_value": group.trail_value,
                 "stop_type": group.stop_type,
                 "limit_offset": group.limit_offset,
+                "trigger_price_type": group.trigger_price_type,
                 # P&L chart calculation values
                 "total_cost": metrics.get("total_cost", 0.0),
                 "pnl_mark": metrics.get("pnl_mark", 0.0),
-                "mid_value": metrics.get("mid_value", 0.0),  # For stop_pnl calculation
+                "trigger_value": metrics.get("trigger_value", 0.0),  # For stop_pnl calculation
             }
 
         # Render position chart with stop/limit lines
@@ -1278,18 +1368,22 @@ class AppState(rx.State):
 
         # === Update chart header info ===
         if group_info:
-            # Position OHLC header: Close, Stop, Limit, HWM
-            mid_value = group_info.get("mid_value", 0)
-            stop_mid = group_info.get("stop_price", 0)
-            hwm_mid = group_info.get("high_water_mark", 0)
+            # Position OHLC header: Trigger value, Stop, Limit, HWM
+            trigger_value = group_info.get("trigger_value", 0)
+            stop_price = group_info.get("stop_price", 0)
+            hwm = group_info.get("high_water_mark", 0)
             limit_offset = group_info.get("limit_offset", 0)
             stop_type = group_info.get("stop_type", "market")
+            trigger_type = group_info.get("trigger_price_type", "mid")
 
-            self.chart_pos_close = f"${mid_value:.2f}" if mid_value > 0 else "-"
-            self.chart_pos_stop = f"${stop_mid:.2f}" if stop_mid > 0 else "-"
-            self.chart_pos_hwm = f"${hwm_mid:.2f}" if hwm_mid > 0 else "-"
-            if stop_type == "limit" and stop_mid > 0:
-                limit_price = stop_mid - limit_offset
+            # Set trigger label (capitalize first letter)
+            self.chart_trigger_label = trigger_type.capitalize()
+
+            self.chart_pos_close = f"${trigger_value:.2f}" if trigger_value > 0 else "-"
+            self.chart_pos_stop = f"${stop_price:.2f}" if stop_price > 0 else "-"
+            self.chart_pos_hwm = f"${hwm:.2f}" if hwm > 0 else "-"
+            if stop_type == "limit" and stop_price > 0:
+                limit_price = stop_price - limit_offset
                 self.chart_pos_limit = f"${limit_price:.2f}"
             else:
                 self.chart_pos_limit = "-"
@@ -1299,14 +1393,15 @@ class AppState(rx.State):
             total_cost = group_info.get("total_cost", 0)
             self.chart_pnl_current = f"${pnl_mark:.2f}" if pnl_mark != 0 else "$0.00"
 
-            # Calculate stop P&L: stop_mid is already a VALUE, so stop_pnl = stop_mid - total_cost
-            if stop_mid > 0 and total_cost > 0:
-                stop_pnl = stop_mid - total_cost
+            # Calculate stop P&L: stop_price is already a VALUE, so stop_pnl = stop_price - total_cost
+            if stop_price > 0 and total_cost > 0:
+                stop_pnl = stop_price - total_cost
                 self.chart_pnl_stop = f"${stop_pnl:.2f}"
             else:
                 self.chart_pnl_stop = "-"
         else:
             # Reset headers
+            self.chart_trigger_label = "Mid"
             self.chart_pos_close = "-"
             self.chart_pos_stop = "-"
             self.chart_pos_limit = "-"

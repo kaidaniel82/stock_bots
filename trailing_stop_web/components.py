@@ -162,11 +162,12 @@ def position_row(row: list) -> rx.Component:
     """Single position row from computed var."""
     con_id = row[0].to(int)
     con_id_str = row[0]
-    pnl_color = row[15]
-    is_selected = row[16] == "true"
-    qty_usage = row[17]           # e.g., "2/3"
-    is_fully_used = row[18] == "true"
-    selected_qty = row[19]        # Selected qty for this group
+    pnl_color = row[16]           # shifted by 1
+    is_selected = row[17] == "true"
+    qty_usage = row[18]           # e.g., "2/3"
+    is_fully_used = row[19] == "true"
+    selected_qty = row[20]        # Selected qty for this group
+    market_status = row[23]       # "Open", "Closed", or "Unknown"
 
     # Row styling based on fully_used status
     row_opacity = rx.cond(is_fully_used, "0.5", "1.0")
@@ -184,7 +185,8 @@ def position_row(row: list) -> rx.Component:
         rx.table.cell(rx.badge(row[2], color_scheme="gray")),  # type_str
         rx.table.cell(row[3]),   # expiry
         rx.table.cell(row[4]),   # strike_str
-        rx.table.cell(row[5]),   # quantity_str
+        rx.table.cell(row[5]),   # side_str (C/P)
+        rx.table.cell(row[6]),   # quantity_str
         rx.table.cell(
             rx.text(
                 qty_usage,
@@ -200,7 +202,7 @@ def position_row(row: list) -> rx.Component:
                 rx.cond(
                     is_selected,
                     rx.select(
-                        row[21].split(","),  # qty_options as comma-separated string -> list
+                        row[22].split(","),  # qty_options as comma-separated string -> list
                         value=selected_qty,
                         on_change=AppState.set_position_quantity(con_id_str),
                         size="1",
@@ -209,13 +211,24 @@ def position_row(row: list) -> rx.Component:
                 ),
             )
         ),
-        rx.table.cell(row[6]),   # fill_price
-        rx.table.cell(row[7]),   # bid
-        rx.table.cell(row[8]),   # mid
-        rx.table.cell(row[9]),   # ask
-        rx.table.cell(row[10]),  # last
-        rx.table.cell(row[11]),  # mark
-        rx.table.cell(rx.text(row[14], color=pnl_color)),  # pnl with color
+        rx.table.cell(row[7]),   # fill_price
+        rx.table.cell(row[8]),   # bid
+        rx.table.cell(row[9]),   # mid
+        rx.table.cell(row[10]),  # ask
+        rx.table.cell(row[11]),  # last
+        rx.table.cell(row[12]),  # mark
+        rx.table.cell(rx.text(row[15], color=pnl_color)),  # pnl with color
+        rx.table.cell(
+            rx.badge(
+                market_status,
+                color_scheme=rx.cond(
+                    market_status == "Open",
+                    "green",
+                    rx.cond(market_status == "Closed", "red", "gray"),
+                ),
+                size="1",
+            )
+        ),  # market status
         style={"opacity": row_opacity, "background": row_bg},
     )
 
@@ -242,6 +255,7 @@ def portfolio_table() -> rx.Component:
                             rx.table.column_header_cell("TYPE"),
                             rx.table.column_header_cell("EXPIRY"),
                             rx.table.column_header_cell("STRIKE"),
+                            rx.table.column_header_cell("SIDE"),
                             rx.table.column_header_cell("QTY"),
                             rx.table.column_header_cell("USAGE"),
                             rx.table.column_header_cell("SEL"),
@@ -252,6 +266,7 @@ def portfolio_table() -> rx.Component:
                             rx.table.column_header_cell("LAST"),
                             rx.table.column_header_cell("MARK"),
                             rx.table.column_header_cell("P&L"),
+                            rx.table.column_header_cell("MKT"),
                         )
                     ),
                     rx.table.body(
@@ -322,11 +337,20 @@ def group_config_card(group: dict) -> rx.Component:
 
     return rx.box(
         rx.vstack(
-            # Header with name, qty and status
+            # Header with name, qty, market status and active status
             rx.hstack(
                 rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
                        font_family=TYPOGRAPHY["font_family"]),
                 rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
+                rx.badge(
+                    group["market_status"],
+                    color_scheme=rx.cond(
+                        group["market_status"] == "Open",
+                        "green",
+                        rx.cond(group["market_status"] == "Closed", "red", "gray"),
+                    ),
+                    size="1",
+                ),
                 rx.badge(
                     rx.cond(is_active, "ACTIVE", "INACTIVE"),
                     color_scheme=rx.cond(is_active, "green", "gray"),
@@ -361,28 +385,61 @@ def group_config_card(group: dict) -> rx.Component:
                 width="100%",
             ),
             # Prices row - Mid, Mark, Bid/Ask and P&L
+            # The selected trigger_price_type is highlighted with accent color
             rx.hstack(
                 rx.vstack(
-                    rx.text("Mid", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["mid_value_str"], size="2", weight="bold", color=COLORS["text_primary"]),
+                    rx.text("Mid", size="1", color=rx.cond(
+                        group["trigger_price_type"] == "mid",
+                        COLORS["accent"],
+                        COLORS["text_muted"],
+                    )),
+                    rx.text(group["mid_value_str"], size="2", weight="bold", color=rx.cond(
+                        group["trigger_price_type"] == "mid",
+                        COLORS["accent"],
+                        COLORS["text_primary"],
+                    )),
                     align="center",
                     spacing="0",
                 ),
                 rx.vstack(
-                    rx.text("Mark", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["mark_value_str"], size="2", weight="bold", color=COLORS["text_primary"]),
+                    rx.text("Mark", size="1", color=rx.cond(
+                        group["trigger_price_type"] == "mark",
+                        COLORS["accent"],
+                        COLORS["text_muted"],
+                    )),
+                    rx.text(group["mark_value_str"], size="2", weight="bold", color=rx.cond(
+                        group["trigger_price_type"] == "mark",
+                        COLORS["accent"],
+                        COLORS["text_primary"],
+                    )),
                     align="center",
                     spacing="0",
                 ),
                 rx.vstack(
-                    rx.text("Bid", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["spread_bid_str"], size="2", weight="bold", color=COLORS["bid"]),
+                    rx.text("Bid", size="1", color=rx.cond(
+                        group["trigger_price_type"] == "bid",
+                        COLORS["accent"],
+                        COLORS["text_muted"],
+                    )),
+                    rx.text(group["spread_bid_str"], size="2", weight="bold", color=rx.cond(
+                        group["trigger_price_type"] == "bid",
+                        COLORS["accent"],
+                        COLORS["text_primary"],
+                    )),
                     align="center",
                     spacing="0",
                 ),
                 rx.vstack(
-                    rx.text("Ask", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["spread_ask_str"], size="2", weight="bold", color=COLORS["text_primary"]),
+                    rx.text("Ask", size="1", color=rx.cond(
+                        group["trigger_price_type"] == "ask",
+                        COLORS["accent"],
+                        COLORS["text_muted"],
+                    )),
+                    rx.text(group["spread_ask_str"], size="2", weight="bold", color=rx.cond(
+                        group["trigger_price_type"] == "ask",
+                        COLORS["accent"],
+                        COLORS["text_primary"],
+                    )),
                     align="center",
                     spacing="0",
                 ),
@@ -581,11 +638,20 @@ def compact_group_card(group: dict) -> rx.Component:
 
     return rx.box(
         rx.vstack(
-            # Header with name, qty and status
+            # Header with name, qty, market status and active status
             rx.hstack(
                 rx.text(group["name"], weight="bold", size="2", color=COLORS["primary"],
                        font_family=TYPOGRAPHY["font_family"]),
                 rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
+                rx.badge(
+                    group["market_status"],
+                    color_scheme=rx.cond(
+                        group["market_status"] == "Open",
+                        "green",
+                        rx.cond(group["market_status"] == "Closed", "red", "gray"),
+                    ),
+                    size="1",
+                ),
                 rx.badge(
                     rx.cond(is_active, "ACTIVE", "IDLE"),
                     color_scheme=rx.cond(is_active, "green", "gray"),
@@ -599,28 +665,61 @@ def compact_group_card(group: dict) -> rx.Component:
                 width="100%",
             ),
             # Key metrics - Mid, Mark, Bid, Ask, P&L
+            # The selected trigger_price_type is highlighted with accent color
             rx.hstack(
                 rx.vstack(
-                    rx.text("Mid", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["mid_value_str"], size="1", weight="bold", color=COLORS["text_primary"]),
+                    rx.text("Mid", size="1", color=rx.cond(
+                        group["trigger_price_type"] == "mid",
+                        COLORS["accent"],
+                        COLORS["text_muted"],
+                    )),
+                    rx.text(group["mid_value_str"], size="1", weight="bold", color=rx.cond(
+                        group["trigger_price_type"] == "mid",
+                        COLORS["accent"],
+                        COLORS["text_primary"],
+                    )),
                     align="center",
                     spacing="0",
                 ),
                 rx.vstack(
-                    rx.text("Mark", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["mark_value_str"], size="1", weight="bold", color=COLORS["text_primary"]),
+                    rx.text("Mark", size="1", color=rx.cond(
+                        group["trigger_price_type"] == "mark",
+                        COLORS["accent"],
+                        COLORS["text_muted"],
+                    )),
+                    rx.text(group["mark_value_str"], size="1", weight="bold", color=rx.cond(
+                        group["trigger_price_type"] == "mark",
+                        COLORS["accent"],
+                        COLORS["text_primary"],
+                    )),
                     align="center",
                     spacing="0",
                 ),
                 rx.vstack(
-                    rx.text("Bid", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["spread_bid_str"], size="1", weight="bold", color=COLORS["bid"]),
+                    rx.text("Bid", size="1", color=rx.cond(
+                        group["trigger_price_type"] == "bid",
+                        COLORS["accent"],
+                        COLORS["text_muted"],
+                    )),
+                    rx.text(group["spread_bid_str"], size="1", weight="bold", color=rx.cond(
+                        group["trigger_price_type"] == "bid",
+                        COLORS["accent"],
+                        COLORS["text_primary"],
+                    )),
                     align="center",
                     spacing="0",
                 ),
                 rx.vstack(
-                    rx.text("Ask", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["spread_ask_str"], size="1", weight="bold", color=COLORS["text_primary"]),
+                    rx.text("Ask", size="1", color=rx.cond(
+                        group["trigger_price_type"] == "ask",
+                        COLORS["accent"],
+                        COLORS["text_muted"],
+                    )),
+                    rx.text(group["spread_ask_str"], size="1", weight="bold", color=rx.cond(
+                        group["trigger_price_type"] == "ask",
+                        COLORS["accent"],
+                        COLORS["text_primary"],
+                    )),
                     align="center",
                     spacing="0",
                 ),
@@ -769,10 +868,10 @@ def combo_price_chart() -> rx.Component:
                        font_family=TYPOGRAPHY["font_family"]),
                 rx.text("(12h / 3-min bars)", size="1", color=COLORS["text_muted"]),
                 rx.spacer(),
-                # Live values header
+                # Live values header (label shows trigger_price_type: Mid, Mark, Bid, Ask, Last)
                 rx.hstack(
-                    rx.text("Mid:", size="1", color=COLORS["text_muted"]),
-                    rx.text(AppState.chart_pos_close, size="1", weight="bold", color=COLORS["text_secondary"]),
+                    rx.text(AppState.chart_trigger_label + ":", size="1", color=COLORS["accent"]),
+                    rx.text(AppState.chart_pos_close, size="1", weight="bold", color=COLORS["accent"]),
                     rx.text("Stop:", size="1", color=COLORS["text_muted"]),
                     rx.text(AppState.chart_pos_stop, size="1", weight="bold", color=COLORS["stop"]),
                     rx.text("Limit:", size="1", color=COLORS["text_muted"]),
