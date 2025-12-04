@@ -330,277 +330,346 @@ def create_group_panel() -> rx.Component:
     )
 
 
-def group_config_card(group: dict) -> rx.Component:
-    """Full configuration card for a group (Setup tab) - Bloomberg style."""
+# =============================================================================
+# SHARED GROUP CARD COMPONENTS
+# =============================================================================
+
+def _group_header(group: dict, is_selected: bool = False) -> rx.Component:
+    """Group card header with name, badges, and status."""
+    is_active = group["is_active"]
+    return rx.hstack(
+        rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
+               font_family=TYPOGRAPHY["font_family"]),
+        rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
+        rx.badge(
+            group["market_status"],
+            color_scheme=rx.cond(
+                group["market_status"] == "Open",
+                "green",
+                rx.cond(group["market_status"] == "Closed", "red", "gray"),
+            ),
+            size="1",
+        ),
+        rx.badge(
+            rx.cond(is_active, "ACTIVE", "IDLE"),
+            color_scheme=rx.cond(is_active, "green", "gray"),
+            size="1",
+        ),
+        rx.cond(
+            is_selected,
+            rx.badge("SELECTED", color_scheme="purple", size="1"),
+            rx.fragment(),
+        ),
+        width="100%",
+    )
+
+
+def _group_prices_row(group: dict, size: str = "2") -> rx.Component:
+    """Price row with trigger-type highlighting."""
+    return rx.hstack(
+        rx.vstack(
+            rx.text("Mid", size="1", color=rx.cond(
+                group["trigger_price_type"] == "mid", COLORS["accent"], COLORS["text_muted"])),
+            rx.text(group["mid_value_str"], size=size, weight="bold", color=rx.cond(
+                group["trigger_price_type"] == "mid", COLORS["accent"], COLORS["text_primary"])),
+            align="center", spacing="0",
+        ),
+        rx.vstack(
+            rx.text("Mark", size="1", color=rx.cond(
+                group["trigger_price_type"] == "mark", COLORS["accent"], COLORS["text_muted"])),
+            rx.text(group["mark_value_str"], size=size, weight="bold", color=rx.cond(
+                group["trigger_price_type"] == "mark", COLORS["accent"], COLORS["text_primary"])),
+            align="center", spacing="0",
+        ),
+        rx.vstack(
+            rx.text("Bid", size="1", color=rx.cond(
+                group["trigger_price_type"] == "bid", COLORS["accent"], COLORS["text_muted"])),
+            rx.text(group["spread_bid_str"], size=size, weight="bold", color=rx.cond(
+                group["trigger_price_type"] == "bid", COLORS["accent"], COLORS["text_primary"])),
+            align="center", spacing="0",
+        ),
+        rx.vstack(
+            rx.text("Ask", size="1", color=rx.cond(
+                group["trigger_price_type"] == "ask", COLORS["accent"], COLORS["text_muted"])),
+            rx.text(group["spread_ask_str"], size=size, weight="bold", color=rx.cond(
+                group["trigger_price_type"] == "ask", COLORS["accent"], COLORS["text_primary"])),
+            align="center", spacing="0",
+        ),
+        rx.vstack(
+            rx.text("P&L", size="1", color=COLORS["text_muted"]),
+            rx.text(group["pnl_mark_str"], size=size, weight="bold", color=group["pnl_color"]),
+            align="center", spacing="0",
+        ),
+        spacing="3",
+        width="100%",
+    )
+
+
+def _group_greeks_row(group: dict) -> rx.Component:
+    """Greeks row (Delta, Gamma, Theta, Vega)."""
+    return rx.hstack(
+        rx.vstack(
+            rx.text("Delta", size="1", color=COLORS["text_muted"]),
+            rx.text(group["delta_str"], size="1", color=COLORS["text_secondary"]),
+            align="center", spacing="0",
+        ),
+        rx.vstack(
+            rx.text("Gamma", size="1", color=COLORS["text_muted"]),
+            rx.text(group["gamma_str"], size="1", color=COLORS["text_secondary"]),
+            align="center", spacing="0",
+        ),
+        rx.vstack(
+            rx.text("Theta", size="1", color=COLORS["text_muted"]),
+            rx.text(group["theta_str"], size="1", color=COLORS["text_secondary"]),
+            align="center", spacing="0",
+        ),
+        rx.vstack(
+            rx.text("Vega", size="1", color=COLORS["text_muted"]),
+            rx.text(group["vega_str"], size="1", color=COLORS["text_secondary"]),
+            align="center", spacing="0",
+        ),
+        spacing="3",
+        width="100%",
+    )
+
+
+def _group_hwm_stop_row(group: dict, show_trail: bool = False) -> rx.Component:
+    """HWM, Stop, and optionally Trail display."""
+    items = [
+        rx.vstack(
+            rx.text("HWM", size="1", color=COLORS["text_muted"]),
+            rx.text(group["hwm_str"], size="1", color=COLORS["hwm"]),
+            align="center", spacing="0",
+        ),
+        rx.vstack(
+            rx.text("Stop", size="1", color=COLORS["text_muted"]),
+            rx.text(group["stop_str"], size="1", color=COLORS["stop"]),
+            align="center", spacing="0",
+        ),
+    ]
+    if show_trail:
+        items.append(
+            rx.vstack(
+                rx.text("Trail", size="1", color=COLORS["text_muted"]),
+                rx.text(group["trail_display"], size="1", color=COLORS["text_secondary"]),
+                align="center", spacing="0",
+            )
+        )
+    return rx.hstack(*items, spacing="3", width="100%")
+
+
+def _group_action_buttons(group_id: str, is_active: bool) -> rx.Component:
+    """Action buttons (Activate/Deactivate, Cancel, Delete)."""
+    return rx.hstack(
+        rx.button(
+            rx.cond(is_active, "Deactivate", "Activate"),
+            on_click=AppState.toggle_group_active(group_id),
+            color_scheme=rx.cond(is_active, "orange", "blue"),
+            size="1",
+        ),
+        rx.button(
+            "Cancel",
+            on_click=AppState.cancel_group_order(group_id),
+            color_scheme="yellow",
+            size="1",
+        ),
+        rx.button(
+            "Delete",
+            on_click=AppState.request_delete_group(group_id),
+            color_scheme="red",
+            size="1",
+        ),
+        spacing="1",
+        width="100%",
+    )
+
+
+def _group_trailing_config(group: dict, group_id: str) -> rx.Component:
+    """Trailing stop configuration section (Setup mode only)."""
+    return rx.vstack(
+        rx.divider(color=COLORS["border"]),
+        rx.text("Trailing Stop", size="1", weight="bold", color=COLORS["text_muted"]),
+        rx.hstack(
+            rx.vstack(
+                rx.text("Mode", size="1", color=COLORS["text_muted"]),
+                rx.select(
+                    ["percent", "absolute"],
+                    value=group["trail_mode"],
+                    on_change=AppState.update_group_trail_mode(group_id),
+                    size="1",
+                ),
+                align="center", spacing="0",
+            ),
+            rx.vstack(
+                rx.text("Trail", size="1", color=COLORS["text_muted"]),
+                rx.input(
+                    value=group["trail_value"].to(str),
+                    on_change=AppState.update_group_trail(group_id),
+                    width="50px",
+                    size="1",
+                ),
+                align="center", spacing="0",
+            ),
+            rx.vstack(
+                rx.text("Trigger", size="1", color=COLORS["text_muted"]),
+                rx.select(
+                    ["mark", "mid", "bid", "ask", "last"],
+                    value=group["trigger_price_type"],
+                    on_change=AppState.update_group_trigger_price_type(group_id),
+                    size="1",
+                ),
+                align="center", spacing="0",
+            ),
+            rx.vstack(
+                rx.text("Type", size="1", color=COLORS["text_muted"]),
+                rx.select(
+                    ["market", "limit"],
+                    value=group["stop_type"],
+                    on_change=AppState.update_group_stop_type(group_id),
+                    size="1",
+                ),
+                align="center", spacing="0",
+            ),
+            rx.cond(
+                group["stop_type"] == "limit",
+                rx.vstack(
+                    rx.text("Offset", size="1", color=COLORS["text_muted"]),
+                    rx.input(
+                        value=group["limit_offset"].to(str),
+                        on_change=AppState.update_group_limit_offset(group_id),
+                        width="50px",
+                        size="1",
+                    ),
+                    align="center", spacing="0",
+                ),
+                rx.box(),
+            ),
+            spacing="3",
+            width="100%",
+        ),
+        width="100%",
+        spacing="2",
+    )
+
+
+def _group_time_exit_config(group: dict, group_id: str) -> rx.Component:
+    """Time exit configuration section (Setup mode only)."""
+    return rx.vstack(
+        rx.divider(color=COLORS["border"]),
+        rx.hstack(
+            rx.checkbox(
+                checked=group["time_exit_enabled"],
+                on_change=AppState.update_group_time_exit_enabled(group_id),
+                size="1",
+            ),
+            rx.text("Time Exit", size="1", color=COLORS["text_secondary"]),
+            rx.cond(
+                group["time_exit_enabled"],
+                rx.hstack(
+                    rx.text("at", size="1", color=COLORS["text_muted"]),
+                    rx.input(
+                        value=group["time_exit_time"],
+                        on_change=AppState.update_group_time_exit_time(group_id),
+                        width="60px",
+                        size="1",
+                    ),
+                    rx.text("ET", size="1", color=COLORS["text_muted"]),
+                    spacing="1",
+                    align="center",
+                ),
+                rx.box(),
+            ),
+            spacing="2",
+            align="center",
+        ),
+        width="100%",
+    )
+
+
+def group_card(group: dict, mode: str = "setup") -> rx.Component:
+    """Unified group card component.
+
+    Args:
+        group: Group data dict
+        mode: "setup" (full config) or "monitor" (compact, clickable)
+    """
     group_id = group["id"]
     is_active = group["is_active"]
+    is_selected = AppState.selected_group_id == group_id
 
-    return rx.box(
-        rx.vstack(
-            # Header with name, qty, market status and active status
-            rx.hstack(
-                rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
-                       font_family=TYPOGRAPHY["font_family"]),
-                rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
-                rx.badge(
-                    group["market_status"],
-                    color_scheme=rx.cond(
-                        group["market_status"] == "Open",
-                        "green",
-                        rx.cond(group["market_status"] == "Closed", "red", "gray"),
-                    ),
-                    size="1",
-                ),
-                rx.badge(
-                    rx.cond(is_active, "ACTIVE", "INACTIVE"),
-                    color_scheme=rx.cond(is_active, "green", "gray"),
-                ),
-                rx.spacer(),
-                rx.button(
-                    rx.cond(is_active, "Deactivate", "Activate"),
-                    on_click=AppState.toggle_group_active(group_id),
-                    color_scheme=rx.cond(is_active, "orange", "blue"),
-                    size="1",
-                ),
-                rx.button(
-                    "Cancel",
-                    on_click=AppState.cancel_group_order(group_id),
-                    color_scheme="yellow",
-                    size="1",
-                ),
-                rx.button(
-                    "Delete",
-                    on_click=AppState.request_delete_group(group_id),
-                    color_scheme="red",
-                    size="1",
-                ),
-                width="100%",
-            ),
-            # Legs
+    # Common content for both modes
+    content = [
+        _group_header(group, is_selected if mode == "monitor" else False),
+    ]
+
+    # Legs (Setup mode only)
+    if mode == "setup":
+        content.append(
             rx.box(
                 rx.text(group["legs_str"], size="1", white_space="pre-wrap", color=COLORS["text_secondary"]),
                 padding="2",
                 background=COLORS["bg_elevated"],
                 border_radius="6px",
                 width="100%",
-            ),
-            # Prices row - Mid, Mark, Bid/Ask and P&L
-            # The selected trigger_price_type is highlighted with accent color
-            rx.hstack(
-                rx.vstack(
-                    rx.text("Mid", size="1", color=rx.cond(
-                        group["trigger_price_type"] == "mid",
-                        COLORS["accent"],
-                        COLORS["text_muted"],
-                    )),
-                    rx.text(group["mid_value_str"], size="2", weight="bold", color=rx.cond(
-                        group["trigger_price_type"] == "mid",
-                        COLORS["accent"],
-                        COLORS["text_primary"],
-                    )),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Mark", size="1", color=rx.cond(
-                        group["trigger_price_type"] == "mark",
-                        COLORS["accent"],
-                        COLORS["text_muted"],
-                    )),
-                    rx.text(group["mark_value_str"], size="2", weight="bold", color=rx.cond(
-                        group["trigger_price_type"] == "mark",
-                        COLORS["accent"],
-                        COLORS["text_primary"],
-                    )),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Bid", size="1", color=rx.cond(
-                        group["trigger_price_type"] == "bid",
-                        COLORS["accent"],
-                        COLORS["text_muted"],
-                    )),
-                    rx.text(group["spread_bid_str"], size="2", weight="bold", color=rx.cond(
-                        group["trigger_price_type"] == "bid",
-                        COLORS["accent"],
-                        COLORS["text_primary"],
-                    )),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Ask", size="1", color=rx.cond(
-                        group["trigger_price_type"] == "ask",
-                        COLORS["accent"],
-                        COLORS["text_muted"],
-                    )),
-                    rx.text(group["spread_ask_str"], size="2", weight="bold", color=rx.cond(
-                        group["trigger_price_type"] == "ask",
-                        COLORS["accent"],
-                        COLORS["text_primary"],
-                    )),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("P&L", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["pnl_mark_str"], size="2", weight="bold", color=group["pnl_color"]),
-                    align="center",
-                    spacing="0",
-                ),
-                spacing="4",
-                width="100%",
-            ),
-            # Greeks row
-            rx.hstack(
-                rx.vstack(
-                    rx.text("Delta", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["delta_str"], size="1", weight="bold", color=COLORS["text_secondary"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Gamma", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["gamma_str"], size="1", weight="bold", color=COLORS["text_secondary"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Theta", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["theta_str"], size="1", weight="bold", color=COLORS["text_secondary"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Vega", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["vega_str"], size="1", weight="bold", color=COLORS["text_secondary"]),
-                    align="center",
-                    spacing="0",
-                ),
-                spacing="4",
-                width="100%",
-            ),
-            # Trailing Stop Config
-            rx.divider(color=COLORS["border"]),
-            rx.text("Trailing Stop", size="1", weight="bold", color=COLORS["text_muted"]),
-            rx.hstack(
-                rx.vstack(
-                    rx.text("Mode", size="1", color=COLORS["text_muted"]),
-                    rx.select(
-                        ["percent", "absolute"],
-                        value=group["trail_mode"],
-                        on_change=AppState.update_group_trail_mode(group_id),
-                        size="1",
-                    ),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Trail", size="1", color=COLORS["text_muted"]),
-                    rx.input(
-                        value=group["trail_value"].to(str),
-                        on_change=AppState.update_group_trail(group_id),
-                        width="50px",
-                        size="1",
-                    ),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Trigger", size="1", color=COLORS["text_muted"]),
-                    rx.select(
-                        ["mark", "mid", "bid", "ask", "last"],
-                        value=group["trigger_price_type"],
-                        on_change=AppState.update_group_trigger_price_type(group_id),
-                        size="1",
-                    ),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Type", size="1", color=COLORS["text_muted"]),
-                    rx.select(
-                        ["market", "limit"],
-                        value=group["stop_type"],
-                        on_change=AppState.update_group_stop_type(group_id),
-                        size="1",
-                    ),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.cond(
-                    group["stop_type"] == "limit",
-                    rx.vstack(
-                        rx.text("Offset", size="1", color=COLORS["text_muted"]),
-                        rx.input(
-                            value=group["limit_offset"].to(str),
-                            on_change=AppState.update_group_limit_offset(group_id),
-                            width="50px",
-                            size="1",
-                        ),
-                        align="center",
-                        spacing="0",
-                    ),
-                    rx.box(),
-                ),
-                spacing="3",
-                width="100%",
-            ),
-            # HWM and Stop
-            rx.hstack(
-                rx.vstack(
-                    rx.text("HWM", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["hwm_str"], size="2", weight="bold", color=COLORS["hwm"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Stop", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["stop_str"], size="2", weight="bold", color=COLORS["stop"]),
-                    align="center",
-                    spacing="0",
-                ),
-                spacing="4",
-            ),
-            # Time Exit
-            rx.divider(color=COLORS["border"]),
-            rx.hstack(
-                rx.checkbox(
-                    checked=group["time_exit_enabled"],
-                    on_change=AppState.update_group_time_exit_enabled(group_id),
-                    size="1",
-                ),
-                rx.text("Time Exit", size="1", color=COLORS["text_secondary"]),
-                rx.cond(
-                    group["time_exit_enabled"],
-                    rx.hstack(
-                        rx.text("at", size="1", color=COLORS["text_muted"]),
-                        rx.input(
-                            value=group["time_exit_time"],
-                            on_change=AppState.update_group_time_exit_time(group_id),
-                            width="60px",
-                            size="1",
-                        ),
-                        rx.text("ET", size="1", color=COLORS["text_muted"]),
-                        spacing="1",
-                        align="center",
-                    ),
-                    rx.box(),
-                ),
-                spacing="2",
-                align="center",
-            ),
-            width="100%",
-            spacing="2",
-        ),
-        background=COLORS["bg_panel"],
-        border=PANEL_STYLES["border"],
-        border_left=PANEL_STYLES["border_left"],
-        border_radius=PANEL_STYLES["border_radius"],
-        padding=PANEL_STYLES["padding"],
-        width="100%",
+            )
+        )
+
+    # Prices row
+    content.append(_group_prices_row(group, size="2" if mode == "setup" else "1"))
+
+    # Greeks row
+    content.append(_group_greeks_row(group))
+
+    # Trailing config (Setup mode only)
+    if mode == "setup":
+        content.append(_group_trailing_config(group, group_id))
+
+    # HWM/Stop row
+    content.append(_group_hwm_stop_row(group, show_trail=(mode == "monitor")))
+
+    # Time exit config (Setup mode only)
+    if mode == "setup":
+        content.append(_group_time_exit_config(group, group_id))
+
+    # Action buttons
+    content.append(_group_action_buttons(group_id, is_active))
+
+    # Build card with mode-specific styling
+    card_props = {
+        "background": COLORS["bg_panel"],
+        "border": PANEL_STYLES["border"],
+        "border_radius": PANEL_STYLES["border_radius"],
+        "padding": PANEL_STYLES["padding"],
+        "width": "100%",
+    }
+
+    if mode == "monitor":
+        card_props["on_click"] = AppState.select_group(group_id)
+        card_props["cursor"] = "pointer"
+        card_props["border_left"] = rx.cond(
+            is_selected,
+            f"3px solid {COLORS['accent']}",
+            PANEL_STYLES["border_left"],
+        )
+        card_props["_hover"] = {"background": COLORS["bg_elevated"]}
+    else:
+        card_props["border_left"] = PANEL_STYLES["border_left"]
+
+    return rx.box(
+        rx.vstack(*content, width="100%", spacing="2"),
+        **card_props,
     )
+
+
+# Wrapper functions for backward compatibility
+def group_config_card(group: dict) -> rx.Component:
+    """Setup tab group card (full config)."""
+    return group_card(group, mode="setup")
+
+
+def compact_group_card(group: dict) -> rx.Component:
+    """Monitor tab group card (compact, clickable)."""
+    return group_card(group, mode="monitor")
 
 
 def setup_tab() -> rx.Component:
@@ -629,202 +698,6 @@ def setup_tab() -> rx.Component:
 # =============================================================================
 # MONITOR TAB COMPONENTS
 # =============================================================================
-
-def compact_group_card(group: dict) -> rx.Component:
-    """Compact group card for monitor view (2x2 grid) - Bloomberg style. Clickable for chart selection."""
-    group_id = group["id"]
-    is_active = group["is_active"]
-    is_selected = AppState.selected_group_id == group_id
-
-    return rx.box(
-        rx.vstack(
-            # Header with name, qty, market status and active status
-            rx.hstack(
-                rx.text(group["name"], weight="bold", size="2", color=COLORS["primary"],
-                       font_family=TYPOGRAPHY["font_family"]),
-                rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
-                rx.badge(
-                    group["market_status"],
-                    color_scheme=rx.cond(
-                        group["market_status"] == "Open",
-                        "green",
-                        rx.cond(group["market_status"] == "Closed", "red", "gray"),
-                    ),
-                    size="1",
-                ),
-                rx.badge(
-                    rx.cond(is_active, "ACTIVE", "IDLE"),
-                    color_scheme=rx.cond(is_active, "green", "gray"),
-                    size="1",
-                ),
-                rx.cond(
-                    is_selected,
-                    rx.badge("SELECTED", color_scheme="purple", size="1"),
-                    rx.fragment(),
-                ),
-                width="100%",
-            ),
-            # Key metrics - Mid, Mark, Bid, Ask, P&L
-            # The selected trigger_price_type is highlighted with accent color
-            rx.hstack(
-                rx.vstack(
-                    rx.text("Mid", size="1", color=rx.cond(
-                        group["trigger_price_type"] == "mid",
-                        COLORS["accent"],
-                        COLORS["text_muted"],
-                    )),
-                    rx.text(group["mid_value_str"], size="1", weight="bold", color=rx.cond(
-                        group["trigger_price_type"] == "mid",
-                        COLORS["accent"],
-                        COLORS["text_primary"],
-                    )),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Mark", size="1", color=rx.cond(
-                        group["trigger_price_type"] == "mark",
-                        COLORS["accent"],
-                        COLORS["text_muted"],
-                    )),
-                    rx.text(group["mark_value_str"], size="1", weight="bold", color=rx.cond(
-                        group["trigger_price_type"] == "mark",
-                        COLORS["accent"],
-                        COLORS["text_primary"],
-                    )),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Bid", size="1", color=rx.cond(
-                        group["trigger_price_type"] == "bid",
-                        COLORS["accent"],
-                        COLORS["text_muted"],
-                    )),
-                    rx.text(group["spread_bid_str"], size="1", weight="bold", color=rx.cond(
-                        group["trigger_price_type"] == "bid",
-                        COLORS["accent"],
-                        COLORS["text_primary"],
-                    )),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Ask", size="1", color=rx.cond(
-                        group["trigger_price_type"] == "ask",
-                        COLORS["accent"],
-                        COLORS["text_muted"],
-                    )),
-                    rx.text(group["spread_ask_str"], size="1", weight="bold", color=rx.cond(
-                        group["trigger_price_type"] == "ask",
-                        COLORS["accent"],
-                        COLORS["text_primary"],
-                    )),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("P&L", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["pnl_mark_str"], size="1", weight="bold", color=group["pnl_color"]),
-                    align="center",
-                    spacing="0",
-                ),
-                spacing="2",
-                width="100%",
-            ),
-            # Greeks row
-            rx.hstack(
-                rx.vstack(
-                    rx.text("Delta", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["delta_str"], size="1", color=COLORS["text_secondary"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Gamma", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["gamma_str"], size="1", color=COLORS["text_secondary"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Theta", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["theta_str"], size="1", color=COLORS["text_secondary"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Vega", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["vega_str"], size="1", color=COLORS["text_secondary"]),
-                    align="center",
-                    spacing="0",
-                ),
-                spacing="2",
-                width="100%",
-            ),
-            # HWM and Stop
-            rx.hstack(
-                rx.vstack(
-                    rx.text("HWM", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["hwm_str"], size="1", color=COLORS["hwm"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Stop", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["stop_str"], size="1", color=COLORS["stop"]),
-                    align="center",
-                    spacing="0",
-                ),
-                rx.vstack(
-                    rx.text("Trail", size="1", color=COLORS["text_muted"]),
-                    rx.text(group["trail_display"], size="1", color=COLORS["text_secondary"]),
-                    align="center",
-                    spacing="0",
-                ),
-                spacing="3",
-                width="100%",
-            ),
-            # Action buttons
-            rx.hstack(
-                rx.button(
-                    rx.cond(is_active, "Deactivate", "Activate"),
-                    on_click=AppState.toggle_group_active(group_id),
-                    color_scheme=rx.cond(is_active, "orange", "blue"),
-                    size="1",
-                ),
-                rx.button(
-                    "Cancel",
-                    on_click=AppState.cancel_group_order(group_id),
-                    color_scheme="yellow",
-                    size="1",
-                ),
-                rx.button(
-                    "Delete",
-                    on_click=AppState.request_delete_group(group_id),
-                    color_scheme="red",
-                    size="1",
-                ),
-                spacing="1",
-                width="100%",
-            ),
-            width="100%",
-            spacing="2",
-        ),
-        on_click=AppState.select_group(group_id),
-        cursor="pointer",
-        background=COLORS["bg_panel"],
-        border=PANEL_STYLES["border"],
-        border_left=rx.cond(
-            is_selected,
-            f"3px solid {COLORS['accent']}",  # Highlight selected
-            PANEL_STYLES["border_left"],
-        ),
-        border_radius=PANEL_STYLES["border_radius"],
-        padding=PANEL_STYLES["padding"],
-        width="100%",
-        _hover={"background": COLORS["bg_elevated"]},
-    )
-
 
 def underlying_chart() -> rx.Component:
     """Chart A: Underlying price history (3D, 3min candlesticks)."""
