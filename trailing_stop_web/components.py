@@ -92,15 +92,12 @@ def topbar() -> rx.Component:
                         color_scheme="red",
                         size="1",
                     ),
-                    rx.cond(
-                        AppState.connection_status == "Disconnected",
-                        rx.button(
-                            "Connect",
-                            on_click=AppState.connect_tws,
-                            color_scheme="green",
-                            size="1",
-                        ),
-                        rx.fragment(),  # Hide during reconnecting
+                    rx.button(
+                        "Connect",
+                        on_click=AppState.connect_tws,
+                        color_scheme="green",
+                        size="1",
+                        disabled=AppState.connection_status != "Disconnected",
                     ),
                 ),
                 spacing="2",
@@ -779,7 +776,7 @@ def combo_price_chart() -> rx.Component:
                     rx.text("Stop:", size="1", color=COLORS["text_muted"]),
                     rx.text(AppState.chart_pos_stop, size="1", weight="bold", color=COLORS["stop"]),
                     rx.text("Limit:", size="1", color=COLORS["text_muted"]),
-                    rx.text(AppState.chart_pos_limit, size="1", weight="bold", color="#FFA500"),
+                    rx.text(AppState.chart_pos_limit, size="1", weight="bold", color=COLORS["limit"]),
                     rx.text("HWM:", size="1", color=COLORS["text_muted"]),
                     rx.text(AppState.chart_pos_hwm, size="1", weight="bold", color=COLORS["hwm"]),
                     spacing="1",

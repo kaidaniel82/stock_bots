@@ -44,6 +44,7 @@ COLORS = {
     "loss": "#FF3B30",     # Red
     "hwm": "#00BFFF",      # High water mark - cyan
     "stop": "#FF3B30",     # Stop price - red
+    "limit": "#FFA500",    # Limit price - orange
     "bid": "#FFB347",      # Bid - amber
     "connected": "#00D26A",
     "disconnected": "#FF3B30",
