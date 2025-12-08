@@ -490,6 +490,8 @@ class AppState(rx.State):
                 "vega_str": metrics["vega_str"],
                 # Position type from STORED group (immutable)
                 "is_credit": g.is_credit,
+                # Statistics
+                "modification_count": g.modification_count,
             })
 
     def _calc_group_value(self, con_ids: list[int]) -> float:
@@ -1173,9 +1175,11 @@ class AppState(rx.State):
             # Update underlying history on bar completion
             if self.selected_group_id:
                 symbol = self.selected_underlying_symbol
+                logger.debug(f"Bar completion: updating underlying chart for {symbol}")
                 if symbol and symbol in self.underlying_history:
                     new_bar = BROKER.fetch_latest_underlying_bar(symbol)
                     if new_bar:
+                        logger.debug(f"Got new underlying bar: {new_bar.get('date')}")
                         new_hist = dict(self.underlying_history)
                         bars = list(new_hist.get(symbol, []))
                         if bars and bars[-1].get("date") == new_bar.get("date"):
@@ -1256,14 +1260,15 @@ class AppState(rx.State):
             else:
                 return
 
-            # Fetch underlying history if not already loaded
-            if symbol not in self.underlying_history:
-                bars = BROKER.fetch_underlying_history(symbol, "3 D", "3 mins")
-                if bars:
-                    new_hist = dict(self.underlying_history)
-                    new_hist[symbol] = bars
-                    self.underlying_history = new_hist
-                    logger.debug(f"Loaded {len(bars)} underlying bars for {symbol}")
+            # Fetch underlying history (always refresh to ensure fresh data)
+            bars = BROKER.fetch_underlying_history(symbol, "3 D", "3 mins")
+            if bars:
+                new_hist = dict(self.underlying_history)
+                new_hist[symbol] = bars
+                self.underlying_history = new_hist
+                logger.info(f"Loaded/refreshed {len(bars)} underlying bars for {symbol}")
+            else:
+                logger.warning(f"Failed to load underlying history for {symbol}")
 
     # NOTE: _build_position_ohlc_from_history and _build_pnl_history_from_position
     # are no longer used - data is collected from connect time using _accumulate_tick
@@ -1505,6 +1510,10 @@ class AppState(rx.State):
         )
 
         if success:
+            # Increment modification counter
+            group.modification_count += 1
+            GROUP_MANAGER._save()  # Persist the counter
+
             # Update rate limiting state
             new_sent = dict(self.last_sent_stop_prices)
             new_sent[group_id] = {
@@ -1514,7 +1523,8 @@ class AppState(rx.State):
             }
             self.last_sent_stop_prices = new_sent
             limit_str = f"${new_limit:.2f}" if new_limit else "N/A"
-            logger.debug(f"Modified order for {group.name}: stop=${new_stop:.2f} limit={limit_str}")
+            logger.debug(f"Modified order for {group.name}: stop=${new_stop:.2f} limit={limit_str} "
+                        f"(mod #{group.modification_count})")
         else:
             logger.warning(f"Failed to modify order for {group.name}")
 
@@ -2168,15 +2178,40 @@ class AppState(rx.State):
 
     def cancel_group_order(self, group_id: str):
         """Cancel order for a specific group at IB and set to inactive."""
-        logger.info(f"Canceling order for group {group_id}")
+        logger.info(f"cancel_group_order called with group_id={group_id}")
         group = GROUP_MANAGER.get(group_id)
-        if group:
-            if group.oca_group_id:
-                BROKER.cancel_oca_group(group.oca_group_id)
-            GROUP_MANAGER.deactivate(group_id, clear_orders=True)
-            self._load_groups_from_manager()
-            self.status_message = f"Order canceled: {group.name}"
-            logger.info(f"Order canceled for group {group.name}")
+        if not group:
+            logger.warning(f"Group {group_id} not found!")
+            return
+
+        logger.info(f"Group found: {group.name}, is_active={group.is_active}, "
+                   f"oca_group_id={group.oca_group_id}, trailing_order_id={group.trailing_order_id}")
+
+        cancelled = False
+
+        # For combo orders: OCA is not supported, use trailing_order_id directly
+        if group.trailing_order_id:
+            logger.info(f"Canceling by order_id: {group.trailing_order_id}")
+            cancelled = BROKER.cancel_order(group.trailing_order_id)
+            if cancelled:
+                logger.info(f"Successfully cancelled order {group.trailing_order_id}")
+            else:
+                logger.warning(f"Failed to cancel order {group.trailing_order_id}")
+
+        # Try OCA group as fallback (only works for single-leg orders)
+        if not cancelled and group.oca_group_id:
+            logger.info(f"Trying OCA group cancel: {group.oca_group_id}")
+            cancelled = BROKER.cancel_oca_group(group.oca_group_id)
+
+        # Also try to cancel time exit order if present
+        if group.time_exit_order_id:
+            logger.info(f"Canceling time exit order: {group.time_exit_order_id}")
+            BROKER.cancel_order(group.time_exit_order_id)
+
+        GROUP_MANAGER.deactivate(group_id, clear_orders=True)
+        self._load_groups_from_manager()
+        self.status_message = f"Order canceled: {group.name}"
+        logger.info(f"Order canceled for group {group.name}, cancelled={cancelled}")
 
     # === Delete with Confirmation ===
 

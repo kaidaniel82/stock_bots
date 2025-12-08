@@ -324,6 +324,9 @@ class TWSBroker:
             # Fetch portfolio
             self._fetch_portfolio()
 
+            # Pre-load market rules for tick sizes (must happen in sync context)
+            self._preload_market_rules()
+
             # Re-subscribe to market data for all positions
             if self._market_data and self._positions:
                 count = self._market_data.subscribe_all(list(self._positions.values()))
@@ -512,7 +515,9 @@ class TWSBroker:
         if is_new and self._market_data and pos.raw_contract:
             if self._market_data.subscribe(contract.conId, pos.raw_contract):
                 logger.info(f"Subscribed new position to market data: {contract.symbol} (conId={contract.conId})")
-            # Fetch trading hours for new position
+
+        # Fetch trading hours for new positions (independent of market data)
+        if is_new and pos.raw_contract:
             self._fetch_trading_hours(contract.conId, contract)
 
         # Log if enabled - always log first position for debugging
@@ -585,10 +590,7 @@ class TWSBroker:
                 liquid_hours = getattr(detail, 'liquidHours', '') or ''
                 time_zone_id = getattr(detail, 'timeZoneId', '') or ''
 
-                # Log full trading hours data for analysis
-                logger.debug(f"Trading hours for {cache_key}:")
-                logger.debug(f"  timeZoneId: {time_zone_id}")
-                logger.debug(f"  tradingHours: {trading_hours[:300]}..." if len(trading_hours) > 300 else f"  tradingHours: {trading_hours}")
+                logger.debug(f"Trading hours for {cache_key}: tz={time_zone_id}")
 
                 # Update cache
                 self._trading_hours_cache[cache_key] = {
@@ -620,6 +622,16 @@ class TWSBroker:
         if not pos:
             return False
 
+        # If trading hours missing, try to apply from cache
+        if not pos.trading_hours and pos.raw_contract:
+            cache_key = f"{pos.symbol}_{pos.raw_contract.secType}"
+            today = datetime.now().strftime('%Y%m%d')
+            cached = self._trading_hours_cache.get(cache_key)
+            if cached and cached.get('date') == today:
+                pos.trading_hours = cached.get('trading_hours', '')
+                pos.liquid_hours = cached.get('liquid_hours', '')
+                pos.time_zone_id = cached.get('time_zone_id', '')
+
         # If we have trading hours, parse them
         if pos.trading_hours and pos.time_zone_id:
             try:
@@ -638,14 +650,18 @@ class TWSBroker:
                         start = tz.localize(start)
                         end = tz.localize(end)
                         if start <= now <= end:
+                            logger.info(f"[MARKET] {pos.symbol}: OPEN via TradingHours (tz={pos.time_zone_id})")
                             return True
+                logger.info(f"[MARKET] {pos.symbol}: CLOSED via TradingHours")
                 return False
             except Exception as e:
                 logger.debug(f"Error parsing trading hours: {e}")
 
         # Fallback: Check if bid/ask are valid
         quote = self.get_quote_data(con_id)
-        return quote.get('bid', 0) > 0 and quote.get('ask', 0) > 0
+        is_open = quote.get('bid', 0) > 0 and quote.get('ask', 0) > 0
+        logger.info(f"[MARKET] {pos.symbol}: {'OPEN' if is_open else 'CLOSED'} via FALLBACK (bid/ask)")
+        return is_open
 
     def get_market_status(self, con_id: int) -> str:
         """Get human-readable market status for a contract.
@@ -699,6 +715,15 @@ class TWSBroker:
         # Wait for positions to load
         import time
         time.sleep(0.3)
+
+        # Fetch trading hours for all positions that don't have them
+        for con_id, pos in self._positions.items():
+            if not pos.trading_hours and pos.raw_contract:
+                self._fetch_trading_hours(con_id, pos.raw_contract)
+
+        # Pre-load market rules for all positions (needed for tick sizes)
+        # This must happen here during sync load, not during async order placement
+        self._preload_market_rules()
 
         return list(self._positions.values())
 
@@ -857,6 +882,8 @@ class TWSBroker:
         if len(position_quantities) == 1:
             # Single leg - return the position's contract
             con_id = list(position_quantities.keys())[0]
+            print(f"[BROKER] Single-leg: looking for con_id={con_id} (type={type(con_id)})")
+            print(f"[BROKER] Available positions: {list(self._positions.keys())}")
             pos = self._positions.get(con_id)
             if pos and pos.raw_contract:
                 contract = pos.raw_contract
@@ -865,8 +892,10 @@ class TWSBroker:
                     contract.exchange = contract.primaryExchange
                 elif not contract.exchange:
                     contract.exchange = "SMART"
+                print(f"[BROKER] Found single-leg contract: {contract.localSymbol} conId={con_id} exchange={contract.exchange}")
                 logger.debug(f"Using single-leg contract: {contract.localSymbol} conId={con_id}")
                 return contract
+            print(f"[BROKER] ERROR: Position {con_id} not found! pos={pos}")
             logger.error(f"Position {con_id} not found in available positions: {available_ids}")
             return None
 
@@ -1023,6 +1052,64 @@ class TWSBroker:
     # Cache for market rules by (conId, exchange)
     _market_rules_cache: dict[tuple[int, str], list] = {}
 
+    def _preload_market_rules(self):
+        """Pre-load market rules for all positions during sync load.
+
+        This is called from load_portfolio() to ensure market rules are cached
+        BEFORE order placement. The reqContractDetails/reqMarketRule calls
+        can't run during async handlers (event loop conflict).
+        """
+        logger.info(f"Pre-loading market rules for {len(self._positions)} positions...")
+        loaded = 0
+
+        for con_id, pos in self._positions.items():
+            if not pos.raw_contract:
+                continue
+
+            contract = pos.raw_contract
+            cache_key = (contract.conId, contract.exchange or "SMART")
+
+            # Skip if already cached
+            if cache_key in self._market_rules_cache:
+                continue
+
+            try:
+                details = self.ib.reqContractDetails(contract)
+                if not details:
+                    logger.debug(f"No contract details for {contract.symbol} {contract.secType}")
+                    continue
+
+                cd = details[0]
+                exchanges = cd.validExchanges.split(",")
+                rule_ids = cd.marketRuleIds.split(",")
+
+                # Find the rule ID for our exchange (positional mapping)
+                exchange = contract.exchange or "SMART"
+                rule_id_to_use = None
+
+                if exchange in exchanges:
+                    idx = exchanges.index(exchange)
+                    if idx < len(rule_ids) and rule_ids[idx]:
+                        rule_id_to_use = int(rule_ids[idx])
+
+                # Fallback: use first rule if exchange not found
+                if rule_id_to_use is None and rule_ids and rule_ids[0]:
+                    rule_id_to_use = int(rule_ids[0])
+
+                if rule_id_to_use is not None:
+                    rule = self.ib.reqMarketRule(rule_id_to_use)
+                    self._market_rules_cache[cache_key] = rule if rule else []
+                    loaded += 1
+                    logger.debug(f"Loaded market rule {rule_id_to_use} for {contract.symbol} "
+                                f"{contract.secType}: {len(rule) if rule else 0} price levels")
+                else:
+                    self._market_rules_cache[cache_key] = []
+
+            except Exception as e:
+                logger.warning(f"Failed to load market rule for {contract.symbol}: {e}")
+
+        logger.info(f"Pre-loaded {loaded} market rules")
+
     def _get_price_increment(self, contract: Contract, price: float) -> float:
         """Get price increment for a contract at a given price using MarketRules.
 
@@ -1041,71 +1128,39 @@ class TWSBroker:
         """
         default_tick = 0.01
 
-        # BAG (combo) contracts don't support reqContractDetails
-        # Use fallback based on underlying symbol
+        # BAG (combo) contracts: get tick from first leg (no fallback - must read from contract)
         if contract.secType == "BAG":
-            if contract.symbol == "SPX":
-                # SPX options: $0.05 for prices < $3, $0.10 for >= $3
-                return 0.10 if abs(price) >= 3.0 else 0.05
+            if contract.comboLegs:
+                first_leg_id = contract.comboLegs[0].conId
+                pos = self._positions.get(first_leg_id)
+                if pos and pos.raw_contract:
+                    logger.debug(f"BAG contract: getting tick from first leg {first_leg_id}")
+                    return self._get_price_increment(pos.raw_contract, price)
+            logger.warning(f"BAG contract {contract.symbol}: could not get tick from legs!")
             return default_tick
 
         cache_key = (contract.conId, contract.exchange or "SMART")
 
-        try:
-            # Check cache first
-            if cache_key not in self._market_rules_cache:
-                details = self.ib.reqContractDetails(contract)
-                if not details:
-                    return default_tick
+        # Use pre-loaded cache only (no API calls during async handlers)
+        # Market rules are loaded in _preload_market_rules() during load_portfolio()
+        rule = self._market_rules_cache.get(cache_key, [])
 
-                cd = details[0]
-                exchanges = cd.validExchanges.split(",")
-                rule_ids = cd.marketRuleIds.split(",")
-
-                # Find the rule ID for our exchange (positional mapping)
-                exchange = contract.exchange or "SMART"
-                rule_id_to_use = None
-
-                if exchange in exchanges:
-                    idx = exchanges.index(exchange)
-                    if idx < len(rule_ids) and rule_ids[idx]:
-                        rule_id_to_use = int(rule_ids[idx])
-
-                # Fallback: use first rule if exchange not found
-                if rule_id_to_use is None and rule_ids and rule_ids[0]:
-                    rule_id_to_use = int(rule_ids[0])
-                    logger.debug(f"Exchange {exchange} not in {exchanges}, using first rule")
-
-                if rule_id_to_use is not None:
-                    # Only fetch the single rule we need (not all rules)
-                    rule = self.ib.reqMarketRule(rule_id_to_use)
-                    self._market_rules_cache[cache_key] = rule if rule else []
-                else:
-                    self._market_rules_cache[cache_key] = []
-
-            # Find increment for this price level
-            rule = self._market_rules_cache.get(cache_key, [])
-            increment = default_tick
-
-            for price_rule in rule:
-                if price_rule.lowEdge <= price:
-                    increment = float(price_rule.increment)
-                else:
-                    break
-
-            logger.debug(f"Price increment for {contract.localSymbol or contract.symbol} "
-                        f"at ${price:.2f}: {increment}")
-            return increment
-
-        except Exception as e:
-            logger.warning(f"Error getting price increment for {contract.symbol}: {e}")
-            # Fallback for SPX options based on price level
-            if contract.symbol == "SPX" and contract.secType == "OPT":
-                if price >= 3.0:
-                    return 0.10
-                else:
-                    return 0.05
+        if not rule:
+            # Cache miss - market rules weren't pre-loaded for this contract
+            logger.warning(f"No cached market rules for {contract.symbol} {contract.secType} "
+                          f"conId={contract.conId} - using default tick")
             return default_tick
+
+        # Find increment for this price level
+        increment = default_tick
+        for price_rule in rule:
+            if price_rule.lowEdge <= price:
+                increment = float(price_rule.increment)
+            else:
+                break
+
+        logger.debug(f"[TICK] {contract.symbol} {contract.secType} at ${price:.2f}: increment={increment}")
+        return increment
 
     def _get_min_tick(self, contract: Contract) -> float:
         """Get minTick (fallback, uses default price of 10).
@@ -1172,6 +1227,7 @@ class TWSBroker:
             # For combos: auxPrice can be NEGATIVE (credit spreads use SELL @ negative price)
             stop_increment = self._get_price_increment(contract, abs(stop_price))
             stop_price_rounded = self._round_to_tick(stop_price, stop_increment)
+            print(f"[BROKER] Price rounding: ${stop_price:.4f} -> ${stop_price_rounded:.2f} (tick={stop_increment})")
 
             if limit_price == 0 or limit_price is None:
                 # Stop-Market Order
@@ -1198,6 +1254,9 @@ class TWSBroker:
                 order.ocaType = 1  # Cancel all remaining on fill
 
             # Log contract details for debugging
+            print(f"[BROKER] place_stop_order: Placing {order.orderType} {order.action} order on "
+                  f"{contract.secType} {contract.symbol} conId={contract.conId} "
+                  f"exchange={contract.exchange} stop=${stop_price_rounded:.2f}")
             logger.debug(f"Placing order on contract: {contract.secType} {contract.symbol} "
                         f"conId={contract.conId} exchange={contract.exchange}")
 
@@ -1209,13 +1268,15 @@ class TWSBroker:
 
             # Check order status
             status = trade.orderStatus.status if trade.orderStatus else "Unknown"
+            print(f"[BROKER] Order placed: orderId={trade.order.orderId} status={status}")
             logger.info(f"Placed {order.orderType} order: orderId={trade.order.orderId} "
                        f"status={status} stop=${stop_price:.2f} action={action} "
                        f"contract={contract.localSymbol or contract.symbol}")
 
-            # Warn if order not submitted
-            if status in ("PendingSubmit", "ApiCancelled", "Cancelled"):
-                logger.warning(f"Order {trade.order.orderId} may not have been accepted: {status}")
+            # Warn if order rejected (PendingSubmit is normal - order in transit to TWS)
+            if status in ("ApiCancelled", "Cancelled", "Inactive"):
+                print(f"[BROKER] WARNING: Order {trade.order.orderId} REJECTED: {status}")
+                logger.warning(f"Order {trade.order.orderId} rejected: {status}")
 
             return trade
 
@@ -1398,15 +1459,27 @@ class TWSBroker:
                 action = "SELL"
                 # Always invert leg actions for SELL order (IBKR inverts them back)
                 invert_legs = True
+                print(f"[BROKER] Multi-leg order: action=SELL, invert_legs=True")
+                logger.info(f"Multi-leg order: action=SELL, invert_legs=True")
             else:
                 # Single leg: BUY to close short, SELL to close long
                 action = "BUY" if is_credit else "SELL"
                 invert_legs = False
+                print(f"[BROKER] Single-leg order: action={action}, is_credit={is_credit}")
+                logger.info(f"Single-leg order: action={action}, is_credit={is_credit}")
 
             # Build contract
+            print(f"[BROKER] Building contract for position_quantities={position_quantities}")
             contract = self.build_combo_contract(position_quantities, invert_leg_actions=invert_legs)
             if not contract:
+                print(f"[BROKER] ERROR: Failed to build contract!")
+                logger.error(f"Failed to build contract for position_quantities={position_quantities}")
                 return None
+
+            print(f"[BROKER] Contract built: secType={contract.secType}, symbol={contract.symbol}, "
+                  f"conId={contract.conId}, exchange={contract.exchange}, localSymbol={contract.localSymbol}")
+            logger.info(f"Contract built: secType={contract.secType}, symbol={contract.symbol}, "
+                       f"conId={contract.conId}, exchange={contract.exchange}, localSymbol={contract.localSymbol}")
 
             # For BAG contracts, the ratios are encoded in ComboLegs
             # Order quantity should be 1 (meaning: 1 unit of the combo)
@@ -1540,16 +1613,26 @@ class TWSBroker:
 
     def cancel_order(self, order_id: int) -> bool:
         """Cancel a single order."""
+        logger.info(f"cancel_order called with order_id={order_id}")
+
         if not self.is_connected():
+            logger.warning("cancel_order: not connected to TWS")
             return False
 
         try:
-            trades = [t for t in self.ib.openTrades() if t.order.orderId == order_id]
+            open_trades = self.ib.openTrades()
+            logger.debug(f"Open trades: {[t.order.orderId for t in open_trades]}")
+
+            trades = [t for t in open_trades if t.order.orderId == order_id]
             if trades:
-                self.ib.cancelOrder(trades[0].order)
-                logger.info(f"Cancelled order {order_id}")
+                trade = trades[0]
+                logger.info(f"Found order {order_id}: status={trade.orderStatus.status}, "
+                           f"type={trade.order.orderType}, action={trade.order.action}")
+                self.ib.cancelOrder(trade.order)
+                logger.info(f"Cancel request sent for order {order_id}")
                 return True
-            logger.warning(f"Order {order_id} not found")
+
+            logger.warning(f"Order {order_id} not found in open trades: {[t.order.orderId for t in open_trades]}")
             return False
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {e}")
@@ -1557,18 +1640,32 @@ class TWSBroker:
 
     def cancel_oca_group(self, oca_group: str) -> bool:
         """Cancel all orders in an OCA group."""
+        logger.info(f"cancel_oca_group called with oca_group={oca_group}")
+
         if not self.is_connected():
+            logger.warning("cancel_oca_group: not connected to TWS")
             return False
 
         try:
+            open_trades = self.ib.openTrades()
+            logger.debug(f"Searching for OCA group '{oca_group}' in {len(open_trades)} open trades")
+
+            # Log all OCA groups found
+            oca_groups_found = set(t.order.ocaGroup for t in open_trades if t.order.ocaGroup)
+            logger.debug(f"OCA groups in open trades: {oca_groups_found}")
+
             cancelled = 0
-            for trade in self.ib.openTrades():
+            for trade in open_trades:
                 if trade.order.ocaGroup == oca_group:
+                    logger.info(f"Found matching order: {trade.order.orderId} in OCA group {oca_group}")
                     self.ib.cancelOrder(trade.order)
                     cancelled += 1
 
             if cancelled > 0:
                 logger.info(f"Cancelled {cancelled} orders in OCA group {oca_group}")
+            else:
+                logger.warning(f"No orders found in OCA group '{oca_group}'. "
+                              f"Available OCA groups: {oca_groups_found}")
             return cancelled > 0
         except Exception as e:
             logger.error(f"Failed to cancel OCA group {oca_group}: {e}")

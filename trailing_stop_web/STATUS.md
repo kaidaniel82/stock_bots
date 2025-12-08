@@ -38,6 +38,7 @@ metrics.py (Berechnung) → state.py (Koordination) → broker.py (IBKR Orders)
 - [x] Multi-Leg BAG (Combo) Orders
 - [x] OCA Groups für Time Exit
 - [x] Dynamische Preis-Increments via `_get_price_increment()` (MarketRules)
+- [x] **Market Rules Pre-Loading** beim Connect (siehe unten)
 - [x] **Vorzeichen-Konsistenz:** `auxPrice`/`lmtPrice` IMMER positiv für IBKR (Action bestimmt Richtung)
 - [x] Leg Action Inversion für BAG SELL Orders (`invert_leg_actions=True`)
 
@@ -54,6 +55,187 @@ metrics.py (Berechnung) → state.py (Koordination) → broker.py (IBKR Orders)
 - [x] Trading Hours Cache (bei Connect und Mitternacht geleert)
 - [x] Entry Price aus Fills (7 Tage Historie)
 - [x] Market Data Subscriptions (reqMktData)
+- [x] Market Rules Cache für Tick-Sizes
+
+---
+
+## Trading Hours Cache System (2025-12-08)
+
+### Problem
+
+Trading Hours müssen für `is_market_open()` bekannt sein, aber `reqContractDetails()` ist teuer und kann nicht während async Handlers aufgerufen werden.
+
+### Architektur
+
+```
+Connect
+   ↓
+_attempt_connection()
+   ↓
+self._trading_hours_cache.clear()        ← Cache leeren
+   ↓
+_fetch_portfolio()
+   ↓
+Für jede Position: _fetch_trading_hours()  ← Trading Hours laden
+   ↓
+_trading_hours_cache = {
+    "ES_FOP": {date: "20251208", trading_hours: "...", time_zone_id: "US/Central"},
+    "SPX_OPT": {date: "20251208", trading_hours: "...", time_zone_id: "US/Central"},
+    ...
+}
+
+Laufend (alle 0.5s im TWS Thread):
+   ↓
+_check_midnight_cache_clear()            ← Bei Datumswechsel: Cache leeren + neu laden
+```
+
+### Cache-Struktur
+
+```python
+_trading_hours_cache: dict[str, dict]
+# Key: "SYMBOL_SECTYPE" (z.B. "ES_FOP", "SPX_OPT", "DAX_OPT")
+# Value: {
+#     date: "20251208",           # Für Invalidierung
+#     trading_hours: "...",       # Raw TWS String
+#     liquid_hours: "...",        # Liquid Hours
+#     time_zone_id: "US/Central"  # Zeitzone
+# }
+```
+
+### Wann wird geladen?
+
+| Event | Aktion |
+|-------|--------|
+| Connect | Cache leeren, alle Positionen laden |
+| Mitternacht | Cache leeren (wird bei nächstem Zugriff neu geladen) |
+| Neue Position | Falls nicht gecached → laden |
+
+### Dateien
+
+| Datei | Funktion | Zeilen |
+|-------|----------|--------|
+| `broker.py` | `_trading_hours_cache` | ~259-262 |
+| `broker.py` | `_fetch_trading_hours()` | ~559-620 |
+| `broker.py` | `_check_midnight_cache_clear()` | ~345-351 |
+| `broker.py` | `is_market_open()` | ~622-680 |
+
+### Logging
+
+```
+Trading hours cache cleared on connect
+Fetched trading hours for ES FOP: tz=US/Central
+[MARKET] ES: OPEN via TradingHours (tz=US/Central)
+Trading hours cache cleared at midnight (new day: 20251209)
+```
+
+---
+
+## Market Rules & Tick-Size System (2025-12-08)
+
+### Problem
+
+IBKR erfordert, dass Order-Preise auf gültige Tick-Sizes gerundet werden. Die Tick-Size variiert je nach:
+- **Instrument** (SPX, ES, DAX, TSLA, etc.)
+- **Preisniveau** (z.B. ES FOP: $0.05 unter $5, $0.25 ab $5)
+
+Für **BAG (Combo) Contracts** kann `reqContractDetails` nicht direkt aufgerufen werden - die Market Rules müssen vom ersten Leg geholt werden.
+
+### Architektur
+
+```
+Connect
+   ↓
+_attempt_connection()
+   ↓
+_fetch_portfolio()           ← Positionen laden
+   ↓
+_preload_market_rules()      ← Market Rules für ALLE Positionen cachen
+   ↓
+_market_rules_cache = {
+    (conId, exchange): [PriceIncrement(lowEdge=0, increment=0.05),
+                        PriceIncrement(lowEdge=5, increment=0.25), ...]
+}
+
+Order Placement
+   ↓
+place_stop_order(contract, stop_price)
+   ↓
+_get_price_increment(contract, abs(stop_price))
+   ↓
+[BAG?] → Rekursiv mit erstem Leg Contract
+   ↓
+Cache Lookup: _market_rules_cache[(conId, exchange)]
+   ↓
+Preisniveau-Lookup: Finde increment für stop_price
+   ↓
+_round_to_tick(stop_price, increment)
+```
+
+### Wichtige Details
+
+**1. Sync vs Async Context:**
+- `reqContractDetails()` und `reqMarketRule()` können NICHT während async Event-Handlers aufgerufen werden (Event Loop Konflikt)
+- Daher: **Pre-Loading bei Connect** (sync context im TWS Thread)
+
+**2. Cache-Struktur:**
+```python
+_market_rules_cache: dict[tuple[int, str], list[PriceIncrement]]
+# Key: (conId, exchange)
+# Value: Liste von PriceIncrement mit lowEdge und increment
+```
+
+**3. BAG Contract Handling:**
+```python
+if contract.secType == "BAG":
+    first_leg_id = contract.comboLegs[0].conId
+    pos = self._positions.get(first_leg_id)
+    return self._get_price_increment(pos.raw_contract, price)
+    #                                                  ↑ ORDER Preis durchreichen!
+```
+
+**4. Preisniveau-Lookup:**
+```python
+for price_rule in rule:
+    if price_rule.lowEdge <= price:
+        increment = price_rule.increment
+    else:
+        break
+```
+
+### Beispiele
+
+| Instrument | Preis | Tick-Size | Quelle |
+|------------|-------|-----------|--------|
+| ES FOP | $5.51 | 0.05 | MarketRule |
+| ES FOP | $13.11 | 0.25 | MarketRule |
+| SPX OPT | $2.50 | 0.05 | MarketRule |
+| SPX OPT | $5.00 | 0.10 | MarketRule |
+| DAX OPT | $66.00 | 0.50 | MarketRule |
+| TSLA OPT | $0.05 | 0.01 | MarketRule |
+
+### Dateien
+
+| Datei | Funktion | Zeilen |
+|-------|----------|--------|
+| `broker.py` | `_preload_market_rules()` | ~1052-1111 |
+| `broker.py` | `_get_price_increment()` | ~1110-1165 |
+| `broker.py` | `_round_to_tick()` | ~1175-1190 |
+| `broker.py` | `_market_rules_cache` | ~1050 |
+
+### Logging
+
+Bei Connect:
+```
+Pre-loading market rules for 14 positions...
+Loaded market rule 239 for ES FOP: 2 price levels
+Pre-loaded 14 market rules
+```
+
+Bei Order:
+```
+[TICK] ES FOP at $5.51: increment=0.05
+[BROKER] Price rounding: $-5.5100 -> $-5.50 (tick=0.05)
+```
 
 ---
 
@@ -108,9 +290,11 @@ Szenario: Credit Spread, LWM=-$3.00, Trail=20%, Limit Offset=$0.10
 
 #### 2.3 Preis-Rounding
 ```
-- [ ] SPX Options: $0.05 unter $3, $0.10 ab $3
-- [ ] Andere Options: $0.01 oder $0.05
-- [ ] Futures: Contract-spezifisch
+- [x] SPX Options: $0.05 unter $3, $0.10 ab $3 (via MarketRules)
+- [x] ES FOP: $0.05 unter $5, $0.25 ab $5 (via MarketRules)
+- [x] DAX Options: $0.50 (via MarketRules)
+- [x] TSLA Options: $0.01 (via MarketRules)
+- [x] BAG Contracts: Tick vom ersten Leg
 ```
 
 ### 3. Edge Cases
@@ -196,7 +380,9 @@ Durch manuelles Testen in TWS wurde festgestellt:
 
 | Datum | Strategie | Legs | Credit/Debit | Order Type | Ergebnis | Notizen |
 |-------|-----------|------|--------------|------------|----------|---------|
-| | | | | | | |
+| 2025-12-08 | ES Put Spread | 2 | Credit | STP | ✅ | Tick=0.25 korrekt via MarketRules |
+| 2025-12-08 | DAX Put | 1 | Debit | STP | ✅ | Tick=0.50 korrekt |
+| 2025-12-08 | SPX Spread | 2 | Credit | STP | ✅ | Tick=0.10 korrekt |
 
 ---
 
@@ -205,3 +391,31 @@ Durch manuelles Testen in TWS wurde festgestellt:
 1. **OCA Groups funktionieren nicht mit BAG Contracts** - Time Exit Orders werden ohne OCA platziert
 2. **Trading Hours nur für Positionen** - Neue Contracts müssen erst geladen werden
 3. **Entry Price aus Fills** - Nur 7 Tage Historie, danach avg_cost Fallback
+
+---
+
+## Changelog
+
+### 2025-12-08 (Nachmittag)
+
+**Market Rules Fix:**
+- **Problem:** `reqContractDetails`/`reqMarketRule` schlugen fehl mit "This event loop is already running" während Order-Platzierung (async context)
+- **Lösung:** Market Rules werden jetzt bei Connect vorgeladen (`_preload_market_rules()`)
+- **Dateien:** `broker.py:328` (Aufruf), `broker.py:1052-1111` (Implementierung)
+
+**BAG Tick-Size:**
+- **Problem:** BAG Contracts haben keine eigenen ContractDetails
+- **Lösung:** Tick-Size vom ersten Leg holen, ORDER-Preis für Level-Lookup verwenden
+- **Datei:** `broker.py:1128-1138`
+
+**Weitere Fixes:**
+- Market Status zeigt jetzt korrekt "Open" via TradingHours Cache
+- Trading Hours werden bei Connect für alle Positionen geladen
+- Modification Counter in UI implementiert
+- Cancel-Button verwendet jetzt `trailing_order_id`
+
+### 2025-12-08 (Vormittag)
+
+- App-kontrollierte Trailing Stops implementiert
+- Dynamische Stop-Preis Modifikation via `modify_stop_order()`
+- Entry Price aus 7-Tage Fills Historie

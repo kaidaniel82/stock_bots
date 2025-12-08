@@ -54,6 +54,9 @@ class Group:
     trailing_order_id: int = 0            # TWS Order ID
     time_exit_order_id: int = 0           # TWS Order ID
 
+    # === STATISTICS ===
+    modification_count: int = 0           # Number of stop price modifications
+
     # Backwards compatibility: alias for trail_value
     @property
     def trail_percent(self) -> float:
@@ -261,9 +264,18 @@ class GroupManager:
         """
         if group_id in self._groups:
             group = self._groups[group_id]
+
+            # Log stack trace for debugging auto-deactivation mystery
+            import traceback
+            logger.info(f"deactivate() called for group '{group.name}' (was_active={group.is_active}, "
+                       f"clear_orders={clear_orders})")
+            logger.debug(f"deactivate() call stack:\n{''.join(traceback.format_stack())}")
+
             group.is_active = False
 
             if clear_orders:
+                logger.info(f"Clearing order IDs: oca={group.oca_group_id}, "
+                           f"trailing={group.trailing_order_id}, time_exit={group.time_exit_order_id}")
                 group.oca_group_id = ""
                 group.trailing_order_id = 0
                 group.time_exit_order_id = 0

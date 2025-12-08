@@ -361,6 +361,16 @@ def _group_header(group: dict, is_selected: bool = False) -> rx.Component:
                 color_scheme=rx.cond(is_active, "green", "gray"),
                 size="1",
             ),
+            # Modification counter (only show when > 0)
+            rx.cond(
+                group["modification_count"] != 0,
+                rx.badge(
+                    rx.text(f"Mods: ", group["modification_count"]),
+                    color_scheme="violet",
+                    size="1",
+                ),
+                rx.fragment(),
+            ),
             rx.cond(
                 is_selected,
                 rx.badge("SELECTED", color_scheme="purple", size="1"),
@@ -690,10 +700,26 @@ def group_card(group: dict, mode: str = "setup") -> rx.Component:
     if mode == "monitor":
         card_props["on_click"] = AppState.select_group(group_id)
         card_props["cursor"] = "pointer"
+        # Selected cards: full orange border, glow effect, subtle orange tint
+        card_props["border"] = rx.cond(
+            is_selected,
+            f"2px solid {COLORS['accent']}",
+            PANEL_STYLES["border"],
+        )
         card_props["border_left"] = rx.cond(
             is_selected,
-            f"3px solid {COLORS['accent']}",
+            f"4px solid {COLORS['accent']}",
             PANEL_STYLES["border_left"],
+        )
+        card_props["background"] = rx.cond(
+            is_selected,
+            "rgba(255, 165, 0, 0.08)",  # Subtle orange tint
+            COLORS["bg_panel"],
+        )
+        card_props["box_shadow"] = rx.cond(
+            is_selected,
+            f"0 0 12px rgba(255, 165, 0, 0.25)",  # Orange glow
+            "none",
         )
         card_props["_hover"] = {"background": COLORS["bg_elevated"]}
     else:
