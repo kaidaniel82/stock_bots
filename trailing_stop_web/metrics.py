@@ -40,6 +40,7 @@ SIMPLER APPROACH - Cash Flow:
 - P&L = current_close_value + (total_cash_in - total_cash_out)
 """
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from .logger import logger
@@ -68,14 +69,73 @@ class LegData:
     vega: float = 0.0
 
     @property
+    def expiry_fmt(self) -> str:
+        """Formatted expiry: 20251209 -> DEC09'25."""
+        if len(self.expiry) == 8:
+            try:
+                dt = datetime.strptime(self.expiry, "%Y%m%d")
+                return dt.strftime("%b%d'%y").upper()
+            except ValueError:
+                pass
+        return self.expiry
+
+    @property
+    def expiry_iso(self) -> str:
+        """ISO formatted expiry: 20251209 -> 2025-12-09."""
+        if len(self.expiry) == 8:
+            try:
+                dt = datetime.strptime(self.expiry, "%Y%m%d")
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        return self.expiry
+
+    @property
+    def strike_str(self) -> str:
+        """Formatted strike price."""
+        return f"{self.strike:g}" if self.strike > 0 else "-"
+
+    @property
+    def side_str(self) -> str:
+        """Call/Put indicator: C, P, or -."""
+        return self.right if self.right in ("C", "P") else "-"
+
+    @property
+    def qty_str(self) -> str:
+        """Quantity with sign: +1, -2."""
+        return f"{self.quantity:+g}"
+
+    @property
+    def qty_abs(self) -> int:
+        """Absolute quantity."""
+        return abs(int(self.quantity))
+
+    @property
+    def fill_str(self) -> str:
+        """Formatted fill price (static - entry price)."""
+        return f"${self.fill_price:.2f}"
+
+    @property
     def display_name(self) -> str:
-        """Display name for the leg."""
-        if self.sec_type == "OPT":
-            return f"{self.symbol} {self.expiry} {self.strike}{self.right}"
+        """Display name for the leg: ES DEC09'25 6850P."""
+        if self.sec_type in ("OPT", "FOP"):
+            return f"{self.symbol} {self.expiry_fmt} {self.strike:g}{self.right}"
         elif self.sec_type == "STK":
             return f"{self.symbol}"
+        elif self.sec_type == "FUT":
+            return f"{self.symbol} {self.expiry_fmt}"
         else:
             return f"{self.symbol} {self.sec_type}"
+
+    @property
+    def info_line(self) -> str:
+        """Formatted info line with live data."""
+        name = f"{self.display_name:<22}"[:22]
+        sign = "+" if self.quantity > 0 else "-"
+        fill = f"${self.fill_price:.2f}".rjust(7)
+        mark = f"${self.mark:.2f}".rjust(7)
+        delta = f"{self.delta:+.2f}".rjust(6)
+        return f" {sign}{self.qty_abs}x {name} ⋮ Fill {fill}  Mark {mark}  Δ {delta}"
 
     @property
     def is_long(self) -> bool:
@@ -124,6 +184,9 @@ class GroupMetrics:
     # P&L
     pnl: float                   # Unrealized P&L
 
+    # Number of logical units (spreads/ratios) - GCD of quantities
+    num_units: int = 1
+
     # Greeks (aggregated for entire group, position-weighted)
     delta: float = 0.0
     gamma: float = 0.0
@@ -136,35 +199,40 @@ class GroupMetrics:
     hwm_updated: bool = False     # True if HWM changed this tick
     trail_stop_price: float = 0.0 # Calculated stop price from HWM
     trail_limit_price: float = 0.0  # Calculated limit price (if stop_type="limit")
+    stop_pnl: float = 0.0         # P&L if stop is triggered
 
-    # Formatted strings for UI
+    # Formatted strings for UI (use absolute values for display)
     @property
     def mark_str(self) -> str:
-        return f"${self.mark:.2f}"
+        return f"${abs(self.mark):.2f}"
 
     @property
     def mid_str(self) -> str:
-        return f"${self.mid:.2f}"
+        return f"${abs(self.mid):.2f}"
 
     @property
     def bid_str(self) -> str:
-        return f"${self.bid:.2f}"
+        return f"${abs(self.bid):.2f}"
 
     @property
     def ask_str(self) -> str:
-        return f"${self.ask:.2f}"
+        return f"${abs(self.ask):.2f}"
 
     @property
     def entry_str(self) -> str:
-        return f"${self.entry:.2f}"
+        return f"${abs(self.entry):.2f}"
 
     @property
     def trigger_value_str(self) -> str:
-        return f"${self.trigger_value:.2f}"
+        return f"${abs(self.trigger_value):.2f}"
 
     @property
     def pnl_str(self) -> str:
         return f"${self.pnl:.2f}"
+
+    @property
+    def stop_pnl_str(self) -> str:
+        return f"${self.stop_pnl:.2f}"
 
     @property
     def delta_str(self) -> str:
@@ -256,40 +324,52 @@ class GroupMetrics:
         return self.vega
 
 
-def _calculate_stop_price(hwm: float, trail_mode: str, trail_value: float,
-                          is_credit: bool) -> float:
+def calculate_stop_price(hwm: float, trail_mode: str, trail_value: float,
+                         is_credit: bool = False) -> float:
     """
-    Calculate stop price based on HWM and trail settings.
+    Calculate stop price based on HWM/LWM and trail settings.
 
     DEBIT positions (long, debit spreads): HWM is positive, tracks HIGHEST value
     - We profit when value goes UP
     - Stop should be BELOW HWM (trigger when value drops)
     - Formula: hwm * (1 - trail%) or hwm - trail_value
 
-    CREDIT positions (short, credit spreads): HWM tracks "best" value
-    - Single short: HWM is positive (lowest option price = best)
-      Stop should be ABOVE HWM (trigger when price rises)
-    - Credit spread: HWM is negative (most negative = best)
-      Stop should be less negative (trigger when value rises toward 0)
+    CREDIT positions: LWM tracks "best" value (closest to $0)
+    - Single short: LWM is positive (lowest option price = best)
+      Stop should be ABOVE LWM (trigger when price rises)
+      Example: LWM=$8, trail=15% → stop = $8 * 1.15 = $9.20
 
-    The key insight: for credits, stop is in the OPPOSITE direction from debit!
+    - Credit spread: LWM is NEGATIVE but closer to $0 = better
+      e.g., LWM=-$4.30 means we pay $4.30 to close (good!)
+      Stop should be MORE NEGATIVE (worse = we'd pay more)
+      Example: LWM=-4.30, trail=15% → stop = -4.30 - |4.30|*0.15 = -4.30 - 0.645 = -4.95
+      Triggered when value drops to -$4.95 (we'd pay $4.95 = bad)
     """
+    # For Credit positions, stop is FURTHER from $0 (worse price = higher cost to close)
+    # For Debit positions, stop is LOWER than HWM (value dropped)
+    #
+    # IMPORTANT: For IBKR BAG orders, we need POSITIVE stop prices!
+    # - Credit Spread: internal value is negative, but order uses positive price
+    # - The stop order triggers when spread price rises above stop
+    #
+    abs_hwm = abs(hwm)
+
     if trail_mode == "percent":
         if is_credit:
-            # Credit: stop is trail% ABOVE (worse direction)
-            # For negative HWM: -6 * 1.15 = -5.10 (less negative = stop)
-            # For positive HWM (single short): 10 * 1.15 = 11.50 (higher = stop)
-            return round(hwm * (1 + trail_value / 100), 2)
+            # Credit: stop is abs(LWM) + trail% (higher = worse for us)
+            # LWM=±$3.30, trail=15% → stop = $3.30 * 1.15 = $3.80
+            return round(abs_hwm * (1 + trail_value / 100), 2)
         else:
-            # Debit: stop is trail% BELOW
-            return round(hwm * (1 - trail_value / 100), 2)
+            # Debit: stop is trail% BELOW HWM
+            return round(abs_hwm * (1 - trail_value / 100), 2)
     else:  # absolute
         if is_credit:
-            # Credit: stop is trail_value ABOVE (worse direction)
-            return round(hwm + trail_value, 2)
+            # Credit: stop is abs(LWM) + trail (higher = worse for us)
+            # LWM=±$3.30, trail=$1.00 → stop = $3.30 + $1.00 = $4.30
+            return round(abs_hwm + trail_value, 2)
         else:
             # Debit: stop is trail_value BELOW
-            return round(hwm - trail_value, 2)
+            return round(abs_hwm - trail_value, 2)
 
 
 def compute_group_metrics(
@@ -483,11 +563,36 @@ def compute_group_metrics(
 
     if trail_mode:
         # Determine if this is a new "best" value
-        # Credit: lower (more negative) is better -> track lowest value
-        # Debit: higher is better -> track highest value
+        # The logic depends on position type and value sign:
+        #
+        # DEBIT (is_credit=False): Higher value is better (we profit when value goes up)
+        #   - Long call/put: value goes up = profit
+        #   - Debit spread: value goes up = profit
+        #
+        # CREDIT (is_credit=True): Lower absolute value is better (closer to $0)
+        #   - Single short: sold at $10, now $8 = good (lower)
+        #   - Credit spread (positive): sold for credit, now costs $3.30 to close
+        #     Lower is better ($3.20 < $3.30 = good)
+        #   - Credit spread (negative): -$4.00 entry, -$3.40 current = good
+        #     Higher (closer to 0) is better (-$3.40 > -$4.00 = good)
+        #
+        # CREDIT with POSITIVE trigger_value (Single Short, Credit Spread):
+        #   - Lower price is better (option decays, we keep premium)
+        #   - e.g., sold at $10, now $8 = good, now $12 = bad
+        #
+        # CREDIT with NEGATIVE trigger_value (Credit Spread negative):
+        #   - Closer to $0 (HIGHER/less negative) is better
+        #   - e.g., -$4.00 entry, -$3.40 current = good (pay less to close)
+        #
         if is_credit:
-            is_new_best = trigger_value < current_hwm or current_hwm == 0
+            if trigger_value >= 0:
+                # Single short OR Credit spread (positive): lower is better
+                is_new_best = trigger_value < current_hwm or current_hwm == 0
+            else:
+                # Credit spread (negative values): higher (closer to 0) is better
+                is_new_best = trigger_value > current_hwm or current_hwm == 0
         else:
+            # Debit: higher is better
             is_new_best = trigger_value > current_hwm
 
         # Update HWM only when market is open
@@ -499,11 +604,33 @@ def compute_group_metrics(
 
         # Calculate stop price from HWM
         if updated_hwm != 0:
-            trail_stop_price = _calculate_stop_price(updated_hwm, trail_mode, trail_value, is_credit)
+            trail_stop_price = calculate_stop_price(updated_hwm, trail_mode, trail_value, is_credit)
 
             # Calculate limit price if limit order type
+            # Credit (BUY to close): limit = stop + offset (willing to pay more)
+            # Debit (SELL to close): limit = stop - offset (willing to accept less)
             if stop_type == "limit" and trail_stop_price != 0:
-                trail_limit_price = round(trail_stop_price - limit_offset, 2)
+                if is_credit:
+                    trail_limit_price = round(trail_stop_price + limit_offset, 2)
+                else:
+                    trail_limit_price = round(trail_stop_price - limit_offset, 2)
+
+    # === STEP 7: Calculate Stop P&L ===
+    # P&L if stop is triggered at trail_stop_price
+    # For credit spreads, both unit_entry and trail_stop_price can be negative
+    # Use absolute values: profit = |entry| - |stop| for credits
+    # For debit: profit = stop - entry (both positive)
+    stop_pnl = 0.0
+    if trail_stop_price != 0 and unit_entry != 0:
+        if is_credit:
+            # Credit: profit if |stop| < |entry| (bought back cheaper)
+            per_contract_pnl = abs(unit_entry) - abs(trail_stop_price)
+        else:
+            # Debit: profit if stop > entry (sold higher)
+            per_contract_pnl = trail_stop_price - unit_entry
+        # Scale by position size (qty * multiplier = total_entry / unit_entry)
+        scale = abs(total_entry / unit_entry) if unit_entry != 0 else 0
+        stop_pnl = round(per_contract_pnl * scale, 2)
 
     logger.info(
         f"Group metrics [{position_type}]: entry=${unit_entry:.2f} bid=${unit_bid:.2f} "
@@ -516,6 +643,7 @@ def compute_group_metrics(
         legs=legs,
         position_type=position_type,
         is_credit=is_credit,
+        num_units=position_gcd,
         mark=round(unit_mark, 2),
         mid=round(unit_mid, 2),
         bid=round(unit_bid, 2),
@@ -535,4 +663,5 @@ def compute_group_metrics(
         hwm_updated=hwm_updated,
         trail_stop_price=trail_stop_price,
         trail_limit_price=trail_limit_price,
+        stop_pnl=stop_pnl,
     )

@@ -255,8 +255,9 @@ class TWSBroker:
         self._connection_status_callback: Optional[Callable[[str], None]] = None
 
         # Trading hours cache: {symbol: {date: str, trading_hours: str, liquid_hours: str, time_zone_id: str}}
-        # Cached per symbol (not per position) and invalidated on date change
+        # Cached per symbol (not per position) and invalidated on date change or at midnight
         self._trading_hours_cache: dict[str, dict] = {}
+        self._last_cache_date: str = ""  # Track date for midnight cache clear
 
     def _run_loop(self):
         """Run ib_insync event loop in separate thread with reconnection support."""
@@ -301,6 +302,11 @@ class TWSBroker:
             self._notify_status("Connected")
             logger.success("Connected to TWS")
 
+            # Clear trading hours cache on connect (force refresh)
+            self._trading_hours_cache.clear()
+            self._last_cache_date = datetime.now().strftime('%Y%m%d')
+            logger.debug("Trading hours cache cleared on connect")
+
             # Initialize/reinitialize MarketDataManager
             self._market_data = MarketDataManager(self.ib, self.price_cache)
             logger.info("MarketDataManager initialized")
@@ -326,6 +332,14 @@ class TWSBroker:
             self._connected = False
             return False
 
+    def _check_midnight_cache_clear(self):
+        """Clear trading hours cache at midnight (date change)."""
+        today = datetime.now().strftime('%Y%m%d')
+        if self._last_cache_date and self._last_cache_date != today:
+            self._trading_hours_cache.clear()
+            logger.info(f"Trading hours cache cleared at midnight (new day: {today})")
+        self._last_cache_date = today
+
     def _run_connected_loop(self):
         """Main loop while connected - monitors connection and fetches data."""
         import time
@@ -339,6 +353,9 @@ class TWSBroker:
                 self._connected = False
                 self._notify_status("Connection lost")
                 break
+
+            # Check for midnight and clear trading hours cache
+            self._check_midnight_cache_clear()
 
             # Fetch portfolio at interval
             now = time.time()
@@ -623,6 +640,10 @@ class TWSBroker:
         """Get human-readable market status for a contract.
 
         Returns: "Open", "Closed", or "Unknown"
+
+        Note: is_market_open() uses cached trading hours (loaded once per day)
+        but checks current time against those hours on every call.
+        This is efficient - no API calls, just time comparison.
         """
         pos = self._positions.get(con_id)
         if not pos:
@@ -631,12 +652,7 @@ class TWSBroker:
         if self.is_market_open(con_id):
             return "Open"
 
-        # Check if we have trading hours info
-        if pos.trading_hours:
-            return "Closed"
-
-        # No trading hours, can't determine
-        return "Unknown"
+        return "Closed"
 
     def disconnect(self):
         """Disconnect from TWS and stop reconnection attempts."""
@@ -808,11 +824,12 @@ class TWSBroker:
         """Generate unique OCA group identifier."""
         return f"TSM_{group_name}_{uuid.uuid4().hex[:8]}"
 
-    def build_combo_contract(self, position_quantities: dict[int, int]) -> Optional[Contract]:
+    def build_combo_contract(self, position_quantities: dict[int, int], invert_leg_actions: bool = False) -> Optional[Contract]:
         """Build BAG (combo) contract from multiple positions.
 
         Args:
             position_quantities: {con_id: quantity} mapping
+            invert_leg_actions: If True, invert leg actions (for SELL order on BAG)
 
         Returns:
             Contract object for the combo, or None if failed
@@ -861,7 +878,15 @@ class TWSBroker:
             # Determine action based on position sign (closing the position)
             # If we're long (qty > 0), we SELL to close
             # If we're short (qty < 0), we BUY to close
-            action = "SELL" if qty > 0 else "BUY"
+            #
+            # IMPORTANT: If order action is SELL (for debit spread), IBKR inverts
+            # all leg actions. So we pre-invert them here to get correct behavior.
+            if invert_leg_actions:
+                # For SELL order: invert leg actions
+                action = "BUY" if qty > 0 else "SELL"
+            else:
+                # For BUY order: normal leg actions
+                action = "SELL" if qty > 0 else "BUY"
 
             leg = ComboLeg(
                 conId=con_id,
@@ -870,11 +895,21 @@ class TWSBroker:
                 exchange="SMART"
             )
             combo_legs.append(leg)
+            logger.info(f"ComboLeg: conId={con_id} qty={qty} ratio={abs(qty)} action={action}")
+
+        # Determine exchange - SPX options trade on CBOE
+        if symbol == "SPX":
+            exchange = "CBOE"
+            # Also update leg exchanges
+            for leg in combo_legs:
+                leg.exchange = "CBOE"
+        else:
+            exchange = "SMART"
 
         combo = Contract(
             secType="BAG",
             symbol=symbol,
-            exchange="SMART",
+            exchange=exchange,
             currency="USD",
             comboLegs=combo_legs
         )
@@ -997,8 +1032,17 @@ class TWSBroker:
         Returns:
             Price increment (e.g., 0.01, 0.05, 0.10)
         """
-        cache_key = (contract.conId, contract.exchange or "SMART")
         default_tick = 0.01
+
+        # BAG (combo) contracts don't support reqContractDetails
+        # Use fallback based on underlying symbol
+        if contract.secType == "BAG":
+            if contract.symbol == "SPX":
+                # SPX options: $0.05 for prices < $3, $0.10 for >= $3
+                return 0.10 if abs(price) >= 3.0 else 0.05
+            return default_tick
+
+        cache_key = (contract.conId, contract.exchange or "SMART")
 
         try:
             # Check cache first
@@ -1064,20 +1108,21 @@ class TWSBroker:
         return self._get_price_increment(contract, 10.0)
 
     def _round_to_tick(self, price: float, increment: float) -> float:
-        """Round price to valid tick size.
+        """Round price to valid tick size, preserving sign.
 
         Args:
-            price: Price to round
+            price: Price to round (can be negative for credit spreads)
             increment: Price increment
 
         Returns:
-            Rounded price
+            Rounded price with preserved sign
         """
         if increment <= 0:
             increment = 0.01  # Fallback
 
-        # Round to nearest tick
-        return round(price / increment) * increment
+        # Preserve sign for negative prices (credit spreads)
+        sign = 1 if price >= 0 else -1
+        return sign * round(abs(price) / increment) * increment
 
     def place_stop_order(
         self,
@@ -1117,8 +1162,9 @@ class TWSBroker:
             order.totalQuantity = abs(quantity)
 
             # Get price increment based on actual price level and round
+            # IMPORTANT: Preserve sign for BAG contracts (credit spreads have negative prices)
             stop_increment = self._get_price_increment(contract, abs(stop_price))
-            stop_price_rounded = self._round_to_tick(abs(stop_price), stop_increment)
+            stop_price_rounded = self._round_to_tick(stop_price, stop_increment)
 
             if limit_price == 0 or limit_price is None:
                 # Stop-Market Order
@@ -1126,8 +1172,9 @@ class TWSBroker:
                 order.auxPrice = stop_price_rounded
             else:
                 # Stop-Limit Order - limit price may have different increment
+                # IMPORTANT: Preserve sign for BAG contracts
                 limit_increment = self._get_price_increment(contract, abs(limit_price))
-                limit_price_rounded = self._round_to_tick(abs(limit_price), limit_increment)
+                limit_price_rounded = self._round_to_tick(limit_price, limit_increment)
                 order.orderType = "STP LMT"
                 order.auxPrice = stop_price_rounded
                 order.lmtPrice = limit_price_rounded
@@ -1137,7 +1184,9 @@ class TWSBroker:
             order.tif = "GTC"  # Good Till Cancelled
 
             # OCA group settings
-            if oca_group:
+            # Note: BAG (combo) orders do NOT support OCA groups for stop orders
+            # Only set OCA for single-leg orders
+            if oca_group and contract.secType != "BAG":
                 order.ocaGroup = oca_group
                 order.ocaType = 1  # Cancel all remaining on fill
 
@@ -1148,14 +1197,8 @@ class TWSBroker:
             trade = self.ib.placeOrder(contract, order)
 
             # Brief wait to receive order status update from TWS
-            try:
-                self.ib.sleep(0.1)
-            except RuntimeError:
-                # "This event loop is already running" - fallback
-                try:
-                    self.ib.waitOnUpdate(timeout=0.1)
-                except Exception:
-                    pass
+            import time as time_module
+            time_module.sleep(0.2)  # Simple sync wait - avoid asyncio issues
 
             # Check order status
             status = trade.orderStatus.status if trade.orderStatus else "Unknown"
@@ -1279,8 +1322,10 @@ class TWSBroker:
             order.transmit = True
 
             # OCA group settings
-            order.ocaGroup = oca_group
-            order.ocaType = 1
+            # Note: BAG (combo) orders do NOT support OCA groups
+            if contract.secType != "BAG":
+                order.ocaGroup = oca_group
+                order.ocaType = 1  # Cancel all remaining on fill
 
             trade = self.ib.placeOrder(contract, order)
 
@@ -1328,17 +1373,36 @@ class TWSBroker:
             or None if failed
         """
         try:
+            # Log input for debugging
+            logger.info(f"place_oca_group: position_quantities={position_quantities} is_credit={is_credit}")
+
+            # Determine order action first (needed for building contract)
+            # Stop trigger direction:
+            # - BUY Stop: triggers when price RISES above stop (for credit - close when losing)
+            # - SELL Stop: triggers when price FALLS below stop (for debit - close when losing)
+            #
+            # Single-leg: BUY to close short, SELL to close long
+            # Multi-leg: Same logic, but need to handle IBKR's leg action inversion
+            action = "BUY" if is_credit else "SELL"
+
+            # For BAG contracts with SELL action, IBKR inverts all leg actions
+            # So we pre-invert them in build_combo_contract to get correct behavior
+            is_multi_leg = len(position_quantities) > 1
+            invert_legs = is_multi_leg and action == "SELL"
+
             # Build contract
-            contract = self.build_combo_contract(position_quantities)
+            contract = self.build_combo_contract(position_quantities, invert_leg_actions=invert_legs)
             if not contract:
                 return None
 
-            total_qty = sum(abs(q) for q in position_quantities.values())
-
-            # Determine action based on position type:
-            # - LONG/Debit positions (is_credit=False): SELL to close
-            # - SHORT/Credit positions (is_credit=True): BUY to close
-            action = "BUY" if is_credit else "SELL"
+            # For BAG contracts, the ratios are encoded in ComboLegs
+            # Order quantity should be 1 (meaning: 1 unit of the combo)
+            # For single-leg orders, use the actual quantity
+            if len(position_quantities) == 1:
+                total_qty = abs(list(position_quantities.values())[0])
+            else:
+                # Multi-leg combo: quantity = 1 (ratios are in legs)
+                total_qty = 1
 
             # Create OCA group
             oca_group = self.create_oca_group_id(group_name)
@@ -1350,8 +1414,15 @@ class TWSBroker:
             if stop_type == "market":
                 limit_price = 0.0  # STP order (no limit)
             else:
-                # STP LMT order
-                limit_price = initial_limit_price if initial_limit_price > 0 else (initial_stop_price - limit_offset)
+                # STP LMT order - use provided limit price or calculate fallback
+                # Credit (BUY to close): limit = stop + offset
+                # Debit (SELL to close): limit = stop - offset
+                if initial_limit_price > 0:
+                    limit_price = initial_limit_price
+                elif is_credit:
+                    limit_price = initial_stop_price + limit_offset
+                else:
+                    limit_price = initial_stop_price - limit_offset
 
             # Place app-controlled stop order (STP or STP LMT)
             stop_trade = self.place_stop_order(

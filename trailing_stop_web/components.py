@@ -337,30 +337,43 @@ def create_group_panel() -> rx.Component:
 def _group_header(group: dict, is_selected: bool = False) -> rx.Component:
     """Group card header with name, badges, and status."""
     is_active = group["is_active"]
+    is_credit = group["is_credit"]
     return rx.hstack(
+        # Left side: badges
+        rx.hstack(
+            rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
+            rx.badge(
+                rx.cond(is_credit, "CREDIT", "DEBIT"),
+                color_scheme=rx.cond(is_credit, "orange", "cyan"),
+                size="1",
+            ),
+            rx.badge(
+                group["market_status"],
+                color_scheme=rx.cond(
+                    group["market_status"] == "Open",
+                    "green",
+                    rx.cond(group["market_status"] == "Closed", "red", "gray"),
+                ),
+                size="1",
+            ),
+            rx.badge(
+                rx.cond(is_active, "ACTIVE", "IDLE"),
+                color_scheme=rx.cond(is_active, "green", "gray"),
+                size="1",
+            ),
+            rx.cond(
+                is_selected,
+                rx.badge("SELECTED", color_scheme="purple", size="1"),
+                rx.fragment(),
+            ),
+            spacing="1",
+        ),
+        rx.spacer(),
+        # Right side: name
         rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
                font_family=TYPOGRAPHY["font_family"]),
-        rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
-        rx.badge(
-            group["market_status"],
-            color_scheme=rx.cond(
-                group["market_status"] == "Open",
-                "green",
-                rx.cond(group["market_status"] == "Closed", "red", "gray"),
-            ),
-            size="1",
-        ),
-        rx.badge(
-            rx.cond(is_active, "ACTIVE", "IDLE"),
-            color_scheme=rx.cond(is_active, "green", "gray"),
-            size="1",
-        ),
-        rx.cond(
-            is_selected,
-            rx.badge("SELECTED", color_scheme="purple", size="1"),
-            rx.fragment(),
-        ),
         width="100%",
+        align="center",
     )
 
 
@@ -434,33 +447,59 @@ def _group_greeks_row(group: dict) -> rx.Component:
 
 
 def _group_hwm_stop_row(group: dict, show_trail: bool = False) -> rx.Component:
-    """HWM, Stop, Fill/Cost, and optionally Trail display."""
-    items = [
+    """HWM, Stop, Limit, Fill/Cost, and optionally Trail display.
+
+    For Credit spreads: Order is Fill → Stop → LWM (worst to best, $0 is best)
+    For Debit spreads: Order is Fill → HWM → Stop (best to worst)
+    """
+    # Credit: LWM label (Low Water Mark - $0 is the goal)
+    # Debit: HWM label (High Water Mark)
+    hwm_label = rx.cond(group["is_credit"], "LWM", "HWM")
+
+    fill_item = rx.vstack(
+        rx.text("Fill", size="1", color=COLORS["text_muted"]),
+        rx.text(group["cost_str"], size="1", color=COLORS["text_secondary"]),
+        align="center", spacing="0",
+    )
+    hwm_item = rx.vstack(
+        rx.text(hwm_label, size="1", color=COLORS["text_muted"]),
+        rx.text(group["hwm_str"], size="1", color=COLORS["hwm"]),
+        align="center", spacing="0",
+    )
+    stop_item = rx.vstack(
+        rx.text("Stop", size="1", color=COLORS["text_muted"]),
+        rx.text(group["stop_str"], size="1", color=COLORS["stop"]),
+        align="center", spacing="0",
+    )
+    limit_item = rx.cond(
+        group["stop_type"] == "limit",
         rx.vstack(
-            rx.text("Fill", size="1", color=COLORS["text_muted"]),
-            rx.text(group["cost_str"], size="1", color=COLORS["text_secondary"]),
+            rx.text("Limit", size="1", color=COLORS["text_muted"]),
+            rx.text(group["limit_str"], size="1", color=COLORS["limit"]),
             align="center", spacing="0",
         ),
-        rx.vstack(
-            rx.text("HWM", size="1", color=COLORS["text_muted"]),
-            rx.text(group["hwm_str"], size="1", color=COLORS["hwm"]),
-            align="center", spacing="0",
-        ),
-        rx.vstack(
-            rx.text("Stop", size="1", color=COLORS["text_muted"]),
-            rx.text(group["stop_str"], size="1", color=COLORS["stop"]),
-            align="center", spacing="0",
-        ),
-    ]
+        rx.fragment(),
+    )
+
+    # Credit spreads: Fill → Stop → LWM (worst to best, $0 is best)
+    # Debit spreads: Fill → HWM → Stop (best to worst)
+    items_credit = [fill_item, stop_item, hwm_item, limit_item]
+    items_debit = [fill_item, hwm_item, stop_item, limit_item]
+
     if show_trail:
-        items.append(
-            rx.vstack(
-                rx.text("Trail", size="1", color=COLORS["text_muted"]),
-                rx.text(group["trail_display"], size="1", color=COLORS["text_secondary"]),
-                align="center", spacing="0",
-            )
+        trail_item = rx.vstack(
+            rx.text("Trail", size="1", color=COLORS["text_muted"]),
+            rx.text(group["trail_display"], size="1", color=COLORS["text_secondary"]),
+            align="center", spacing="0",
         )
-    return rx.hstack(*items, spacing="3", width="100%")
+        items_credit.append(trail_item)
+        items_debit.append(trail_item)
+
+    return rx.cond(
+        group["is_credit"],
+        rx.hstack(*items_credit, spacing="3", width="100%"),
+        rx.hstack(*items_debit, spacing="3", width="100%"),
+    )
 
 
 def _group_action_buttons(group_id: str, is_active: bool) -> rx.Component:
@@ -611,7 +650,7 @@ def group_card(group: dict, mode: str = "setup") -> rx.Component:
     if mode == "setup":
         content.append(
             rx.box(
-                rx.text(group["legs_str"], size="1", white_space="pre-wrap", color=COLORS["text_secondary"]),
+                rx.text(group["legs_str"], size="1", white_space="pre", font_family="monospace", color=COLORS["text_secondary"]),
                 padding="2",
                 background=COLORS["bg_elevated"],
                 border_radius="6px",
@@ -756,7 +795,7 @@ def combo_price_chart() -> rx.Component:
                     rx.text(AppState.chart_pos_stop, size="1", weight="bold", color=COLORS["stop"]),
                     rx.text("Limit:", size="1", color=COLORS["text_muted"]),
                     rx.text(AppState.chart_pos_limit, size="1", weight="bold", color=COLORS["limit"]),
-                    rx.text("HWM:", size="1", color=COLORS["text_muted"]),
+                    rx.text(AppState.chart_hwm_label + ":", size="1", color=COLORS["text_muted"]),
                     rx.text(AppState.chart_pos_hwm, size="1", weight="bold", color=COLORS["hwm"]),
                     spacing="1",
                     align="center",

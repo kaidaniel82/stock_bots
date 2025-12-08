@@ -6,10 +6,10 @@ from datetime import datetime
 from typing import Optional
 
 from .logger import logger
+from .metrics import calculate_stop_price
 
-# Data directory for persistence - OUTSIDE project folder to avoid hot-reload triggers
-# Using ~/.trailing_stop_web/ to prevent Reflex from restarting on file changes
-DATA_DIR = Path.home() / ".trailing_stop_web"
+# Data directory for persistence - in project folder (hot-reload excluded via REFLEX_HOT_RELOAD_EXCLUDE_PATHS)
+DATA_DIR = Path(__file__).parent.parent / "data"
 GROUPS_FILE = DATA_DIR / "groups.json"
 
 
@@ -40,6 +40,10 @@ class Group:
     # === TIME EXIT ===
     time_exit_enabled: bool = False
     time_exit_time: str = "15:55"         # HH:MM format (ET)
+
+    # === POSITION TYPE (set at creation, immutable) ===
+    is_credit: bool = False               # True for credit/short positions
+    entry_price: float = 0.0              # Entry price per unit at creation
 
     # === RUNTIME STATE ===
     high_water_mark: float = 0.0
@@ -72,39 +76,6 @@ class Group:
             con_ids = data.pop("con_ids")
             data["position_quantities"] = {str(cid): 1 for cid in con_ids}
         return cls(**data)
-
-
-def calculate_stop_price(hwm: float, trail_mode: str, trail_value: float,
-                         is_credit: bool = False) -> float:
-    """Calculate stop price based on mode and value.
-
-    Args:
-        hwm: High water mark (current value)
-        trail_mode: "percent" or "absolute"
-        trail_value: Trail amount (10 = 10% or $10)
-        is_credit: True for credit positions (short, credit spreads)
-
-    Returns:
-        Calculated stop price
-
-    DEBIT positions: HWM is highest value, stop is BELOW HWM
-    CREDIT positions: HWM is best value (lowest for short, most negative for credit spread)
-                      Stop is in the OPPOSITE direction (ABOVE for shorts, less negative for spreads)
-    """
-    if trail_mode == "percent":
-        if is_credit:
-            # Credit: stop is trail% ABOVE (worse direction)
-            return round(hwm * (1 + trail_value / 100), 2)
-        else:
-            # Debit: stop is trail% BELOW
-            return round(hwm * (1 - trail_value / 100), 2)
-    else:  # absolute
-        if is_credit:
-            # Credit: stop is trail_value ABOVE (worse direction)
-            return round(hwm + trail_value, 2)
-        else:
-            # Debit: stop is trail_value BELOW
-            return round(hwm - trail_value, 2)
 
 
 class GroupManager:
@@ -171,16 +142,19 @@ class GroupManager:
         time_exit_enabled: bool = False,
         time_exit_time: str = "15:55",
         initial_value: float = 0.0,
+        is_credit: bool = False,
+        entry_price: float = 0.0,
     ) -> Group:
         """Create a new group.
 
         Args:
             name: Group name
             position_quantities: dict mapping con_id -> quantity to allocate
+            is_credit: True for credit/short positions (immutable after creation)
+            entry_price: Entry price per unit at creation (immutable after creation)
         """
         group_id = f"grp_{len(self._groups) + 1}_{datetime.now().strftime('%H%M%S')}"
-        # Note: stop_price will be recalculated with is_credit from metrics on each tick
-        stop_price = calculate_stop_price(initial_value, trail_mode, trail_value)
+        stop_price = calculate_stop_price(initial_value, trail_mode, trail_value, is_credit=is_credit)
 
         # Convert int keys to str for JSON serialization
         pos_qty_str = {str(k): v for k, v in position_quantities.items()}
@@ -199,13 +173,19 @@ class GroupManager:
             limit_offset=limit_offset,
             time_exit_enabled=time_exit_enabled,
             time_exit_time=time_exit_time,
+            is_credit=is_credit,
+            entry_price=entry_price,
             high_water_mark=initial_value,
             stop_price=stop_price,
         )
         self._groups[group.id] = group
         self._save()
-        total_qty = sum(position_quantities.values())
-        logger.info(f"Group created: {group.name} ({group.id}) with {len(position_quantities)} positions, {total_qty} total qty")
+        # Logical unit count: GCD of quantities (e.g., +2/-2 → 2 units)
+        from math import gcd
+        from functools import reduce
+        abs_qtys = [abs(q) for q in position_quantities.values()]
+        unit_qty = reduce(gcd, abs_qtys) if abs_qtys else 0
+        logger.info(f"Group created: {group.name} ({group.id}) with {len(position_quantities)} legs, {unit_qty} units, credit={is_credit}")
         return group
 
     def delete(self, group_id: str) -> bool:
@@ -311,11 +291,17 @@ class GroupManager:
 
         group = self._groups[group_id]
 
-        # Determine if this is a "better" value (new HWM)
-        # Debit: higher is better
-        # Credit: lower (more negative) is better
+        # Determine if this is a "better" value (new HWM/LWM)
+        # Debit: higher is better (profit when value goes up)
+        # Credit with positive value (Single Short): lower is better
+        # Credit with negative value (Credit Spread): higher (closer to 0) is better
         if is_credit:
-            is_better = new_value < group.high_water_mark or group.high_water_mark == 0
+            if new_value >= 0:
+                # Single short: lower is better
+                is_better = new_value < group.high_water_mark or group.high_water_mark == 0
+            else:
+                # Credit spread (negative values): higher (closer to 0) is better
+                is_better = new_value > group.high_water_mark or group.high_water_mark == 0
         else:
             is_better = new_value > group.high_water_mark
 
@@ -335,13 +321,18 @@ class GroupManager:
                              is_credit: bool = False) -> bool:
         """Check if stop price was breached. Returns True if triggered.
 
-        Credit-Spreads: current_value and stop_price are negative
-        - Stop triggered when current_value >= stop_price (less negative = worse)
-        - Example: current=-$5.00, stop=-$5.50 → -5.00 >= -5.50? YES! TRIGGER!
+        IMPORTANT: stop_price is always stored as POSITIVE (for IBKR BAG orders).
+        We use abs(current_value) for comparison with credit positions.
 
-        Debit-Spreads: current_value and stop_price are positive
-        - Stop triggered when current_value <= stop_price (lower = worse)
-        - Example: current=$5.00, stop=$5.50 → 5.00 <= 5.50? YES! TRIGGER!
+        Credit positions (short/credit spread):
+        - stop_price = $5.20 (positive, the "bad" absolute price)
+        - current = -$4.20 → abs = $4.20 < $5.20 → NOT triggered
+        - current = -$5.50 → abs = $5.50 >= $5.20 → TRIGGERED!
+        - Triggered when abs(current) >= stop (cost to close is too high)
+
+        Debit positions (long/debit spread):
+        - stop_price = $8.50 (the minimum acceptable value)
+        - Triggered when current <= stop (value dropped too much)
         """
         if group_id not in self._groups:
             return False
@@ -351,16 +342,25 @@ class GroupManager:
             return False
 
         # IMPORTANT: Don't trigger on invalid/zero prices
-        # This can happen when market data is temporarily unavailable
         if current_value == 0 or group.stop_price == 0:
             logger.debug(f"Skipping stop check for {group.name}: current={current_value}, stop={group.stop_price}")
             return False
 
+        # NOTE: stop_price is ALWAYS stored as positive (for IBKR BAG orders)
+        # For comparison, we need to use abs(current_value) vs stop_price
+        #
+        # Credit: Stop triggers when price moves AGAINST us (higher absolute cost to close)
+        #   - Credit spread: current=-4.20, stop=5.20 → abs(-4.20)=4.20 < 5.20 → NOT triggered
+        #   - Trigger when abs(current) >= stop (cost to close increased)
+        # Debit: Stop triggers when price DROPS below stop
+        #   - current=8.00, stop=8.50 → 8.00 < 8.50 → triggered
+
         if is_credit:
-            # Credit: less negative is worse (value rising towards 0 or positive)
-            triggered = current_value >= group.stop_price
+            # Credit positions: triggered when abs(current) >= stop
+            # (cost to close has risen to or above stop level)
+            triggered = abs(current_value) >= group.stop_price
         else:
-            # Debit: lower is worse
+            # Debit: triggered when current <= stop (value dropped)
             triggered = current_value <= group.stop_price
 
         if triggered:
@@ -379,13 +379,13 @@ class GroupManager:
         """Calculate total quantity used for each con_id across all groups.
 
         Returns:
-            dict mapping con_id -> total quantity allocated across all groups
+            dict mapping con_id -> total absolute quantity allocated across all groups
         """
         usage: dict[int, int] = {}
         for group in self._groups.values():
             for con_id_str, qty in group.position_quantities.items():
                 con_id = int(con_id_str)
-                usage[con_id] = usage.get(con_id, 0) + qty
+                usage[con_id] = usage.get(con_id, 0) + abs(qty)
         return usage
 
     def can_use_position(self, con_id: int, position_qty: float) -> bool:

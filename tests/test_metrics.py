@@ -532,7 +532,12 @@ class TestTrailingStopCredit:
         assert metrics.trail_stop_price == 12.0
 
     def test_credit_spread_hwm_tracking(self):
-        """Credit spread: HWM tracks the most negative (best) value."""
+        """Credit spread: HWM tracks the closest to $0 (best) value.
+
+        For credit spreads, we PROFIT when the spread value decreases toward $0.
+        Internal values are negative (e.g., -$4.30 means we pay $4.30 to close).
+        LESS NEGATIVE = BETTER (closer to $0 = less to pay back).
+        """
         # Credit spread: short near, long far = negative net value
         short_leg = make_leg(con_id=1, strike=6800, quantity=-5, mark=16.50, fill_price=16.60)
         long_leg = make_leg(con_id=2, strike=6850, quantity=5, mark=12.20, fill_price=12.00)
@@ -544,13 +549,14 @@ class TestTrailingStopCredit:
             current_hwm=-5.00, market_open=True  # Previous best was -5.00
         )
 
-        # -4.30 > -5.00 so HWM should NOT update (less negative = worse for credit)
+        # -4.30 > -5.00 so HWM SHOULD update (less negative = BETTER for credit)
+        # We pay $4.30 to close instead of $5.00 = good!
         assert metrics.is_credit is True
-        assert metrics.hwm_updated is False
-        assert metrics.updated_hwm == -5.00
+        assert metrics.hwm_updated is True
+        assert metrics.updated_hwm == -4.30
 
-    def test_credit_spread_hwm_update_on_improvement(self):
-        """Credit spread: HWM updates when value becomes more negative (better)."""
+    def test_credit_spread_hwm_no_update_when_worse(self):
+        """Credit spread: HWM does NOT update when value becomes more negative (worse)."""
         short_leg = make_leg(con_id=1, strike=6800, quantity=-5, mark=17.00, fill_price=16.60)
         long_leg = make_leg(con_id=2, strike=6850, quantity=5, mark=11.50, fill_price=12.00)
 
@@ -561,10 +567,11 @@ class TestTrailingStopCredit:
             current_hwm=-5.00, market_open=True
         )
 
-        # -5.50 < -5.00 so HWM should update (more negative = better)
+        # -5.50 < -5.00 so HWM should NOT update (more negative = WORSE)
+        # We'd have to pay $5.50 to close instead of $5.00 = bad!
         assert metrics.is_credit is True
-        assert metrics.hwm_updated is True
-        assert metrics.updated_hwm == -5.50
+        assert metrics.hwm_updated is False
+        assert metrics.updated_hwm == -5.00
 
 
 class TestTrailingStopEdgeCases:
@@ -616,3 +623,215 @@ class TestTrailingStopEdgeCases:
         )
         assert metrics.trail_stop_price == 85.0
         assert metrics.trail_limit_price == 0.0  # No limit for market orders
+
+
+class TestClosingOrderAction:
+    """Tests for determining correct closing order action (BUY vs SELL).
+
+    Closing logic:
+    - Long leg (qty > 0): SELL to close
+    - Short leg (qty < 0): BUY to close
+    - Debit position (is_credit=False): SELL to close spread
+    - Credit position (is_credit=True): BUY to close spread
+    """
+
+    # --- Single Long Leg ---
+    def test_single_long_is_not_credit(self):
+        """Single long position: is_credit=False."""
+        leg = make_leg(quantity=5, fill_price=10.0)
+        metrics = compute_group_metrics([leg], "mark")
+        assert not metrics.is_credit
+
+    def test_single_long_closes_with_sell(self):
+        """Single long: SELL to close."""
+        leg = make_leg(quantity=5, fill_price=10.0)
+        metrics = compute_group_metrics([leg], "mark")
+        closing_action = "BUY" if metrics.is_credit else "SELL"
+        assert closing_action == "SELL"
+
+    # --- Single Short Leg ---
+    def test_single_short_is_credit(self):
+        """Single short position: is_credit=True (received premium)."""
+        leg = make_leg(quantity=-3, fill_price=10.0)
+        metrics = compute_group_metrics([leg], "mark")
+        assert metrics.is_credit
+
+    def test_single_short_closes_with_buy(self):
+        """Single short: BUY to close."""
+        leg = make_leg(quantity=-3, fill_price=10.0)
+        metrics = compute_group_metrics([leg], "mark")
+        closing_action = "BUY" if metrics.is_credit else "SELL"
+        assert closing_action == "BUY"
+
+    # --- Debit Spread ---
+    def test_debit_spread_is_not_credit(self):
+        """Debit spread: is_credit=False (paid to enter)."""
+        # Buy 6800C @ $16.60, Sell 6850C @ $12.00 = $4.60 debit
+        long_leg = make_leg(con_id=1, strike=6800, quantity=5, fill_price=16.60)
+        short_leg = make_leg(con_id=2, strike=6850, quantity=-5, fill_price=12.00)
+        metrics = compute_group_metrics([long_leg, short_leg], "mark")
+        assert not metrics.is_credit
+
+    def test_debit_spread_closes_with_sell(self):
+        """Debit spread: SELL to close.
+
+        Example: Bought call spread for $4.60 debit
+        To close: SELL the spread (sell long leg, buy short leg)
+        """
+        long_leg = make_leg(con_id=1, strike=6800, quantity=5, fill_price=16.60)
+        short_leg = make_leg(con_id=2, strike=6850, quantity=-5, fill_price=12.00)
+        metrics = compute_group_metrics([long_leg, short_leg], "mark")
+        closing_action = "BUY" if metrics.is_credit else "SELL"
+        assert closing_action == "SELL"
+
+    # --- Credit Spread ---
+    def test_credit_spread_is_credit(self):
+        """Credit spread: is_credit=True (received premium)."""
+        # Sell 6800C @ $16.60, Buy 6850C @ $12.00 = $4.60 credit
+        short_leg = make_leg(con_id=1, strike=6800, quantity=-5, fill_price=16.60)
+        long_leg = make_leg(con_id=2, strike=6850, quantity=5, fill_price=12.00)
+        metrics = compute_group_metrics([short_leg, long_leg], "mark")
+        assert metrics.is_credit
+
+    def test_credit_spread_closes_with_buy(self):
+        """Credit spread: BUY to close.
+
+        Example: Sold call spread for $4.60 credit
+        To close: BUY the spread (buy short leg, sell long leg)
+        """
+        short_leg = make_leg(con_id=1, strike=6800, quantity=-5, fill_price=16.60)
+        long_leg = make_leg(con_id=2, strike=6850, quantity=5, fill_price=12.00)
+        metrics = compute_group_metrics([short_leg, long_leg], "mark")
+        closing_action = "BUY" if metrics.is_credit else "SELL"
+        assert closing_action == "BUY"
+
+
+class TestStopPnL:
+    """Tests for stop P&L calculation.
+
+    Stop P&L = P&L if stop is triggered at trail_stop_price
+    - Credit: profit if stop_price < entry (bought back cheaper)
+    - Debit: profit if stop_price > entry (sold higher)
+    """
+
+    def test_credit_stop_pnl_profit(self):
+        """Credit position: profit when stop < entry.
+
+        Entry: $21.68 (received)
+        Stop: $13.91 (pay to close)
+        Per-contract P&L: $21.68 - $13.91 = $7.77 profit
+        Scale: 1 contract * 100 multiplier = 100
+        Stop P&L: $7.77 * 100 = $777
+        """
+        leg = make_leg(quantity=-1, multiplier=100, fill_price=21.68, mark=13.91)
+        metrics = compute_group_metrics(
+            [leg], "mark",
+            trail_mode="percent", trail_value=15.0,
+            current_hwm=12.10, market_open=True
+        )
+        # Stop should be above HWM for credit (triggers when price rises)
+        # HWM=12.10 * 1.15 = 13.915
+        assert metrics.trail_stop_price == pytest.approx(13.915, rel=0.01)
+        # P&L: (entry - stop) * scale = (21.68 - 13.915) * 100 = 776.5
+        assert metrics.stop_pnl == pytest.approx(776.5, rel=0.01)
+
+    def test_credit_stop_pnl_loss(self):
+        """Credit position: loss when stop > entry.
+
+        Entry: $10.00 (received)
+        HWM: $8.00 (price dropped, good)
+        Stop: $8.00 * 1.15 = $9.20
+        Per-contract P&L: $10.00 - $9.20 = $0.80 profit (still in profit at stop)
+        """
+        leg = make_leg(quantity=-1, multiplier=100, fill_price=10.00, mark=8.00)
+        metrics = compute_group_metrics(
+            [leg], "mark",
+            trail_mode="percent", trail_value=15.0,
+            current_hwm=8.00, market_open=True
+        )
+        # Stop: 8.00 * 1.15 = 9.20
+        assert metrics.trail_stop_price == pytest.approx(9.20, rel=0.01)
+        # P&L: (10.00 - 9.20) * 100 = 80
+        assert metrics.stop_pnl == pytest.approx(80.0, rel=0.01)
+
+    def test_debit_stop_pnl_profit(self):
+        """Debit position: profit when stop > entry.
+
+        Entry: $10.00 (paid)
+        HWM: $15.00 (price rose, good)
+        Stop: $15.00 * 0.85 = $12.75
+        Per-contract P&L: $12.75 - $10.00 = $2.75 profit
+        Scale: 5 contracts * 100 = 500
+        Stop P&L: $2.75 * 500 = $1375
+        """
+        leg = make_leg(quantity=5, multiplier=100, fill_price=10.00, mark=15.00)
+        metrics = compute_group_metrics(
+            [leg], "mark",
+            trail_mode="percent", trail_value=15.0,
+            current_hwm=15.00, market_open=True
+        )
+        # Stop: 15.00 * 0.85 = 12.75
+        assert metrics.trail_stop_price == pytest.approx(12.75, rel=0.01)
+        # P&L: (12.75 - 10.00) * 500 = 1375
+        assert metrics.stop_pnl == pytest.approx(1375.0, rel=0.01)
+
+    def test_debit_stop_pnl_loss(self):
+        """Debit position: loss when stop < entry.
+
+        Entry: $10.00 (paid)
+        HWM: $10.00 (no movement yet)
+        Stop: $10.00 * 0.85 = $8.50
+        Per-contract P&L: $8.50 - $10.00 = -$1.50 loss
+        """
+        leg = make_leg(quantity=1, multiplier=100, fill_price=10.00, mark=10.00)
+        metrics = compute_group_metrics(
+            [leg], "mark",
+            trail_mode="percent", trail_value=15.0,
+            current_hwm=10.00, market_open=True
+        )
+        # Stop: 10.00 * 0.85 = 8.50
+        assert metrics.trail_stop_price == pytest.approx(8.50, rel=0.01)
+        # P&L: (8.50 - 10.00) * 100 = -150
+        assert metrics.stop_pnl == pytest.approx(-150.0, rel=0.01)
+
+    def test_credit_spread_stop_pnl(self):
+        """Credit spread: stop P&L calculation.
+
+        Sell 6800C @ $16.60, Buy 6850C @ $12.00 = $4.60 credit per unit
+        5 contracts * 100 multiplier = 500 scale
+        Entry: -$4.60 (negative because credit spread)
+        total_entry: -$2300 (credit received)
+
+        LWM = -$3.00 (best value - closest to $0, meaning we pay less to close)
+        Stop calculation for negative LWM:
+          stop = LWM - |LWM| * trail% = -3.00 - 3.00 * 0.15 = -3.00 - 0.45 = -3.45
+        (Stop is MORE negative = worse for us = triggers when spread value drops)
+
+        Per-unit P&L at stop: |$4.60| - |$3.45| = $1.15 profit
+        Stop P&L: $1.15 * 500 = $575
+        """
+        short_leg = make_leg(
+            con_id=1, strike=6800, quantity=-5, multiplier=100,
+            fill_price=16.60, mark=15.00, bid=14.90, ask=15.10
+        )
+        long_leg = make_leg(
+            con_id=2, strike=6850, quantity=5, multiplier=100,
+            fill_price=12.00, mark=12.00, bid=11.90, ask=12.10
+        )
+        # Current spread value: 12.00 - 15.00 = -3.00 (we owe less than entry)
+        metrics = compute_group_metrics(
+            [short_leg, long_leg], "mark",
+            trail_mode="percent", trail_value=15.0,
+            current_hwm=-3.00, market_open=True
+        )
+
+        assert metrics.is_credit
+        # Entry is negative for credit spread: long_fill - short_fill = 12.00 - 16.60 = -4.60
+        assert metrics.entry == -4.60
+        # Stop for credit: abs(LWM) * (1 + trail%) = 3.00 * 1.15 = 3.45
+        # (positive for IBKR order - triggers when spread price rises above 3.45)
+        assert metrics.trail_stop_price == pytest.approx(3.45, rel=0.01)
+        # Per-unit P&L: |4.60| - |3.45| = 1.15
+        # Scale: abs(-2300 / -4.60) = 500
+        # Stop P&L: 1.15 * 500 = 575
+        assert metrics.stop_pnl == pytest.approx(575.0, rel=0.05)

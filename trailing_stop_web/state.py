@@ -7,8 +7,8 @@ import reflex as rx
 import plotly.graph_objects as go
 
 from .broker import BROKER
-from .groups import GROUP_MANAGER, calculate_stop_price
-from .metrics import LegData, GroupMetrics, compute_group_metrics
+from .groups import GROUP_MANAGER
+from .metrics import LegData, GroupMetrics, compute_group_metrics, calculate_stop_price
 from .config import (
     UI_UPDATE_INTERVAL,
     DEFAULT_TRAIL_PERCENT, DEFAULT_STOP_TYPE, DEFAULT_LIMIT_OFFSET,
@@ -121,6 +121,11 @@ class AppState(rx.State):
     # {group_id: {"stop": float, "limit": float, "timestamp": float}}
     last_sent_stop_prices: dict[str, dict] = {}
 
+    # === Double-click prevention ===
+    # Tracks in-progress activations to prevent duplicate orders
+    # {group_id: timestamp}
+    _activation_in_progress: dict[str, float] = {}
+
     # Pre-rendered Plotly figures (stored as Figure, NOT @rx.var!)
     # Reflex serializes go.Figure to dict automatically
     underlying_figure: go.Figure = go.Figure()
@@ -142,6 +147,7 @@ class AppState(rx.State):
     chart_pos_stop: str = "-"
     chart_pos_limit: str = "-"
     chart_pos_hwm: str = "-"
+    chart_hwm_label: str = "HWM"  # "HWM" for debit, "LWM" for credit
     chart_pos_fill: str = "-"  # Fill/Cost price
     # P&L History Header: Current P&L, Stop P&L
     chart_pnl_current: str = "-"
@@ -323,14 +329,30 @@ class AppState(rx.State):
             self.status_message = "Enter a group name"
             return
 
-        # Convert string keys to int for GroupManager (it will convert back to str for JSON)
-        position_quantities = {int(k): v for k, v in self.selected_quantities.items()}
+        # Convert string keys to int and apply sign from portfolio positions
+        # This ensures position_quantities stores SIGNED values (positive=long, negative=short)
+        position_quantities = {}
+        for k, v in self.selected_quantities.items():
+            con_id = int(k)
+            # Find portfolio position to get the sign
+            portfolio_qty = 0
+            for pos in self.positions:
+                if pos["con_id"] == con_id:
+                    portfolio_qty = pos["quantity"]
+                    break
+            # Apply sign: if portfolio is short (negative), make allocated qty negative
+            signed_qty = -abs(v) if portfolio_qty < 0 else abs(v)
+            position_quantities[con_id] = signed_qty
+            logger.debug(f"Position {con_id}: portfolio_qty={portfolio_qty}, allocated={v}, signed={signed_qty}")
 
         # Calculate initial value and determine if credit position
         con_ids = list(position_quantities.keys())
-        value = self._calc_group_value(con_ids)
         metrics = self._calc_group_metrics(con_ids, position_quantities, "mark")
         is_credit = metrics.get("is_credit", False)
+        # Use trigger_value (per-contract price) for HWM, NOT net_value (which includes multiplier)
+        trigger_value = metrics.get("trigger_value", 0)
+        # Entry price per unit (immutable after creation)
+        entry_price = metrics.get("entry_price", 0)
 
         # Create via GroupManager (persisted to JSON)
         group = GROUP_MANAGER.create(
@@ -340,7 +362,9 @@ class AppState(rx.State):
             trail_mode="percent",  # Default mode
             stop_type=self.stop_type,
             limit_offset=self.limit_offset,
-            initial_value=value,
+            initial_value=trigger_value,  # Per-contract price for correct stop calculation
+            is_credit=is_credit,  # Immutable after creation
+            entry_price=entry_price,  # Immutable after creation
         )
 
         # Refresh positions if connected (don't clear if disconnected)
@@ -354,7 +378,7 @@ class AppState(rx.State):
         self.selected_quantities = {}
         self.new_group_name = ""
         self.status_message = f"Group '{group.name}' created"
-        logger.info(f"Group created: '{group.name}' with {len(position_quantities)} positions, value=${value:.2f}")
+        logger.info(f"Group created: '{group.name}' with {len(position_quantities)} positions, trigger=${trigger_value:.2f}")
 
     def _load_groups_from_manager(self, metrics_cache: dict = None):
         """Load groups from GroupManager into state for UI.
@@ -372,8 +396,9 @@ class AppState(rx.State):
                 metrics = metrics_cache[g.id]
             else:
                 metrics = self._calc_group_metrics(g.con_ids, g.position_quantities, g.trigger_price_type, group=g)
-            # Calculate total allocated quantity
-            total_allocated_qty = sum(g.position_quantities.values())
+            # Get logical unit count from metrics (GCD of quantities)
+            # e.g., 2 spreads with +2/-2 → num_units=2
+            total_allocated_qty = metrics.get("num_units", 1)
 
             # Format trail value display based on mode
             if g.trail_mode == "percent":
@@ -382,16 +407,24 @@ class AppState(rx.State):
                 trail_display = f"${g.trail_value}"
 
             # Calculate group market status (worst case of all positions)
-            group_market_status = "Open"
+            group_market_status = "Unknown"
+            found_position = False
             for pos in self.positions:
                 if pos["con_id"] in g.con_ids:
+                    found_position = True
                     pos_status = pos.get("market_status", "Unknown")
-                    if pos_status == "Closed":
+                    if pos_status == "Open":
+                        group_market_status = "Open"
+                    elif pos_status == "Closed":
                         group_market_status = "Closed"
                         break
-                    elif pos_status == "Unknown" and group_market_status == "Open":
-                        group_market_status = "Unknown"
+            # If positions found but none had status, default to Unknown
+            if not found_position:
+                group_market_status = "Unknown"
 
+            # Use STORED values from group for immutable fields (is_credit, entry_price)
+            # Use LIVE values from metrics for dynamic fields (bid, ask, mark, greeks, pnl)
+            # Use STORED values from group for HWM/Stop (updated by trailing logic)
             self.groups.append({
                 "id": g.id,
                 "name": g.name,
@@ -416,33 +449,37 @@ class AppState(rx.State):
                 "time_exit_time": g.time_exit_time,
                 # Runtime state
                 "is_active": g.is_active,
-                # HWM and Stop from chart_data (trigger-based) or fallback to metrics trigger_value
-                "high_water_mark": self._get_group_hwm(g.id, metrics.get("trigger_value", 0)),
-                "hwm_str": f"${self._get_group_hwm(g.id, metrics.get('trigger_value', 0)):.2f}",
-                "stop_price": self._get_group_stop(g.id, g.trail_mode, g.trail_value, metrics.get("trigger_value", 0), is_credit=metrics.get("is_credit", False)),
-                "stop_str": f"${self._get_group_stop(g.id, g.trail_mode, g.trail_value, metrics.get('trigger_value', 0), is_credit=metrics.get('is_credit', False)):.2f}",
-                # Trigger value for highlighting in UI
+                # HWM/Stop from STORED group (updated by trailing logic in tick_update)
+                "high_water_mark": g.high_water_mark,
+                "hwm_str": f"${abs(g.high_water_mark):.2f}" if g.high_water_mark != 0 else "-",
+                "stop_price": g.stop_price,
+                "stop_str": f"${abs(g.stop_price):.2f}" if g.stop_price != 0 else "-",
+                # Limit price: calculated from stop + offset
+                "trail_limit_price": g.stop_price + g.limit_offset if g.is_credit else g.stop_price - g.limit_offset if g.stop_price != 0 else 0,
+                "limit_str": f"${abs(g.stop_price + g.limit_offset if g.is_credit else g.stop_price - g.limit_offset):.2f}" if g.stop_price != 0 else "-",
+                # Trigger value from LIVE metrics (current price)
                 "trigger_value": metrics.get("trigger_value", 0),
-                "trigger_value_str": f"${metrics.get('trigger_value', 0):.2f}",
+                "trigger_value_str": f"${abs(metrics.get('trigger_value', 0)):.2f}",
                 "current_value": value,
                 "value_str": f"${value:.2f}",
-                # Metrics - Legs info
+                # Metrics - Legs info from LIVE
                 "legs_str": metrics["legs_str"],
-                # Per-leg aggregated values
+                # Per-leg aggregated values from LIVE
                 "mark_value_str": metrics["mark_value_str"],
                 "mid_value_str": metrics["mid_value_str"],
-                # Spread-level Natural Bid/Ask
+                # Spread-level Natural Bid/Ask from LIVE
                 "spread_bid_str": metrics["spread_bid_str"],
                 "spread_ask_str": metrics["spread_ask_str"],
-                # Cost and PnL
-                "entry_price": metrics["entry_price"],
-                "cost_str": metrics["cost_str"],
+                # Entry price from STORED group (immutable)
+                "entry_price": g.entry_price,
+                "cost_str": f"${abs(g.entry_price):.2f}",
+                # PnL from LIVE metrics
                 "pnl_mark": metrics["pnl_mark"],
                 "pnl_mark_str": metrics["pnl_mark_str"],
                 "pnl_color": "green" if metrics["pnl_mark"] >= 0 else "red",
                 "pnl_close": metrics["pnl_close"],
                 "pnl_close_str": metrics["pnl_close_str"],
-                # Greeks (aggregated for group)
+                # Greeks from LIVE metrics
                 "delta": metrics["delta"],
                 "delta_str": metrics["delta_str"],
                 "gamma": metrics["gamma"],
@@ -451,6 +488,8 @@ class AppState(rx.State):
                 "theta_str": metrics["theta_str"],
                 "vega": metrics["vega"],
                 "vega_str": metrics["vega_str"],
+                # Position type from STORED group (immutable)
+                "is_credit": g.is_credit,
             })
 
     def _calc_group_value(self, con_ids: list[int]) -> float:
@@ -501,13 +540,12 @@ class AppState(rx.State):
         for pos in self.positions:
             if pos["con_id"] in con_ids:
                 strike_str = pos["strike_str"]
-                # Use allocated quantity if provided, else use portfolio quantity
+                side_str = pos.get("side_str", "")  # "C" or "P"
+                # Use allocated quantity if provided (already signed), else use portfolio quantity
                 con_id_str = str(pos["con_id"])
                 if position_quantities:
-                    allocated_qty = position_quantities.get(con_id_str, abs(pos["quantity"]))
-                    # Preserve sign from portfolio position (long/short)
-                    if pos["quantity"] < 0:
-                        allocated_qty = -allocated_qty
+                    # position_quantities is already signed (positive=long, negative=short)
+                    allocated_qty = position_quantities.get(con_id_str, pos["quantity"])
                 else:
                     allocated_qty = pos["quantity"]
 
@@ -516,8 +554,8 @@ class AppState(rx.State):
                     symbol=pos["symbol"],
                     sec_type=pos["sec_type"],
                     expiry=pos["expiry"] if pos["expiry"] != "-" else "",
-                    strike=float(strike_str.rstrip("CP")) if strike_str not in ("-", "") else 0.0,
-                    right=strike_str[-1] if strike_str not in ("-", "") and strike_str[-1] in ("C", "P") else "",
+                    strike=float(strike_str) if strike_str not in ("-", "") else 0.0,
+                    right=side_str if side_str in ("C", "P") else "",
                     quantity=allocated_qty,  # Use allocated qty
                     multiplier=pos["multiplier"],
                     fill_price=pos["fill_price"],
@@ -552,11 +590,12 @@ class AppState(rx.State):
             market_open=market_open,
         )
 
-        # Build leg info for UI display - per-leg Mark and Mid
+        # Build leg info for UI display
         leg_infos = []
         for leg in legs:
             leg_infos.append({
                 "name": leg.display_name,
+                "info_line": leg.info_line,
                 "qty": f"{leg.quantity:+g}",  # +1 or -1
                 "type": leg.position_type,
                 "fill": f"${leg.fill_price:.2f}",
@@ -564,16 +603,11 @@ class AppState(rx.State):
                 "mid": f"${leg.mid:.2f}" if leg.mid > 0 else "-",
                 "bid": f"${leg.bid:.2f}" if leg.bid > 0 else "-",
                 "ask": f"${leg.ask:.2f}" if leg.ask > 0 else "-",
+                "delta": f"{leg.delta:.2f}",
             })
 
-        # Format legs as string for display (avoids nested foreach issue)
-        # Show: Qty, Name, Bid/Ask (simplified view)
-        legs_lines = []
-        for info in leg_infos:
-            legs_lines.append(
-                f"{info['qty']:>3}  {info['name']}  Bid:{info['bid']} Ask:{info['ask']}"
-            )
-        legs_str = "\n".join(legs_lines) if legs_lines else "No legs"
+        # Format legs as string for display (use info_line from LegData)
+        legs_str = "\n".join(leg.info_line for leg in legs) if legs else "No legs"
 
         return {
             "legs": leg_infos,
@@ -635,6 +669,8 @@ class AppState(rx.State):
             "hwm_updated": metrics.hwm_updated,
             "trail_stop_price": metrics.trail_stop_price,
             "trail_limit_price": metrics.trail_limit_price,
+            "stop_pnl": metrics.stop_pnl,
+            "stop_pnl_str": metrics.stop_pnl_str,
         }
 
     def _get_trigger_value(self, metrics, trigger_price_type: str) -> float:
@@ -664,6 +700,22 @@ class AppState(rx.State):
 
     def toggle_group_active(self, group_id: str):
         """Toggle group monitoring on/off - places/cancels orders at TWS."""
+        import time as time_module
+
+        # === DOUBLE-CLICK PREVENTION ===
+        now = time_module.time()
+        if group_id in self._activation_in_progress:
+            last_activation = self._activation_in_progress[group_id]
+            if now - last_activation < 2.0:  # 2 second cooldown
+                logger.warning(f"Double-click prevented for group {group_id}")
+                self.status_message = "Please wait..."
+                return
+
+        # Mark activation in progress
+        new_progress = dict(self._activation_in_progress)
+        new_progress[group_id] = now
+        self._activation_in_progress = new_progress
+
         # Sync connection state and refresh positions
         self._sync_broker_state()
         group = GROUP_MANAGER.get(group_id)
@@ -681,6 +733,12 @@ class AppState(rx.State):
                 self.status_message = f"Deactivated: {group.name}"
             else:
                 # Activating - place orders at TWS
+                # SAFETY CHECK: Ensure group is not already active (prevent duplicate orders)
+                if group.trailing_order_id != 0:
+                    logger.warning(f"Group {group.name} already has order {group.trailing_order_id}, skipping activation")
+                    self.status_message = f"Group {group.name} already has active order"
+                    return
+
                 # Get current metrics for proper stop price calculation
                 metrics = self._calc_group_metrics(group.con_ids, group.position_quantities, group.trigger_price_type, group=group)
                 trigger_value = metrics.get("trigger_value", 0)
@@ -700,12 +758,18 @@ class AppState(rx.State):
                 )
 
                 # Calculate limit price if using limit order type
+                # Credit (BUY to close): limit = stop + offset (willing to pay more)
+                # Debit (SELL to close): limit = stop - offset (willing to accept less)
                 if group.stop_type == "limit":
-                    initial_limit_price = initial_stop_price - group.limit_offset
+                    if is_credit:
+                        initial_limit_price = initial_stop_price + group.limit_offset
+                    else:
+                        initial_limit_price = initial_stop_price - group.limit_offset
                 else:
                     initial_limit_price = 0.0  # Stop-Market has no limit
 
                 # Place OCA order group (using new app-controlled stop order)
+                # IMPORTANT: Keep sign for BAG contracts (credit spreads have negative prices)
                 order_result = BROKER.place_oca_group(
                     group_name=group.name,
                     position_quantities={int(k): v for k, v in group.position_quantities.items()},
@@ -713,8 +777,8 @@ class AppState(rx.State):
                     limit_offset=group.limit_offset,
                     time_exit_enabled=group.time_exit_enabled,
                     time_exit_time=group.time_exit_time,
-                    initial_stop_price=abs(initial_stop_price),
-                    initial_limit_price=abs(initial_limit_price) if initial_limit_price else 0.0,
+                    initial_stop_price=initial_stop_price,  # Keep sign for BAG contracts
+                    initial_limit_price=initial_limit_price if initial_limit_price else 0.0,
                     trigger_price_type=group.trigger_price_type,
                     is_credit=is_credit,  # BUY to close short, SELL to close long
                 )
@@ -724,8 +788,8 @@ class AppState(rx.State):
                     # Initialize rate limiting state
                     new_sent = dict(self.last_sent_stop_prices)
                     new_sent[group_id] = {
-                        "stop": abs(initial_stop_price),
-                        "limit": abs(initial_limit_price) if initial_limit_price else 0.0,
+                        "stop": initial_stop_price,  # Keep sign
+                        "limit": initial_limit_price if initial_limit_price else 0.0,
                         "timestamp": time.time()
                     }
                     self.last_sent_stop_prices = new_sent
@@ -1086,12 +1150,14 @@ class AppState(rx.State):
                     # Update HWM with is_credit flag for proper comparison
                     GROUP_MANAGER.update_hwm(g.id, trigger_value, is_credit=is_credit)
 
-                    # Check if stop triggered
+                    # Check if stop triggered (for logging only)
+                    # NOTE: We do NOT deactivate here! The IBKR order is the real stop.
+                    # The app only monitors and logs. IBKR decides when to execute.
                     if GROUP_MANAGER.check_stop_triggered(g.id, trigger_value, is_credit=is_credit):
-                        logger.warning(f"STOP TRIGGERED: {g.name} trigger=${trigger_value:.2f} "
+                        logger.warning(f"STOP NEAR: {g.name} trigger=${trigger_value:.2f} "
                                       f"stop=${g.stop_price:.2f} credit={is_credit}")
-                        self.status_message = f"STOP TRIGGERED: {g.name} at ${trigger_value:.2f}!"
-                        GROUP_MANAGER.deactivate(g.id)
+                        self.status_message = f"STOP NEAR: {g.name} at ${trigger_value:.2f}!"
+                        # DO NOT deactivate - let IBKR order handle it
 
                     # === APP-CONTROLLED TRAILING: Sync TWS order with current stop price ===
                     # Always check (rate limiting is inside the method)
@@ -1349,23 +1415,34 @@ class AppState(rx.State):
 
         # Use updated_hwm from metrics (falls back to current_hwm in state if not calculated)
         hwm = metrics.get("updated_hwm", 0) or state.get("current_hwm", 0)
-        stop_price = metrics.get("trail_stop_price", 0)
-        limit_price = metrics.get("trail_limit_price", 0)
+        is_credit = metrics.get("is_credit", False)
 
-        if hwm != 0:  # Allow negative HWM for credit spreads
-            state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm}
+        # Get group for trail settings
+        group = GROUP_MANAGER.get(group_id)
+        trail_mode = group.trail_mode if group else "percent"
+        trail_value = group.trail_value if group else 10.0
+        limit_offset = group.limit_offset if group else 0.0
 
+        # Store DISPLAY values for chart (use abs() for positive display)
+        if hwm != 0:
+            state["hwm_bars"][slot] = {"time": time_label, "hwm": abs(hwm)}
+
+            # Calculate stop/limit using central function, abs() for display
+            stop_price = calculate_stop_price(hwm, trail_mode, trail_value, is_credit)
             if stop_price != 0:
-                state["stop_bars"][slot] = {"time": time_label, "stop": stop_price}
+                state["stop_bars"][slot] = {"time": time_label, "stop": abs(stop_price)}
 
                 # Limit price (only for limit orders)
+                if is_credit:
+                    limit_price = stop_price + limit_offset
+                else:
+                    limit_price = stop_price - limit_offset
                 if limit_price != 0:
-                    state["limit_bars"][slot] = {"time": time_label, "limit": limit_price}
+                    state["limit_bars"][slot] = {"time": time_label, "limit": abs(limit_price)}
 
-                # Stop P&L calculation (for P&L chart)
-                total_cost = metrics.get("total_cost", 0)
-                if total_cost != 0:
-                    stop_pnl = stop_price - total_cost
+                # Stop P&L (calculated centrally in metrics)
+                stop_pnl = metrics.get("stop_pnl", 0)
+                if stop_pnl != 0:
                     state["stop_pnl_bars"][slot] = {"time": time_label, "stop_pnl": stop_pnl}
 
         state["tick_count"] += 1
@@ -1411,18 +1488,19 @@ class AppState(rx.State):
             return  # Too fast, skip this tick
 
         # Modify order at TWS
+        # IMPORTANT: Keep sign for BAG contracts (credit spreads have negative prices)
         success = BROKER.modify_stop_order(
             group.trailing_order_id,
-            abs(new_stop),
-            abs(new_limit) if new_limit else 0.0
+            new_stop,  # Keep sign
+            new_limit if new_limit else 0.0
         )
 
         if success:
             # Update rate limiting state
             new_sent = dict(self.last_sent_stop_prices)
             new_sent[group_id] = {
-                "stop": abs(new_stop),
-                "limit": abs(new_limit) if new_limit else 0.0,
+                "stop": new_stop,  # Keep sign
+                "limit": new_limit if new_limit else 0.0,
                 "timestamp": now
             }
             self.last_sent_stop_prices = new_sent
@@ -1465,9 +1543,10 @@ class AppState(rx.State):
                     # Get is_credit dynamically from metrics
                     metrics = self._calc_group_metrics(group.con_ids, group.position_quantities, group.trigger_price_type)
                     is_credit = metrics.get("is_credit", False)
-                    stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value, is_credit=is_credit)
-                    state["hwm_bars"][slot] = {"time": time_label, "hwm": hwm}
-                    state["stop_bars"][slot] = {"time": time_label, "stop": stop_price}
+                    # Store DISPLAY values for chart (abs for positive display)
+                    state["hwm_bars"][slot] = {"time": time_label, "hwm": abs(hwm)}
+                    stop_price = calculate_stop_price(hwm, group.trail_mode, group.trail_value, is_credit)
+                    state["stop_bars"][slot] = {"time": time_label, "stop": abs(stop_price)}
 
             # Advance slot (wrap around at 240)
             state["current_slot"] = (slot + 1) % 240
@@ -1516,11 +1595,18 @@ class AppState(rx.State):
                 "stop_type": group.stop_type,
                 "limit_offset": group.limit_offset,
                 "trigger_price_type": group.trigger_price_type,
-                # P&L chart calculation values
+                "is_credit": is_credit,
+                # Values from centralized metrics calculation
                 "total_cost": metrics.get("total_cost", 0.0),
                 "pnl_mark": metrics.get("pnl_mark", 0.0),
-                "trigger_value": metrics.get("trigger_value", 0.0),  # For stop_pnl calculation
-                "entry_price": metrics.get("entry_price", 0.0),  # Per-contract fill price
+                "entry_price": metrics.get("entry_price", 0.0),
+                "stop_pnl": metrics.get("stop_pnl", 0.0),
+                "trail_limit_price": metrics.get("trail_limit_price", 0.0),
+                "trigger_value": metrics.get("trigger_value", 0.0),
+                # Pre-formatted display strings (use abs for positive display)
+                "hwm_str": f"${abs(hwm):.2f}" if hwm != 0 else "-",
+                "stop_str": f"${abs(stop_price):.2f}" if stop_price != 0 else "-",
+                "limit_str": f"${abs(metrics.get('trail_limit_price', 0)):.2f}" if metrics.get("trail_limit_price", 0) != 0 else "-",
             }
 
         # Render position chart with stop/limit lines
@@ -1536,21 +1622,22 @@ class AppState(rx.State):
         if group_info:
             # Position OHLC header: Trigger value, Stop, Limit, HWM
             trigger_value = group_info.get("trigger_value", 0)
-            stop_price = group_info.get("stop_price", 0)
             hwm = group_info.get("high_water_mark", 0)
-            limit_offset = group_info.get("limit_offset", 0)
             stop_type = group_info.get("stop_type", "market")
             trigger_type = group_info.get("trigger_price_type", "mid")
 
             # Set trigger label (capitalize first letter)
             self.chart_trigger_label = trigger_type.capitalize()
 
-            self.chart_pos_close = f"${trigger_value:.2f}" if trigger_value != 0 else "-"
-            self.chart_pos_stop = f"${stop_price:.2f}" if stop_price != 0 else "-"
-            self.chart_pos_hwm = f"${hwm:.2f}" if hwm != 0 else "-"
-            if stop_type == "limit" and stop_price != 0:
-                limit_price = stop_price - limit_offset
-                self.chart_pos_limit = f"${limit_price:.2f}"
+            # Use display values from group_info (already formatted correctly)
+            self.chart_pos_close = f"${abs(trigger_value):.2f}" if trigger_value != 0 else "-"
+            self.chart_pos_stop = group_info.get("stop_str", "-")
+            self.chart_pos_hwm = group_info.get("hwm_str", "-")
+            # Set HWM/LWM label based on position type
+            is_credit = group_info.get("is_credit", False)
+            self.chart_hwm_label = "LWM" if is_credit else "HWM"
+            if stop_type == "limit":
+                self.chart_pos_limit = group_info.get("limit_str", "-")
             else:
                 self.chart_pos_limit = "-"
 
@@ -1559,24 +1646,12 @@ class AppState(rx.State):
             total_cost = group_info.get("total_cost", 0)
             entry_price = group_info.get("entry_price", 0)
             self.chart_pnl_current = f"${pnl_mark:.2f}" if pnl_mark != 0 else "$0.00"
-            # Fill/Entry price (per-contract, like bid/ask)
-            self.chart_pos_fill = f"${entry_price:.2f}" if entry_price != 0 else "-"
+            # Fill/Entry price (per-contract, like bid/ask) - use abs for display
+            self.chart_pos_fill = f"${abs(entry_price):.2f}" if entry_price != 0 else "-"
 
-            # Calculate stop P&L: (stop_price - entry_price) per-contract, then scale
-            # stop_price and entry_price are both per-contract values
-            # To get total P&L we need qty * multiplier from metrics
-            if stop_price != 0 and entry_price != 0:
-                # Per-contract P&L at stop level
-                per_contract_pnl = stop_price - entry_price
-                # Scale by total position (total_cost / entry_price gives qty * mult)
-                if entry_price != 0:
-                    scale = abs(total_cost / entry_price) if entry_price != 0 else 0
-                    stop_pnl = per_contract_pnl * scale
-                else:
-                    stop_pnl = 0
-                self.chart_pnl_stop = f"${stop_pnl:.2f}"
-            else:
-                self.chart_pnl_stop = "-"
+            # Stop P&L (calculated centrally in metrics)
+            stop_pnl = group_info.get("stop_pnl", 0)
+            self.chart_pnl_stop = f"${stop_pnl:.2f}" if stop_pnl != 0 else "-"
         else:
             # Reset headers
             self.chart_trigger_label = "Mid"
@@ -1584,6 +1659,7 @@ class AppState(rx.State):
             self.chart_pos_stop = "-"
             self.chart_pos_limit = "-"
             self.chart_pos_hwm = "-"
+            self.chart_hwm_label = "HWM"
             self.chart_pos_fill = "-"
             self.chart_pnl_current = "-"
             self.chart_pnl_stop = "-"
@@ -1603,6 +1679,7 @@ class AppState(rx.State):
         x_labels = self._generate_12h_labels(state["start_timestamp"])
 
         # Build arrays for ALL 240 slots (None for empty)
+        # Use abs() for display - credit spreads have negative internal values but we show positive
         open_vals = [None] * 240
         high_vals = [None] * 240
         low_vals = [None] * 240
@@ -1611,55 +1688,121 @@ class AppState(rx.State):
         # Fill in completed bars
         for i, bar in enumerate(state["position_bars"]):
             if bar is not None:
-                open_vals[i] = bar["open"]
-                high_vals[i] = bar["high"]
-                low_vals[i] = bar["low"]
-                close_vals[i] = bar["close"]
+                open_vals[i] = abs(bar["open"]) if bar["open"] is not None else None
+                high_vals[i] = abs(bar["high"]) if bar["high"] is not None else None
+                low_vals[i] = abs(bar["low"]) if bar["low"] is not None else None
+                close_vals[i] = abs(bar["close"]) if bar["close"] is not None else None
 
         # Add current (incomplete) bar at current_slot
         slot = state["current_slot"]
         if state["current_pos"]:
-            open_vals[slot] = state["current_pos"]["open"]
-            high_vals[slot] = state["current_pos"]["high"]
-            low_vals[slot] = state["current_pos"]["low"]
-            close_vals[slot] = state["current_pos"]["close"]
+            open_vals[slot] = abs(state["current_pos"]["open"]) if state["current_pos"]["open"] is not None else None
+            high_vals[slot] = abs(state["current_pos"]["high"]) if state["current_pos"]["high"] is not None else None
+            low_vals[slot] = abs(state["current_pos"]["low"]) if state["current_pos"]["low"] is not None else None
+            close_vals[slot] = abs(state["current_pos"]["close"]) if state["current_pos"]["close"] is not None else None
 
         # Check if we have any data
         if all(v is None for v in close_vals):
             return self._empty_figure("Collecting OHLC data...")
 
-        # Create candlestick chart with ALL 240 x values
-        fig = go.Figure(data=[go.Candlestick(
-            x=x_labels,  # All 240 labels
-            open=open_vals,
-            high=high_vals,
-            low=low_vals,
-            close=close_vals,
-            increasing_line_color='#00D26A',  # Profit green from theme
-            decreasing_line_color='#FF3B30',  # Loss red from theme
-            increasing_fillcolor='#00D26A',
-            decreasing_fillcolor='#FF3B30',
-            name="Position",
-        )])
+        # Get fill price and position type for profit/loss coloring
+        # Use abs() for comparison since display values are absolute
+        fill_price = abs(group_info.get("entry_price", 0)) if group_info else 0
+        is_credit = group_info.get("is_credit", False) if group_info else False
+
+        # Determine colors per bar based on profit/loss vs fill price
+        # All values are now positive (abs), so:
+        # Credit: close < fill = profit (closer to 0 = we pay less to buy back)
+        # Debit: close > fill = profit (value went up)
+        # Blue = current incomplete bar
+        colors = []
+        for i in range(240):
+            if close_vals[i] is None:
+                colors.append(None)
+            elif i == slot:
+                # Current incomplete bar - blue
+                colors.append('#3B82F6')  # Blue
+            elif fill_price != 0:
+                if is_credit:
+                    # Credit: profit when close < fill (closer to $0 = cheaper to buy back)
+                    # e.g., fill=$4.60, close=$3.00 → profit
+                    if close_vals[i] <= fill_price:
+                        colors.append('#00D26A')  # Green - profit
+                    else:
+                        colors.append('#FF3B30')  # Red - loss
+                else:
+                    # Debit: profit when close > fill (higher value)
+                    if close_vals[i] >= fill_price:
+                        colors.append('#00D26A')  # Green - profit
+                    else:
+                        colors.append('#FF3B30')  # Red - loss
+            else:
+                colors.append('#3B82F6')  # Blue - no fill price
+
+        # Create OHLC chart with custom colors using separate traces per color
+        fig = go.Figure()
+
+        # Add bars grouped by color
+        for color, color_name in [('#00D26A', 'Profit'), ('#FF3B30', 'Loss'), ('#3B82F6', 'Current')]:
+            mask_x = []
+            mask_open = []
+            mask_high = []
+            mask_low = []
+            mask_close = []
+            for i in range(240):
+                if colors[i] == color:
+                    mask_x.append(x_labels[i])
+                    mask_open.append(open_vals[i])
+                    mask_high.append(high_vals[i])
+                    mask_low.append(low_vals[i])
+                    mask_close.append(close_vals[i])
+
+            if mask_x:
+                fig.add_trace(go.Candlestick(
+                    x=mask_x,
+                    open=mask_open,
+                    high=mask_high,
+                    low=mask_low,
+                    close=mask_close,
+                    increasing_line_color=color,
+                    decreasing_line_color=color,
+                    increasing_fillcolor=color,
+                    decreasing_fillcolor=color,
+                    name=color_name,
+                    showlegend=False,
+                ))
 
         # === HISTORICAL LINES: Stop, Limit, HWM as time-series ===
         # Build arrays from historical bars + extend to future with current value
 
         # Get current values for extending into future
-        current_hwm = state.get("current_hwm_mid", 0)
+        # Use display values for chart (abs for positive display)
+        current_hwm = abs(state.get("current_hwm", 0))
         current_stop = 0
         current_limit = 0
+        is_credit = group_info.get("is_credit", False) if group_info else False
+        hwm_label = "LWM" if is_credit else "HWM"
         if group_info:
-            current_stop = group_info.get("stop_price", 0)
+            hwm = state.get("current_hwm", 0)
+            trail_mode = group_info.get("trail_mode", "percent")
+            trail_value = group_info.get("trail_value", 10.0)
+            limit_offset = group_info.get("limit_offset", 0)
+            stop_price = calculate_stop_price(hwm, trail_mode, trail_value, is_credit)
+            current_stop = abs(stop_price)
             if group_info.get("stop_type") == "limit":
-                current_limit = current_stop - group_info.get("limit_offset", 0)
+                if is_credit:
+                    limit_price = stop_price + limit_offset
+                else:
+                    limit_price = stop_price - limit_offset
+                current_limit = abs(limit_price)
 
-        # HWM line (green dotted)
+        # HWM line (cyan solid)
         hwm_vals = [None] * 240
         for i, bar in enumerate(state.get("hwm_bars", [])):
             if bar is not None:
-                hwm_vals[i] = bar.get("hwm")
-        # Fill future slots with current value (allow negative for credit spreads)
+                # Values are already stored as abs() - just read them
+                hwm_vals[i] = bar.get("hwm") if bar.get("hwm") else None
+        # Fill future slots with current value
         for i in range(slot + 1, 240):
             if current_hwm != 0:
                 hwm_vals[i] = current_hwm
@@ -1670,16 +1813,17 @@ class AppState(rx.State):
                 y=hwm_vals,
                 mode='lines',
                 line=dict(color='rgba(0, 191, 255, 0.8)', width=2),  # Cyan #00BFFF
-                name='HWM',
-                hovertemplate='HWM: $%{y:.2f}<extra></extra>',
+                name=hwm_label,
+                hovertemplate=f'{hwm_label}: $%{{y:.2f}}<extra></extra>',
             ))
 
         # Stop line (red solid, semi-transparent)
         stop_vals = [None] * 240
         for i, bar in enumerate(state.get("stop_bars", [])):
             if bar is not None:
-                stop_vals[i] = bar.get("stop")
-        # Fill future slots with current value (allow negative for credit spreads)
+                # Values are already stored as abs() - just read them
+                stop_vals[i] = bar.get("stop") if bar.get("stop") else None
+        # Fill future slots with current value
         for i in range(slot + 1, 240):
             if current_stop != 0:
                 stop_vals[i] = current_stop
@@ -1700,8 +1844,9 @@ class AppState(rx.State):
             limit_vals = [None] * 240
             for i, bar in enumerate(state.get("limit_bars", [])):
                 if bar is not None:
-                    limit_vals[i] = bar.get("limit")
-            # Fill future slots with current value (allow negative for credit spreads)
+                    # Values are already stored as abs() - just read them
+                    limit_vals[i] = bar.get("limit") if bar.get("limit") else None
+            # Fill future slots with current value
             for i in range(slot + 1, 240):
                 if current_limit != 0:
                     limit_vals[i] = current_limit
@@ -1716,8 +1861,21 @@ class AppState(rx.State):
                     hovertemplate='Limit: $%{y:.2f}<extra></extra>',
                 ))
 
+        # Fill price line (white dashed) - horizontal line at entry price
+        fill_vals = []
+        if fill_price != 0:
+            fill_vals = [fill_price] * 240
+            fig.add_trace(go.Scatter(
+                x=x_labels,
+                y=fill_vals,
+                mode='lines',
+                line=dict(color='rgba(255, 255, 255, 0.6)', width=1, dash='dash'),
+                name='Fill',
+                hovertemplate='Fill: $%{y:.2f}<extra></extra>',
+            ))
+
         # Calculate stable Y-range with 10% padding
-        all_y_vals = [v for v in low_vals + high_vals + hwm_vals + stop_vals + limit_vals if v is not None]
+        all_y_vals = [v for v in low_vals + high_vals + hwm_vals + stop_vals + limit_vals + fill_vals if v is not None]
         if all_y_vals:
             y_min = min(all_y_vals)
             y_max = max(all_y_vals)
@@ -1802,16 +1960,21 @@ class AppState(rx.State):
         # Build array from historical bars + extend to future with current value
 
         # Calculate current stop P&L for extending into future
-        # stop_price and entry_price are both per-contract values
-        # stop_pnl = (stop_price - entry_price) * scale
+        # Use same logic as metrics.py for consistency
         current_stop_pnl = None
         if group_info and group_info.get("stop_price", 0) != 0:
             stop_price = group_info["stop_price"]
             entry_price = group_info.get("entry_price", 0)
             total_cost = group_info.get("total_cost", 0)
+            is_credit = group_info.get("is_credit", False)
 
             if entry_price != 0:
-                per_contract_pnl = stop_price - entry_price
+                if is_credit:
+                    # Credit: profit if |stop| < |entry| (bought back cheaper)
+                    per_contract_pnl = abs(entry_price) - abs(stop_price)
+                else:
+                    # Debit: profit if stop > entry (sold higher)
+                    per_contract_pnl = stop_price - entry_price
                 scale = abs(total_cost / entry_price)
                 current_stop_pnl = per_contract_pnl * scale
 
