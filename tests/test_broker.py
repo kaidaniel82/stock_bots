@@ -51,103 +51,114 @@ class TestCalculateStopPriceAlwaysPositive:
 
 
 class TestOrderActionDetermination:
-    """Test that is_credit correctly determines order action (BUY vs SELL)."""
+    """Test order action determination for single-leg and multi-leg positions.
 
-    def test_long_position_is_not_credit(self):
-        """Long position: total_entry > 0 → is_credit = False → SELL to close."""
-        # Simulating: bought 5 contracts @ $10 = $5000 debit
-        total_entry = 5000.0  # Positive = paid
-        is_credit = total_entry < 0
-        assert is_credit is False
-        closing_action = "BUY" if is_credit else "SELL"
-        assert closing_action == "SELL"
+    Key insight from TWS manual testing:
+    - Single legs: BUY to close short, SELL to close long
+    - Multi-leg combos: ALWAYS SELL, price sign determines direction
+      - Debit spread: SELL @ +positive price
+      - Credit spread: SELL @ -negative price
+    """
 
-    def test_short_position_is_credit(self):
-        """Short position: total_entry < 0 → is_credit = True → BUY to close."""
-        # Simulating: sold 3 contracts @ $10 = $3000 credit
-        total_entry = -3000.0  # Negative = received
-        is_credit = total_entry < 0
-        assert is_credit is True
-        closing_action = "BUY" if is_credit else "SELL"
-        assert closing_action == "BUY"
+    def test_single_leg_long_position(self):
+        """Single leg long: SELL to close."""
+        is_credit = False  # Long = paid (debit)
+        is_multi_leg = False
 
-    def test_debit_spread_is_not_credit(self):
-        """Debit spread: total_entry > 0 → is_credit = False → SELL to close."""
-        # Simulating: +5 6800C @ $16.60, -5 6850C @ $12.00 = $4.60 * 5 * 100 = $2300 debit
-        total_entry = 2300.0  # Positive = paid
-        is_credit = total_entry < 0
-        assert is_credit is False
-        closing_action = "BUY" if is_credit else "SELL"
-        assert closing_action == "SELL"
+        if is_multi_leg:
+            action = "SELL"  # Always SELL for combos
+        else:
+            action = "BUY" if is_credit else "SELL"
 
-    def test_credit_spread_is_credit(self):
-        """Credit spread: total_entry < 0 → is_credit = True → BUY to close."""
-        # Simulating: -5 6800C @ $16.60, +5 6850C @ $12.00 = $4.60 * 5 * 100 = $2300 credit
-        total_entry = -2300.0  # Negative = received
-        is_credit = total_entry < 0
-        assert is_credit is True
-        closing_action = "BUY" if is_credit else "SELL"
-        assert closing_action == "BUY"
+        assert action == "SELL"
+
+    def test_single_leg_short_position(self):
+        """Single leg short: BUY to close."""
+        is_credit = True  # Short = received (credit)
+        is_multi_leg = False
+
+        if is_multi_leg:
+            action = "SELL"  # Always SELL for combos
+        else:
+            action = "BUY" if is_credit else "SELL"
+
+        assert action == "BUY"
+
+    def test_multi_leg_debit_spread(self):
+        """Multi-leg debit spread: SELL @ positive price."""
+        is_credit = False  # Debit spread
+        is_multi_leg = True
+        base_stop_price = 4.60  # Positive
+
+        # Action is always SELL for multi-leg
+        action = "SELL"
+
+        # Price sign: positive for debit
+        stop_price_for_order = base_stop_price if not is_credit else -base_stop_price
+
+        assert action == "SELL"
+        assert stop_price_for_order > 0, "Debit spread uses positive price"
+
+    def test_multi_leg_credit_spread(self):
+        """Multi-leg credit spread: SELL @ negative price."""
+        is_credit = True  # Credit spread
+        is_multi_leg = True
+        base_stop_price = 4.60  # Base is always positive from calculate_stop_price
+
+        # Action is always SELL for multi-leg
+        action = "SELL"
+
+        # Price sign: negative for credit (SELL @ -$X = pay to close)
+        if is_multi_leg and is_credit:
+            stop_price_for_order = -abs(base_stop_price)
+        else:
+            stop_price_for_order = abs(base_stop_price)
+
+        assert action == "SELL"
+        assert stop_price_for_order < 0, "Credit spread uses negative price"
+        assert stop_price_for_order == -4.60
 
 
 class TestLegActionInversion:
-    """Test leg action inversion logic for BAG SELL orders.
+    """Test leg action inversion logic for BAG orders.
 
-    IBKR automatically inverts all leg actions when you SELL a BAG (combo) order.
-    We pre-invert to compensate, so the final result is correct.
+    Key insight: ALL multi-leg combos use SELL order.
+    IBKR automatically inverts all leg actions when you SELL a BAG (combo).
+    We ALWAYS pre-invert for multi-leg to compensate.
     """
 
-    def test_debit_spread_sell_requires_inversion(self):
-        """Debit spread closing: SELL order → invert_legs = True."""
-        is_credit = False
-        action = "BUY" if is_credit else "SELL"
-        is_multi_leg = True  # Spread has multiple legs
+    def test_all_multi_leg_combos_use_sell(self):
+        """ALL multi-leg combos use SELL order (price sign determines credit/debit)."""
+        for is_credit in [True, False]:
+            is_multi_leg = True
+            action = "SELL"  # Always SELL for multi-leg
+            invert_legs = is_multi_leg  # Always True for multi-leg
 
-        invert_legs = is_multi_leg and action == "SELL"
-
-        assert action == "SELL", "Debit spread closes with SELL"
-        assert invert_legs is True, "SELL on multi-leg requires leg inversion"
-
-    def test_credit_spread_buy_no_inversion(self):
-        """Credit spread closing: BUY order → invert_legs = False."""
-        is_credit = True
-        action = "BUY" if is_credit else "SELL"
-        is_multi_leg = True  # Spread has multiple legs
-
-        invert_legs = is_multi_leg and action == "SELL"
-
-        assert action == "BUY", "Credit spread closes with BUY"
-        assert invert_legs is False, "BUY order does not need leg inversion"
+            assert action == "SELL"
+            assert invert_legs is True
 
     def test_single_leg_no_inversion(self):
         """Single leg orders never need inversion (not a BAG)."""
-        is_credit = False  # Long position
-        action = "BUY" if is_credit else "SELL"
-        is_multi_leg = False  # Single leg
+        is_multi_leg = False
 
-        invert_legs = is_multi_leg and action == "SELL"
+        # Single leg: inversion never needed
+        invert_legs = is_multi_leg
 
         assert invert_legs is False, "Single leg never needs inversion"
 
-    def test_leg_action_calculation_with_inversion(self):
-        """Test pre-inverted leg action calculation for SELL order."""
-        # Debit spread: +5 long, -5 short
-        # Closing with SELL → need to pre-invert
-
+    def test_debit_spread_leg_actions(self):
+        """Test leg actions for debit spread (SELL @ positive price)."""
+        # Bull Call Spread: +5 lower strike, -5 higher strike
         position_quantities = {
             101: 5,   # Long leg (positive qty)
             102: -5,  # Short leg (negative qty)
         }
-        invert_leg_actions = True  # For SELL order
+        invert_leg_actions = True  # Always True for multi-leg SELL
 
         leg_actions = {}
         for con_id, qty in position_quantities.items():
-            if invert_leg_actions:
-                # Pre-inverted: long gets BUY (so IBKR inverts to SELL)
-                action = "BUY" if qty > 0 else "SELL"
-            else:
-                # Normal: long gets SELL to close
-                action = "SELL" if qty > 0 else "BUY"
+            # Pre-inverted: long gets BUY (so IBKR inverts to SELL)
+            action = "BUY" if qty > 0 else "SELL"
             leg_actions[con_id] = action
 
         # After IBKR inverts (because we're doing BAG SELL):
@@ -156,31 +167,26 @@ class TestLegActionInversion:
         assert leg_actions[101] == "BUY", "Long leg pre-inverted to BUY"
         assert leg_actions[102] == "SELL", "Short leg pre-inverted to SELL"
 
-    def test_leg_action_calculation_without_inversion(self):
-        """Test normal leg action calculation for BUY order."""
-        # Credit spread: -5 short, +5 long
-        # Closing with BUY → no pre-inversion needed
-
+    def test_credit_spread_leg_actions(self):
+        """Test leg actions for credit spread (SELL @ negative price)."""
+        # Bear Call Spread: -5 lower strike, +5 higher strike
         position_quantities = {
             101: -5,  # Short leg (negative qty)
             102: 5,   # Long leg (positive qty)
         }
-        invert_leg_actions = False  # For BUY order
+        invert_leg_actions = True  # Always True for multi-leg SELL
 
         leg_actions = {}
         for con_id, qty in position_quantities.items():
-            if invert_leg_actions:
-                action = "BUY" if qty > 0 else "SELL"
-            else:
-                # Normal: short gets BUY to close, long gets SELL
-                action = "SELL" if qty > 0 else "BUY"
+            # Pre-inverted: long gets BUY (so IBKR inverts to SELL)
+            action = "BUY" if qty > 0 else "SELL"
             leg_actions[con_id] = action
 
-        # BUY order, no inversion:
-        # Leg 101 (short): BUY (closes short) ✓
-        # Leg 102 (long): SELL (closes long) ✓
-        assert leg_actions[101] == "BUY", "Short leg gets BUY to close"
-        assert leg_actions[102] == "SELL", "Long leg gets SELL to close"
+        # After IBKR inverts (because we're doing BAG SELL):
+        # Leg 101 (short): SELL → BUY (closes short) ✓
+        # Leg 102 (long): BUY → SELL (closes long) ✓
+        assert leg_actions[101] == "SELL", "Short leg pre-inverted to SELL"
+        assert leg_actions[102] == "BUY", "Long leg pre-inverted to BUY"
 
 
 class TestStopPriceEdgeCases:

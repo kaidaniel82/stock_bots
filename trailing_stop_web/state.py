@@ -1469,6 +1469,15 @@ class AppState(rx.State):
         if new_stop == 0:
             return  # No valid stop price calculated
 
+        # For multi-leg combos: apply price sign
+        # Credit spread: negative price (SELL @ -$X = pay to close)
+        # Debit spread: positive price (SELL @ +$X = receive to close)
+        is_multi_leg = len(group.position_quantities) > 1
+        if is_multi_leg and group.is_credit:
+            new_stop = -abs(new_stop)
+            if new_limit:
+                new_limit = -abs(new_limit)
+
         # Rate limiting: check last sent values
         last_sent = self.last_sent_stop_prices.get(group_id, {})
         last_stop = last_sent.get("stop", 0)

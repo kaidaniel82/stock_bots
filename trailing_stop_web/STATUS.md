@@ -135,9 +135,16 @@ Bei SELL Orders auf BAG Contracts invertiert IBKR alle Leg Actions.
 - Wir pre-invertieren bei SELL: Leg Actions = BUY 6000C, SELL 6050C
 - IBKR invertiert nochmal: SELL 6000C, BUY 6050C ← RICHTIG!
 
+**WICHTIG (2025-12-08 Update):**
+Durch manuelles Testen in TWS wurde festgestellt:
+- **ALLE Combo Closing Orders verwenden SELL**
+- **Preis-Vorzeichen bestimmt Credit/Debit:**
+  - Debit Spread: SELL @ +$X.XX (positiver Preis = erhalten)
+  - Credit Spread: SELL @ -$X.XX (negativer Preis = zahlen)
+
 **Test:**
-- [x] Debit Spread SELL Order → Legs korrekt (Unit Tests + E2E)
-- [x] Credit Spread BUY Order → Legs korrekt (keine Inversion)
+- [x] Debit Spread SELL Order → Legs korrekt, positiver Preis
+- [x] Credit Spread SELL Order → Legs korrekt, negativer Preis
 
 ---
 
@@ -151,7 +158,8 @@ Bei SELL Orders auf BAG Contracts invertiert IBKR alle Leg Actions.
 
 ### Refactoring (nach Tests)
 - [x] `calculate_stop_price()` - bereits korrekt importiert aus metrics.py in groups.py
-- [x] Vorzeichen-Konsistenz in broker.py - `abs()` hinzugefügt für auxPrice/lmtPrice
+- [x] Vorzeichen-Konsistenz in broker.py - `abs()` ENTFERNT für auxPrice/lmtPrice (Combos brauchen negative Preise!)
+- [x] Combo Orders: Immer SELL, Preis-Vorzeichen bestimmt Credit/Debit
 - [ ] Display-Funktionen vereinfachen (nur `abs()` bei String-Formatierung)
 
 ---
@@ -160,13 +168,14 @@ Bei SELL Orders auf BAG Contracts invertiert IBKR alle Leg Actions.
 
 ### Unit Tests (2025-12-08)
 
-**71 Tests bestanden** (`tests/test_broker.py` + `tests/test_metrics.py`)
+**70 Tests bestanden** (`tests/test_broker.py` + `tests/test_metrics.py`)
 
 | Test-Kategorie | Status | Beschreibung |
 |----------------|--------|--------------|
 | `calculate_stop_price` | ✅ | Stop-Preis immer positiv (für IBKR) |
-| Order Action Detection | ✅ | Long→SELL, Short→BUY, Debit→SELL, Credit→BUY |
-| Leg Action Inversion | ✅ | BAG SELL pre-invertiert, BUY normal |
+| Order Action - Single | ✅ | Long→SELL, Short→BUY |
+| Order Action - Combo | ✅ | IMMER SELL, Preis-Vorzeichen bestimmt Credit/Debit |
+| Leg Action Inversion | ✅ | IMMER pre-invertiert für Multi-Leg (alle SELL) |
 | Stop Trigger Direction | ✅ | Debit: below HWM, Credit: above LWM |
 | P&L Calculations | ✅ | Single legs, spreads, ratios |
 | Greek Aggregation | ✅ | Position-weighted deltas |

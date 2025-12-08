@@ -41,6 +41,8 @@ class PortfolioPosition:
     combo_legs: list = field(default_factory=list)
     # Raw contract for debugging
     raw_contract: Contract = None
+    # Exchange for order routing (from contract)
+    exchange: str = "SMART"
     # Trading hours info (from ContractDetails)
     trading_hours: str = ""  # Raw string from TWS
     liquid_hours: str = ""   # Liquid hours from TWS
@@ -302,6 +304,11 @@ class TWSBroker:
             self._notify_status("Connected")
             logger.success("Connected to TWS")
 
+            # Register error event handler to capture TWS error messages
+            def on_error(reqId, errorCode, errorString, contract):
+                logger.warning(f"TWS Error [{errorCode}]: {errorString} (reqId={reqId}, contract={contract})")
+            self.ib.errorEvent += on_error
+
             # Clear trading hours cache on connect (force refresh)
             self._trading_hours_cache.clear()
             self._last_cache_date = datetime.now().strftime('%Y%m%d')
@@ -478,6 +485,9 @@ class TWSBroker:
                     "action": leg.action,
                 })
 
+        # Determine exchange for order routing (prefer primaryExchange)
+        position_exchange = contract.primaryExchange or contract.exchange or "SMART"
+
         # Always update position
         pos = PortfolioPosition(
             con_id=contract.conId,
@@ -494,6 +504,7 @@ class TWSBroker:
             is_combo=is_combo,
             combo_legs=combo_legs,
             raw_contract=contract,
+            exchange=position_exchange,
         )
         self._positions[contract.conId] = pos
 
@@ -862,6 +873,7 @@ class TWSBroker:
         # Multi-leg combo
         combo_legs = []
         symbol = None
+        exchange = None  # Will be determined from first leg's position
 
         for con_id, qty in position_quantities.items():
             pos = self._positions.get(con_id)
@@ -871,6 +883,9 @@ class TWSBroker:
 
             if symbol is None:
                 symbol = pos.symbol
+                # Get exchange from position (set during portfolio load)
+                exchange = pos.exchange or "SMART"
+                logger.debug(f"Using exchange from position: {exchange}")
             elif pos.symbol != symbol:
                 logger.error(f"All legs must have same underlying: {symbol} vs {pos.symbol}")
                 return None
@@ -888,23 +903,15 @@ class TWSBroker:
                 # For BUY order: normal leg actions
                 action = "SELL" if qty > 0 else "BUY"
 
+            # Use the determined exchange for all legs
             leg = ComboLeg(
                 conId=con_id,
                 ratio=abs(qty),
                 action=action,
-                exchange="SMART"
+                exchange=exchange
             )
             combo_legs.append(leg)
-            logger.info(f"ComboLeg: conId={con_id} qty={qty} ratio={abs(qty)} action={action}")
-
-        # Determine exchange - SPX options trade on CBOE
-        if symbol == "SPX":
-            exchange = "CBOE"
-            # Also update leg exchanges
-            for leg in combo_legs:
-                leg.exchange = "CBOE"
-        else:
-            exchange = "SMART"
+            logger.info(f"ComboLeg: conId={con_id} qty={qty} ratio={abs(qty)} action={action} exchange={exchange}")
 
         combo = Contract(
             secType="BAG",
@@ -1162,9 +1169,9 @@ class TWSBroker:
             order.totalQuantity = abs(quantity)
 
             # Get price increment based on actual price level and round
-            # IMPORTANT: auxPrice must be POSITIVE for IBKR (order action determines direction)
+            # For combos: auxPrice can be NEGATIVE (credit spreads use SELL @ negative price)
             stop_increment = self._get_price_increment(contract, abs(stop_price))
-            stop_price_rounded = self._round_to_tick(abs(stop_price), stop_increment)
+            stop_price_rounded = self._round_to_tick(stop_price, stop_increment)
 
             if limit_price == 0 or limit_price is None:
                 # Stop-Market Order
@@ -1172,9 +1179,9 @@ class TWSBroker:
                 order.auxPrice = stop_price_rounded
             else:
                 # Stop-Limit Order - limit price may have different increment
-                # IMPORTANT: lmtPrice must be POSITIVE for IBKR (order action determines direction)
+                # For combos: lmtPrice can be NEGATIVE (credit spreads use SELL @ negative price)
                 limit_increment = self._get_price_increment(contract, abs(limit_price))
-                limit_price_rounded = self._round_to_tick(abs(limit_price), limit_increment)
+                limit_price_rounded = self._round_to_tick(limit_price, limit_increment)
                 order.orderType = "STP LMT"
                 order.auxPrice = stop_price_rounded
                 order.lmtPrice = limit_price_rounded
@@ -1256,22 +1263,24 @@ class TWSBroker:
                 return False
 
             # Check if prices actually changed (avoid unnecessary modifications)
-            stop_changed = abs(order.auxPrice - abs(new_stop_price)) >= 0.01
-            limit_changed = (new_limit_price > 0 and
+            # For combos, new_stop_price may be negative (credit spreads)
+            stop_changed = abs(order.auxPrice - new_stop_price) >= 0.01
+            limit_changed = (new_limit_price != 0 and
                            hasattr(order, 'lmtPrice') and
-                           abs(order.lmtPrice - abs(new_limit_price)) >= 0.01)
+                           abs(order.lmtPrice - new_limit_price) >= 0.01)
 
             if not stop_changed and not limit_changed:
                 return True  # No change needed
 
             # Get price increment based on actual price level and round
+            # Preserve sign for combo credit spreads
             stop_increment = self._get_price_increment(trade.contract, abs(new_stop_price))
 
-            # Update prices
-            order.auxPrice = self._round_to_tick(abs(new_stop_price), stop_increment)
-            if new_limit_price > 0:
+            # Update prices (preserve sign for combos)
+            order.auxPrice = self._round_to_tick(new_stop_price, stop_increment)
+            if new_limit_price != 0:
                 limit_increment = self._get_price_increment(trade.contract, abs(new_limit_price))
-                order.lmtPrice = self._round_to_tick(abs(new_limit_price), limit_increment)
+                order.lmtPrice = self._round_to_tick(new_limit_price, limit_increment)
 
             # Re-place the order (ib_insync handles modification)
             self.ib.placeOrder(trade.contract, order)
@@ -1376,19 +1385,23 @@ class TWSBroker:
             # Log input for debugging
             logger.info(f"place_oca_group: position_quantities={position_quantities} is_credit={is_credit}")
 
-            # Determine order action first (needed for building contract)
-            # Stop trigger direction:
-            # - BUY Stop: triggers when price RISES above stop (for credit - close when losing)
-            # - SELL Stop: triggers when price FALLS below stop (for debit - close when losing)
+            # Determine order action
+            # For combos: ALWAYS use SELL with price sign determining direction:
+            # - Debit spread: SELL @ +positive price (receive money)
+            # - Credit spread: SELL @ -negative price (pay money to close)
             #
-            # Single-leg: BUY to close short, SELL to close long
-            # Multi-leg: Same logic, but need to handle IBKR's leg action inversion
-            action = "BUY" if is_credit else "SELL"
-
-            # For BAG contracts with SELL action, IBKR inverts all leg actions
-            # So we pre-invert them in build_combo_contract to get correct behavior
+            # For single-leg: use traditional BUY/SELL based on position
             is_multi_leg = len(position_quantities) > 1
-            invert_legs = is_multi_leg and action == "SELL"
+
+            if is_multi_leg:
+                # Combos: Always SELL, price sign determines credit/debit
+                action = "SELL"
+                # Always invert leg actions for SELL order (IBKR inverts them back)
+                invert_legs = True
+            else:
+                # Single leg: BUY to close short, SELL to close long
+                action = "BUY" if is_credit else "SELL"
+                invert_legs = False
 
             # Build contract
             contract = self.build_combo_contract(position_quantities, invert_leg_actions=invert_legs)
@@ -1410,25 +1423,42 @@ class TWSBroker:
             # Get trigger method from trigger_price_type
             trigger_method = self.get_trigger_method(trigger_price_type)
 
+            # For combos: price sign determines direction
+            # Credit spread: SELL @ -negative price (pay to close)
+            # Debit spread: SELL @ +positive price (receive to close)
+            if is_multi_leg and is_credit:
+                # Credit combo: use negative price
+                stop_price_for_order = -abs(initial_stop_price)
+            else:
+                # Debit combo or single leg: use positive price
+                stop_price_for_order = abs(initial_stop_price)
+
             # Calculate limit price based on stop_type
             if stop_type == "market":
                 limit_price = 0.0  # STP order (no limit)
             else:
                 # STP LMT order - use provided limit price or calculate fallback
-                # Credit (BUY to close): limit = stop + offset
-                # Debit (SELL to close): limit = stop - offset
+                # For combos, limit follows same sign convention as stop
                 if initial_limit_price > 0:
-                    limit_price = initial_limit_price
+                    base_limit = initial_limit_price
                 elif is_credit:
-                    limit_price = initial_stop_price + limit_offset
+                    # Credit: limit worse than stop (pay more) = more negative
+                    base_limit = abs(initial_stop_price) + limit_offset
                 else:
-                    limit_price = initial_stop_price - limit_offset
+                    # Debit: limit worse than stop (receive less) = less positive
+                    base_limit = abs(initial_stop_price) - limit_offset
+
+                # Apply sign for combos
+                if is_multi_leg and is_credit:
+                    limit_price = -abs(base_limit)
+                else:
+                    limit_price = abs(base_limit)
 
             # Place app-controlled stop order (STP or STP LMT)
             stop_trade = self.place_stop_order(
                 contract=contract,
                 quantity=total_qty,
-                stop_price=initial_stop_price,
+                stop_price=stop_price_for_order,
                 limit_price=limit_price,
                 oca_group=oca_group,
                 action=action,
