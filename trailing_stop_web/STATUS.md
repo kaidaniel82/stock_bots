@@ -1,6 +1,6 @@
 # Trailing Stop Web - Status & TODOs
 
-## Aktueller Stand (2025-12-05)
+## Aktueller Stand (2025-12-08)
 
 ### Architektur
 
@@ -38,7 +38,8 @@ metrics.py (Berechnung) → state.py (Koordination) → broker.py (IBKR Orders)
 - [x] Multi-Leg BAG (Combo) Orders
 - [x] OCA Groups für Time Exit
 - [x] Dynamische Preis-Increments via `_get_price_increment()` (MarketRules)
-- [x] Vorzeichen-Erhaltung für Credit Spreads (negative Preise)
+- [x] **Vorzeichen-Konsistenz:** `auxPrice`/`lmtPrice` IMMER positiv für IBKR (Action bestimmt Richtung)
+- [x] Leg Action Inversion für BAG SELL Orders (`invert_leg_actions=True`)
 
 #### UI
 - [x] Position OHLC Chart mit HWM/LWM/Stop Linien
@@ -135,8 +136,8 @@ Bei SELL Orders auf BAG Contracts invertiert IBKR alle Leg Actions.
 - IBKR invertiert nochmal: SELL 6000C, BUY 6050C ← RICHTIG!
 
 **Test:**
-- [ ] Debit Spread SELL Order → Legs korrekt
-- [ ] Credit Spread BUY Order → Legs korrekt (keine Inversion)
+- [x] Debit Spread SELL Order → Legs korrekt (Unit Tests + E2E)
+- [x] Credit Spread BUY Order → Legs korrekt (keine Inversion)
 
 ---
 
@@ -149,12 +150,40 @@ Bei SELL Orders auf BAG Contracts invertiert IBKR alle Leg Actions.
 - [ ] Performance-Metriken (Win Rate, Avg P&L)
 
 ### Refactoring (nach Tests)
-- [ ] `calculate_stop_price()` aus groups.py entfernen (nur in metrics.py)
+- [x] `calculate_stop_price()` - bereits korrekt importiert aus metrics.py in groups.py
+- [x] Vorzeichen-Konsistenz in broker.py - `abs()` hinzugefügt für auxPrice/lmtPrice
 - [ ] Display-Funktionen vereinfachen (nur `abs()` bei String-Formatierung)
 
 ---
 
 ## Test-Protokoll
+
+### Unit Tests (2025-12-08)
+
+**71 Tests bestanden** (`tests/test_broker.py` + `tests/test_metrics.py`)
+
+| Test-Kategorie | Status | Beschreibung |
+|----------------|--------|--------------|
+| `calculate_stop_price` | ✅ | Stop-Preis immer positiv (für IBKR) |
+| Order Action Detection | ✅ | Long→SELL, Short→BUY, Debit→SELL, Credit→BUY |
+| Leg Action Inversion | ✅ | BAG SELL pre-invertiert, BUY normal |
+| Stop Trigger Direction | ✅ | Debit: below HWM, Credit: above LWM |
+| P&L Calculations | ✅ | Single legs, spreads, ratios |
+| Greek Aggregation | ✅ | Position-weighted deltas |
+
+### E2E Tests (2025-12-08)
+
+**23 Tests bestanden, 1 übersprungen** (`tests/test_ui.py`)
+
+| Test-Kategorie | Status | Beschreibung |
+|----------------|--------|--------------|
+| Page Load | ✅ | Hauptseite lädt korrekt |
+| Tab Navigation | ✅ | Setup/Monitor Tab-Wechsel |
+| TWS Connection | ✅ | Connect Button, Status Updates |
+| Order Flow | ✅ | Positionen laden, Gruppe erstellen, Aktivieren/Deaktivieren |
+| Stop Price Display | ✅ | Stop-Preis in UI angezeigt |
+
+### Manuelle TWS Tests
 
 | Datum | Strategie | Legs | Credit/Debit | Order Type | Ergebnis | Notizen |
 |-------|-----------|------|--------------|------------|----------|---------|

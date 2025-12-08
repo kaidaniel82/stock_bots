@@ -1162,9 +1162,9 @@ class TWSBroker:
             order.totalQuantity = abs(quantity)
 
             # Get price increment based on actual price level and round
-            # IMPORTANT: Preserve sign for BAG contracts (credit spreads have negative prices)
+            # IMPORTANT: auxPrice must be POSITIVE for IBKR (order action determines direction)
             stop_increment = self._get_price_increment(contract, abs(stop_price))
-            stop_price_rounded = self._round_to_tick(stop_price, stop_increment)
+            stop_price_rounded = self._round_to_tick(abs(stop_price), stop_increment)
 
             if limit_price == 0 or limit_price is None:
                 # Stop-Market Order
@@ -1172,9 +1172,9 @@ class TWSBroker:
                 order.auxPrice = stop_price_rounded
             else:
                 # Stop-Limit Order - limit price may have different increment
-                # IMPORTANT: Preserve sign for BAG contracts
+                # IMPORTANT: lmtPrice must be POSITIVE for IBKR (order action determines direction)
                 limit_increment = self._get_price_increment(contract, abs(limit_price))
-                limit_price_rounded = self._round_to_tick(limit_price, limit_increment)
+                limit_price_rounded = self._round_to_tick(abs(limit_price), limit_increment)
                 order.orderType = "STP LMT"
                 order.auxPrice = stop_price_rounded
                 order.lmtPrice = limit_price_rounded
