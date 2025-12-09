@@ -9,7 +9,7 @@ def main2():
     spx_con_ids = [834873648, 834873658]
     # ⚠️ conId-Werte durch echte Contract-IDs deiner Legs ersetzen!
     leg1 = ComboLeg(conId=spx_con_ids[0], ratio=1, action='BUY', exchange='SMART')
-    leg2 = ComboLeg(conId=spx_con_ids[2], ratio=1, action='SELL', exchange='SMART')
+    leg2 = ComboLeg(conId=spx_con_ids[1], ratio=1, action='SELL', exchange='SMART')
 
     combo = Contract(
         symbol='SPY',  # nur symbolisch; muss zu den Legs passen
