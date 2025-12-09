@@ -17,7 +17,8 @@ util.logToFile(str(IB_LOG_FILE), level=logging.DEBUG)
 from .config import (
     TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
     BROKER_UPDATE_INTERVAL, VERBOSE_PORTFOLIO_UPDATES, LOG_ONLY_CHANGES,
-    RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY, RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_ATTEMPTS
+    RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY, RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_ATTEMPTS,
+    HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT
 )
 from .logger import logger
 
@@ -256,6 +257,12 @@ class TWSBroker:
         self._auto_reconnect = True
         self._connection_status_callback: Optional[Callable[[str], None]] = None
 
+        # Connection metrics for watchdog
+        self._connect_time: Optional[float] = None  # Timestamp when connected
+        self._last_heartbeat: Optional[float] = None  # Last successful heartbeat
+        self._reconnect_count: int = 0  # Total reconnects since start
+        self._last_disconnect_reason: str = ""  # Why we disconnected
+
         # Trading hours cache: {symbol: {date: str, trading_hours: str, liquid_hours: str, time_zone_id: str}}
         # Cached per symbol (not per position) and invalidated on date change or at midnight
         self._trading_hours_cache: dict[str, dict] = {}
@@ -308,6 +315,14 @@ class TWSBroker:
             self._connected = True
             self._reconnect_attempt = 0
             self._reconnect_delay = RECONNECT_INITIAL_DELAY
+
+            # Update connection metrics
+            import time
+            self._connect_time = time.time()
+            self._last_heartbeat = time.time()
+            if self._reconnect_count > 0:
+                logger.info(f"Reconnected (total reconnects: {self._reconnect_count})")
+
             self._notify_status("Connected")
             logger.success("Connected to TWS")
 
@@ -358,15 +373,21 @@ class TWSBroker:
         self._last_cache_date = today
 
     def _run_connected_loop(self):
-        """Main loop while connected - monitors connection and fetches data."""
+        """Main loop while connected - monitors connection and fetches data.
+
+        Includes heartbeat watchdog that sends reqCurrentTime() every HEARTBEAT_INTERVAL
+        to detect silent disconnects (network issues, TWS crashes).
+        """
         import time
         last_fetch = time.time()
+        last_heartbeat_check = time.time()
 
         while self._connected and not self._stop_requested:
             self.ib.sleep(0.1)  # Process IB events
 
             if not self.ib.isConnected():
-                logger.warning("TWS connection lost")
+                self._last_disconnect_reason = "ib.isConnected() returned False"
+                logger.warning(f"TWS connection lost: {self._last_disconnect_reason}")
                 self._connected = False
                 self._notify_status("Connection lost")
                 break
@@ -374,17 +395,49 @@ class TWSBroker:
             # Check for midnight and clear trading hours cache
             self._check_midnight_cache_clear()
 
-            # Fetch portfolio at interval
             now = time.time()
+
+            # Heartbeat watchdog: send reqCurrentTime every HEARTBEAT_INTERVAL
+            if now - last_heartbeat_check >= HEARTBEAT_INTERVAL:
+                if not self._send_heartbeat():
+                    self._last_disconnect_reason = "Heartbeat timeout"
+                    logger.warning(f"TWS connection lost: {self._last_disconnect_reason}")
+                    self._connected = False
+                    self._notify_status("Connection lost (heartbeat timeout)")
+                    break
+                last_heartbeat_check = now
+
+            # Fetch portfolio at interval
             if now - last_fetch >= BROKER_UPDATE_INTERVAL:
                 self._fetch_portfolio()
                 last_fetch = now
+
+    def _send_heartbeat(self) -> bool:
+        """Send heartbeat to TWS and verify response.
+
+        Uses reqCurrentTime() which is lightweight and always available.
+        Returns True if heartbeat succeeded, False on timeout.
+        """
+        import time
+        try:
+            # reqCurrentTime is async-aware in ib_insync event loop
+            server_time = self.ib.reqCurrentTime()
+            if server_time is not None:
+                self._last_heartbeat = time.time()
+                return True
+            else:
+                logger.warning("Heartbeat: reqCurrentTime returned None")
+                return False
+        except Exception as e:
+            logger.warning(f"Heartbeat failed: {e}")
+            return False
 
     def _handle_reconnection(self):
         """Handle reconnection with exponential backoff."""
         import time
 
         self._reconnect_attempt += 1
+        self._reconnect_count += 1  # Track total reconnects
         delay = min(self._reconnect_delay, RECONNECT_MAX_DELAY)
 
         # Check max attempts (0 = unlimited)
@@ -394,7 +447,8 @@ class TWSBroker:
             self._stop_requested = True
             return
 
-        logger.info(f"Reconnecting in {delay}s (attempt {self._reconnect_attempt})...")
+        max_str = f"/{RECONNECT_MAX_ATTEMPTS}" if RECONNECT_MAX_ATTEMPTS > 0 else ""
+        logger.info(f"Reconnecting in {delay}s (attempt {self._reconnect_attempt}{max_str})...")
 
         # Wait with countdown (check stop_requested periodically)
         start = time.time()
@@ -402,7 +456,9 @@ class TWSBroker:
             if self._stop_requested:
                 return
             remaining = int(delay - (time.time() - start))
-            self._notify_status(f"Reconnecting in {remaining}s...")
+            # Enhanced status: show attempt number and reason
+            reason_hint = f" ({self._last_disconnect_reason})" if self._last_disconnect_reason else ""
+            self._notify_status(f"Reconnecting in {remaining}s (#{self._reconnect_attempt}{max_str}){reason_hint}")
             time.sleep(1)
 
         # Disconnect cleanly before reconnecting
@@ -431,6 +487,26 @@ class TWSBroker:
     def set_connection_status_callback(self, callback: Callable[[str], None]) -> None:
         """Set callback for connection status changes."""
         self._connection_status_callback = callback
+
+    def get_connection_metrics(self) -> dict:
+        """Get connection metrics for monitoring/debugging.
+
+        Returns dict with:
+        - connected: bool
+        - uptime_seconds: float (0 if not connected)
+        - reconnect_count: int (total since broker start)
+        - last_heartbeat_ago: float (seconds since last heartbeat, None if never)
+        - last_disconnect_reason: str
+        """
+        import time
+        now = time.time()
+        return {
+            "connected": self._connected,
+            "uptime_seconds": (now - self._connect_time) if self._connected and self._connect_time else 0,
+            "reconnect_count": self._reconnect_count,
+            "last_heartbeat_ago": (now - self._last_heartbeat) if self._last_heartbeat else None,
+            "last_disconnect_reason": self._last_disconnect_reason,
+        }
 
     def request_reconnect(self) -> None:
         """Request manual reconnection (can be called from UI)."""

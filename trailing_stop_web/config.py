@@ -72,6 +72,13 @@ RECONNECT_BACKOFF_FACTOR = 2
 # Maximum reconnection attempts (0 = unlimited)
 RECONNECT_MAX_ATTEMPTS = 0
 
+# Heartbeat interval for watchdog (seconds)
+# Sends reqCurrentTime() to detect silent disconnects
+HEARTBEAT_INTERVAL = 10
+
+# Heartbeat timeout (seconds) - if no response within this time, consider disconnected
+HEARTBEAT_TIMEOUT = 5
+
 
 # =============================================================================
 # LOGGING
