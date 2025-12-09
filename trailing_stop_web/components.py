@@ -359,8 +359,121 @@ def create_group_panel() -> rx.Component:
 # SHARED GROUP CARD COMPONENTS
 # =============================================================================
 
+def _group_header_collapsible(
+    group: dict,
+    group_id: str,
+    is_collapsed: bool,
+    is_selected: bool = False,
+) -> rx.Component:
+    """Collapsible group card header with chevron, name, badges, and key metrics.
+
+    When collapsed, shows: Name, PnL, Mid, Stop inline.
+    When expanded, shows: Name + badges on top row.
+    """
+    is_active = group["is_active"]
+    is_credit = group["is_credit"]
+    strategy_tag = group.get("strategy_tag", "Custom")
+
+    # Chevron icon (rotates based on collapsed state)
+    chevron = rx.icon(
+        rx.cond(is_collapsed, "chevron-right", "chevron-down"),
+        size=16,
+        color=COLORS["text_secondary"],
+    )
+
+    # Badges row (shown in expanded mode)
+    badges = rx.hstack(
+        rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
+        rx.badge(strategy_tag, color_scheme="gold", size="1"),
+        rx.badge(
+            rx.cond(is_credit, "CREDIT", "DEBIT"),
+            color_scheme=rx.cond(is_credit, "orange", "cyan"),
+            size="1",
+        ),
+        rx.badge(
+            group["market_status"],
+            color_scheme=rx.cond(
+                group["market_status"] == "Open",
+                "green",
+                rx.cond(group["market_status"] == "Closed", "red", "gray"),
+            ),
+            size="1",
+        ),
+        rx.badge(
+            rx.cond(is_active, "ACTIVE", "IDLE"),
+            color_scheme=rx.cond(is_active, "green", "gray"),
+            size="1",
+        ),
+        rx.cond(
+            group["modification_count"] != 0,
+            rx.badge(
+                rx.text(f"Mods: ", group["modification_count"]),
+                color_scheme="violet",
+                size="1",
+            ),
+            rx.fragment(),
+        ),
+        rx.cond(
+            is_selected,
+            rx.badge("SELECTED", color_scheme="purple", size="1"),
+            rx.fragment(),
+        ),
+        spacing="1",
+        flex_wrap="wrap",
+    )
+
+    # Collapsed summary: key metrics inline
+    collapsed_summary = rx.hstack(
+        rx.text(
+            group["pnl_mark_str"],
+            size="2",
+            weight="bold",
+            color=group["pnl_color"],
+        ),
+        rx.text("Mid:", size="1", color=COLORS["text_muted"]),
+        rx.text(group["mid_value_str"], size="1", weight="bold", color=COLORS["text_primary"]),
+        rx.text("Stop:", size="1", color=COLORS["text_muted"]),
+        rx.text(group["stop_str"], size="1", weight="bold", color=COLORS["stop"]),
+        spacing="2",
+        align="center",
+    )
+
+    return rx.box(
+        rx.hstack(
+            # Left: Chevron + Name
+            rx.hstack(
+                chevron,
+                rx.text(
+                    group["name"],
+                    size="2",
+                    weight="bold",
+                    color=COLORS["primary"],
+                    font_family=TYPOGRAPHY["font_family"],
+                ),
+                spacing="2",
+                align="center",
+            ),
+            rx.spacer(),
+            # Right: Collapsed summary OR badges
+            rx.cond(
+                is_collapsed,
+                collapsed_summary,
+                badges,
+            ),
+            width="100%",
+            align="center",
+        ),
+        on_click=AppState.toggle_group_collapsed(group_id),
+        cursor="pointer",
+        padding="2",
+        _hover={"background": COLORS["bg_hover"]},
+        border_radius="4px",
+        width="100%",
+    )
+
+
 def _group_header(group: dict, is_selected: bool = False) -> rx.Component:
-    """Group card header with name, badges, and status."""
+    """Group card header with name, badges, and status (legacy, non-collapsible)."""
     is_active = group["is_active"]
     is_credit = group["is_credit"]
     strategy_tag = group.get("strategy_tag", "Custom")
@@ -668,67 +781,100 @@ def _group_time_exit_config(group: dict, group_id: str) -> rx.Component:
     )
 
 
+def _group_legs_display(group: dict) -> rx.Component:
+    """Responsive display for option legs using legs_str.
+
+    Uses word-wrap and horizontal scroll for responsive layout.
+    Falls back to monospace text but with better wrapping behavior.
+    """
+    return rx.box(
+        rx.text(
+            group["legs_str"],
+            size="1",
+            font_family=TYPOGRAPHY["font_family"],
+            color=COLORS["text_secondary"],
+            style={
+                "white_space": "pre-wrap",  # Allow wrapping
+                "word_break": "break-word",
+                "overflow_x": "auto",
+            },
+        ),
+        padding="2",
+        background=COLORS["bg_elevated"],
+        border_radius="4px",
+        width="100%",
+        max_width="100%",
+        overflow_x="auto",
+    )
+
+
 def group_card(group: dict, mode: str = "setup") -> rx.Component:
-    """Unified group card component.
+    """Unified collapsible group card component.
 
     Args:
         group: Group data dict
-        mode: "setup" (full config) or "monitor" (compact, clickable)
+        mode: "setup" (expanded default) or "monitor" (collapsed default)
+
+    Collapse behavior:
+    - Setup tab: expanded by default, user can collapse
+    - Monitor tab: collapsed by default, user can expand
+    - collapsed_groups list stores user overrides from tab default
     """
     group_id = group["id"]
     is_active = group["is_active"]
     is_selected = AppState.selected_group_id == group_id
 
-    # Common content for both modes
-    content = [
-        _group_header(group, is_selected if mode == "monitor" else False),
-    ]
+    # Determine collapsed state based on mode and user overrides
+    # Setup: default expanded (collapsed=False), override=True means collapsed
+    # Monitor: default collapsed (collapsed=True), override=True means expanded
+    is_in_collapsed_list = AppState.collapsed_groups.contains(group_id)
 
-    # Legs (Setup mode only)
     if mode == "setup":
-        content.append(
-            rx.box(
-                rx.text(group["legs_str"], size="1", white_space="pre", font_family="monospace", color=COLORS["text_secondary"]),
-                padding="2",
-                background=COLORS["bg_elevated"],
-                border_radius="6px",
-                width="100%",
-            )
-        )
+        # Setup default: expanded. If in list, user collapsed it.
+        is_collapsed = is_in_collapsed_list
+    else:
+        # Monitor default: collapsed. If in list, user expanded it.
+        is_collapsed = ~is_in_collapsed_list
 
-    # Prices row
-    content.append(_group_prices_row(group, size="2" if mode == "setup" else "1"))
+    # Header (always visible, clickable to toggle)
+    header = _group_header_collapsible(group, group_id, is_collapsed, is_selected)
 
-    # Greeks row
-    content.append(_group_greeks_row(group))
+    # Expanded content (conditionally rendered)
+    expanded_content = rx.cond(
+        is_collapsed,
+        rx.fragment(),  # Empty when collapsed
+        rx.vstack(
+            # Legs display (responsive)
+            _group_legs_display(group),
+            # Prices row
+            _group_prices_row(group, size="2"),
+            # Greeks row
+            _group_greeks_row(group),
+            # Trailing config
+            _group_trailing_config(group, group_id),
+            # HWM/Stop row with trail
+            _group_hwm_stop_row(group, show_trail=True),
+            # Time exit config
+            _group_time_exit_config(group, group_id),
+            # Action buttons
+            _group_action_buttons(group_id, is_active),
+            width="100%",
+            spacing="2",
+        ),
+    )
 
-    # Trailing config (Setup mode only)
-    if mode == "setup":
-        content.append(_group_trailing_config(group, group_id))
-
-    # HWM/Stop row
-    content.append(_group_hwm_stop_row(group, show_trail=(mode == "monitor")))
-
-    # Time exit config (Setup mode only)
-    if mode == "setup":
-        content.append(_group_time_exit_config(group, group_id))
-
-    # Action buttons
-    content.append(_group_action_buttons(group_id, is_active))
-
-    # Build card with mode-specific styling
+    # Card styling
     card_props = {
         "background": COLORS["bg_panel"],
         "border": PANEL_STYLES["border"],
         "border_radius": PANEL_STYLES["border_radius"],
         "padding": PANEL_STYLES["padding"],
         "width": "100%",
+        "border_left": PANEL_STYLES["border_left"],
     }
 
+    # Monitor mode: add selection styling
     if mode == "monitor":
-        card_props["on_click"] = AppState.select_group(group_id)
-        card_props["cursor"] = "pointer"
-        # Selected cards: full orange border, glow effect, subtle orange tint
         card_props["border"] = rx.cond(
             is_selected,
             f"2px solid {COLORS['accent']}",
@@ -741,32 +887,47 @@ def group_card(group: dict, mode: str = "setup") -> rx.Component:
         )
         card_props["background"] = rx.cond(
             is_selected,
-            "rgba(255, 165, 0, 0.08)",  # Subtle orange tint
+            "rgba(255, 165, 0, 0.08)",
             COLORS["bg_panel"],
         )
         card_props["box_shadow"] = rx.cond(
             is_selected,
-            f"0 0 12px rgba(255, 165, 0, 0.25)",  # Orange glow
+            f"0 0 12px rgba(255, 165, 0, 0.25)",
             "none",
         )
         card_props["_hover"] = {"background": COLORS["bg_elevated"]}
-    else:
-        card_props["border_left"] = PANEL_STYLES["border_left"]
 
-    return rx.box(
-        rx.vstack(*content, width="100%", spacing="2"),
-        **card_props,
+    # Build card content
+    card_content = rx.vstack(
+        header,
+        expanded_content,
+        width="100%",
+        spacing="2",
     )
+
+    # In monitor mode, wrap with click-to-select (double-click selects for charts)
+    if mode == "monitor":
+        return rx.box(
+            card_content,
+            on_double_click=AppState.select_group(group_id),
+            cursor="pointer",
+            **card_props,
+        )
+
+    return rx.box(card_content, **card_props)
 
 
 # Wrapper functions for backward compatibility
 def group_config_card(group: dict) -> rx.Component:
-    """Setup tab group card (full config)."""
+    """Setup tab group card (expanded by default)."""
     return group_card(group, mode="setup")
 
 
 def compact_group_card(group: dict) -> rx.Component:
-    """Monitor tab group card (compact, clickable)."""
+    """Monitor tab group card (collapsed by default).
+
+    Selection happens on card click (excluding header which toggles collapse).
+    """
     return group_card(group, mode="monitor")
 
 
