@@ -31,10 +31,41 @@ Keine direkte IB-Nutzung außerhalb von `trailing_stop_web/broker.py`.
 - nachvollziehbare Logs
 - definierte Retry-Policy
 
-### TODO: Unsere konkrete Policy
-- Ports / Client IDs:
-- Backoff-Strategie:
-- Health-Check Mechanismus:
+### Unsere Policy (implementiert in `broker.py`)
+
+**Ports / Client IDs:**
+- Paper: 7497, Live: 7496
+- Client ID: 1 (konfigurierbar in `config.py`)
+
+**Backoff-Strategie:**
+- Initial Delay: 5s
+- Max Delay: 60s
+- Backoff Factor: 2x (exponential)
+- Max Attempts: 0 (unbegrenzt)
+
+**Heartbeat Watchdog:**
+- Intervall: 10s
+- Methode: `ib.reqCurrentTime()` (lightweight, async-aware)
+- Bei Timeout: Connection als verloren markieren → Reconnect
+- Erkennt "stille" Disconnects (Netzwerkausfall, TWS-Crash)
+
+**Connection Metrics:**
+- `uptime_seconds`: Zeit seit Verbindungsaufbau
+- `reconnect_count`: Gesamtzahl Reconnects seit Start
+- `last_heartbeat_ago`: Sekunden seit letztem erfolgreichen Heartbeat
+- `last_disconnect_reason`: Grund für letzten Disconnect
+
+**Status-Callbacks:**
+- Format: `"Reconnecting in Xs (#N) (reason)"`
+- Grund wird an UI weitergegeben für besseres Debugging
+
+**Disconnect-Gründe (klassifiziert):**
+- `ib.isConnected() returned False` - TWS hat Verbindung getrennt
+- `Heartbeat timeout` - Keine Antwort auf reqCurrentTime()
+
+**Wichtig:**
+- UI-Interval (`rx.moment`) läuft IMMER (auch bei Disconnect)
+- Damit wird Reconnect-Status korrekt in UI synchronisiert
 
 ---
 
