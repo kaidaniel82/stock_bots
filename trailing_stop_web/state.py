@@ -171,6 +171,9 @@ class AppState(rx.State):
     active_tab: str = "setup"  # "setup" or "monitor"
     delete_confirm_group_id: str = ""  # Group ID pending delete confirmation
     selected_group_id: str = ""  # Currently selected group in monitor tab
+    # Collapsed state for group cards (user overrides)
+    # Cards not in this set follow tab default: setup=expanded, monitor=collapsed
+    collapsed_groups: list[str] = []  # List of group IDs that are collapsed (user override)
 
     # === Chart Header Info (updated every render cycle) ===
     # Position OHLC Header: Trigger value (based on trigger_price_type), Stop, Limit, HWM, Fill
@@ -1322,6 +1325,18 @@ class AppState(rx.State):
     def set_active_tab(self, tab: str):
         """Switch between setup and monitor tabs."""
         self.active_tab = tab
+
+    def toggle_group_collapsed(self, group_id: str):
+        """Toggle collapsed state for a group card.
+
+        Logic: collapsed_groups stores user overrides.
+        - If group_id in list: remove it (revert to tab default)
+        - If group_id not in list: add it (override tab default)
+        """
+        if group_id in self.collapsed_groups:
+            self.collapsed_groups = [g for g in self.collapsed_groups if g != group_id]
+        else:
+            self.collapsed_groups = self.collapsed_groups + [group_id]
 
     def select_group(self, group_id: str):
         """Select a group in monitor view and load chart data."""
