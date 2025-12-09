@@ -1188,17 +1188,28 @@ class TWSBroker:
         Returns:
             Price increment (e.g., 0.01, 0.05, 0.10)
         """
+        from trailing_stop_web.tick_rules import get_combo_tick
+
         default_tick = 0.01
 
-        # BAG (combo) contracts: get tick from first leg (no fallback - must read from contract)
+        # BAG (combo) contracts: use combo tick rules
+        # IB does NOT provide ContractDetails for BAG contracts (Error 321)
+        # so we use a lookup table based on exchange rules
         if contract.secType == "BAG":
+            combo_tick = get_combo_tick(contract.symbol)
+            if combo_tick is not None:
+                logger.debug(f"[TICK] BAG {contract.symbol}: using combo tick override = {combo_tick}")
+                return combo_tick
+
+            # Fallback: get tick from first leg (for unknown symbols)
             if contract.comboLegs:
                 first_leg_id = contract.comboLegs[0].conId
                 pos = self._positions.get(first_leg_id)
                 if pos and pos.raw_contract:
-                    logger.debug(f"BAG contract: getting tick from first leg {first_leg_id}")
+                    logger.debug(f"[TICK] BAG {contract.symbol}: no combo rule, using first leg {first_leg_id}")
                     return self._get_price_increment(pos.raw_contract, price)
-            logger.warning(f"BAG contract {contract.symbol}: could not get tick from legs!")
+
+            logger.warning(f"BAG contract {contract.symbol}: no combo rule and could not get tick from legs!")
             return default_tick
 
         # Use conId as cache key (unique identifier, same as in _preload_market_rules)

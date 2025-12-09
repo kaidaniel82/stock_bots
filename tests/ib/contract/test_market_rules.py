@@ -259,45 +259,77 @@ class TestBrokerTickSizeIntegration:
 class TestComboTickSize:
     """Test tick size resolution for BAG (combo) contracts."""
 
-    def test_combo_gets_tick_from_first_leg(self):
-        """BAG contracts should get tick size from first leg."""
-        from trailing_stop_web.broker import TWSBroker, PortfolioPosition
+    def test_spx_combo_uses_lookup_table(self):
+        """SPX BAG contracts should use combo tick from lookup table (0.05)."""
+        from trailing_stop_web.broker import TWSBroker
 
         broker = TWSBroker()
 
-        # Create first leg contract
-        leg_contract = Mock()
-        leg_contract.conId = 111111
-        leg_contract.symbol = "SPX"
-        leg_contract.secType = "OPT"
-        leg_contract.exchange = "SMART"
-        leg_contract.comboLegs = None
-
-        # Create combo leg reference
-        combo_leg = Mock()
-        combo_leg.conId = 111111
-
-        # Create BAG contract
+        # Create BAG contract for SPX
         combo_contract = Mock()
         combo_contract.conId = 999999
         combo_contract.symbol = "SPX"
         combo_contract.secType = "BAG"
+        combo_contract.exchange = "CBOE"
+        combo_contract.comboLegs = [Mock(conId=111111)]
+
+        # SPX combos use 0.05 tick regardless of price (CBOE rule)
+        assert broker._get_price_increment(combo_contract, 4.60) == 0.05
+        assert broker._get_price_increment(combo_contract, 2.50) == 0.05
+        assert broker._get_price_increment(combo_contract, 50.00) == 0.05
+
+    def test_penny_pilot_combo_uses_001_tick(self):
+        """Penny Pilot symbols should use 0.01 tick for combos."""
+        from trailing_stop_web.broker import TWSBroker
+
+        broker = TWSBroker()
+
+        # Create BAG contract for TSLA (Penny Pilot)
+        combo_contract = Mock()
+        combo_contract.conId = 888888
+        combo_contract.symbol = "TSLA"
+        combo_contract.secType = "BAG"
         combo_contract.exchange = "SMART"
-        combo_contract.comboLegs = [combo_leg]
+        combo_contract.comboLegs = [Mock(conId=222222)]
+
+        # Penny Pilot combos use 0.01 tick
+        assert broker._get_price_increment(combo_contract, 5.00) == 0.01
+        assert broker._get_price_increment(combo_contract, 0.50) == 0.01
+
+    def test_unknown_symbol_combo_falls_back_to_first_leg(self):
+        """Unknown symbols should fall back to first leg's market rules."""
+        from trailing_stop_web.broker import TWSBroker
+
+        broker = TWSBroker()
+
+        # Create first leg contract for unknown symbol
+        leg_contract = Mock()
+        leg_contract.conId = 333333
+        leg_contract.symbol = "UNKNOWN"
+        leg_contract.secType = "OPT"
+        leg_contract.exchange = "SMART"
+        leg_contract.comboLegs = None
+
+        # Create BAG contract
+        combo_contract = Mock()
+        combo_contract.conId = 777777
+        combo_contract.symbol = "UNKNOWN"
+        combo_contract.secType = "BAG"
+        combo_contract.exchange = "SMART"
+        combo_contract.comboLegs = [Mock(conId=333333)]
 
         # Add first leg to positions
         pos = Mock()
         pos.raw_contract = leg_contract
-        broker._positions[111111] = pos
+        broker._positions[333333] = pos
 
-        # Cache market rules for the leg (key is conId only)
-        # Use correct SPX values: 0.05 below $3, 0.10 at/above $3
-        broker._market_rules_cache[111111] = [
+        # Cache market rules for the leg
+        broker._market_rules_cache[333333] = [
             SimpleNamespace(lowEdge=0.0, increment=0.05),
             SimpleNamespace(lowEdge=3.0, increment=0.10),
         ]
 
-        # BAG should get tick from first leg
+        # Unknown symbol falls back to first leg's rules
         assert broker._get_price_increment(combo_contract, 4.60) == 0.10   # >= $3
         assert broker._get_price_increment(combo_contract, 2.50) == 0.05   # < $3
 

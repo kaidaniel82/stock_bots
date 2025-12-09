@@ -128,8 +128,49 @@ def _preload_market_rules(self):
 # 3. Tick-Size-Auflösung
 def _get_price_increment(self, contract, price) -> float:
     # Verwendet abs(price) für negative Preise (Credit Spreads)
-    # BAG (Combo): Holt Tick vom ersten Leg
+    # BAG (Combo): Verwendet Lookup-Table, Fallback auf erstes Leg
 ```
+
+### Combo/Spread Tick Sizes (BAG Contracts)
+
+**WICHTIG:** IB liefert KEINE ContractDetails für BAG (Combo) Contracts!
+
+```
+Error 321: 'BAG' isn't supported for contract data request
+```
+
+Daher gibt es eine zentrale Lookup-Table in `trailing_stop_web/tick_rules.py`.
+
+**CBOE Complex Orders (SPX, SPXW, VIX, NDX, RUT):**
+- Single-Leg: Preis-abhängig ($0.05 < $3, $0.10 ≥ $3)
+- **Combo/Spread: Immer $0.05 Net-Preis!**
+
+Quelle: https://www.cboe.com/tradable_products/sp_500/spx_options/specifications/
+> "For complex orders, legs may trade in $.01 increments, but net package price must be in $.05 increments"
+
+**Penny Pilot Symbols (AAPL, TSLA, SPY, QQQ, etc.):**
+- Single-Leg und Combo: $0.01
+
+**Lookup-Tabelle:**
+```python
+# trailing_stop_web/tick_rules.py
+COMBO_TICK_RULES = {
+    "SPX":  0.05,  # CBOE Complex Orders
+    "SPXW": 0.05,
+    "VIX":  0.05,
+    "NDX":  0.05,
+    "RUT":  0.05,
+    "ES":   0.05,  # CME E-mini
+}
+
+PENNY_PILOT_SYMBOLS = {"AAPL", "TSLA", "SPY", "QQQ", "NVDA", ...}
+# → 0.01 für alle Combos
+```
+
+**Auflösungs-Reihenfolge in `_get_price_increment()`:**
+1. `COMBO_TICK_RULES` Lookup → direkter Match
+2. `PENNY_PILOT_SYMBOLS` Check → 0.01
+3. Fallback: Market Rules vom ersten Leg des Combos
 
 ### IB API Details
 
@@ -154,8 +195,10 @@ lowEdge=3.0  → increment=0.10  (ab $3)
 ### Testabdeckung
 
 ```
-tests/ib/contract/test_market_rules.py  # Contract-Tests
+tests/ib/contract/test_market_rules.py  # Contract-Tests (Single-Leg + Combo)
+tests/ib/contract/test_tick_rules.py    # Combo Tick Lookup Tests
 tests/ib/fixtures/market_rules.py       # Fixtures mit echten IB-Daten
+scripts/test_bag_market_rules.py        # Live-Test für BAG Error 321
 ```
 
 **Kritischer Test-Case:**
@@ -214,8 +257,13 @@ Hier gehört rein, was euch schon Zeit gekostet hat.
 
 ### 9.3 BAG (Combo) Contracts haben keine eigenen Market Rules
 
-**Problem:** `reqMarketRule` für BAG-Contract liefert nichts Sinnvolles.
-**Lösung:** Tick-Size vom **ersten Leg** des Combos verwenden.
+**Problem:** `reqContractDetails()` und `reqMarketRule()` für BAG-Contracts liefert Error 321.
+**Realität:** IB API unterstützt keine ContractDetails für secType='BAG'.
+**Lösung:** Zentrale Lookup-Table in `trailing_stop_web/tick_rules.py`:
+- CBOE Index Options (SPX, VIX, etc.): $0.05 für Combos
+- Penny Pilot Symbols (TSLA, etc.): $0.01 für Combos
+- Unbekannte Symbols: Fallback auf Market Rules des ersten Legs
+**Siehe:** Sektion 6b "Combo/Spread Tick Sizes" für Details.
 
 ### 9.4 Trading Hours Cache muss täglich invalidiert werden
 
