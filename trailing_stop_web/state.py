@@ -1,7 +1,9 @@
 """Application state management."""
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from threading import Lock
 import reflex as rx
 import plotly.graph_objects as go
@@ -12,9 +14,35 @@ from .metrics import LegData, GroupMetrics, compute_group_metrics, calculate_sto
 from .config import (
     UI_UPDATE_INTERVAL,
     DEFAULT_TRAIL_PERCENT, DEFAULT_STOP_TYPE, DEFAULT_LIMIT_OFFSET,
-    BAR_INTERVAL_TICKS, CHART_RENDER_INTERVAL
+    BAR_INTERVAL_TICKS, CHART_RENDER_INTERVAL,
+    TWS_PORT, TWS_CLIENT_ID
 )
 from .logger import logger
+
+# Connection config file path (outside src/ to avoid hot-reload)
+CONNECTION_CONFIG_PATH = Path(__file__).parent.parent / "data" / "connection_config.json"
+
+
+def load_connection_config() -> dict:
+    """Load connection config from JSON file."""
+    if CONNECTION_CONFIG_PATH.exists():
+        try:
+            with open(CONNECTION_CONFIG_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Failed to load connection config: {e}")
+    return {"port": TWS_PORT, "client_id": TWS_CLIENT_ID}
+
+
+def save_connection_config(port: int, client_id: int) -> None:
+    """Save connection config to JSON file."""
+    try:
+        CONNECTION_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONNECTION_CONFIG_PATH, "w") as f:
+            json.dump({"port": port, "client_id": client_id}, f, indent=2)
+        logger.debug(f"Saved connection config: port={port}, client_id={client_id}")
+    except IOError as e:
+        logger.error(f"Failed to save connection config: {e}")
 
 
 class UIUpdateQueue:
@@ -81,6 +109,10 @@ class PositionData:
 
 class AppState(rx.State):
     """Main application state."""
+
+    # Connection config (editable only when disconnected)
+    tws_port: int = TWS_PORT
+    tws_client_id: int = TWS_CLIENT_ID
 
     # Connection status
     is_connected: bool = False
@@ -207,15 +239,48 @@ class AppState(rx.State):
     def on_mount(self):
         """Called when page mounts - just initialize UI, don't auto-connect."""
         logger.info("App mounted")
+        # Load connection config
+        config = load_connection_config()
+        self.tws_port = config.get("port", TWS_PORT)
+        self.tws_client_id = config.get("client_id", TWS_CLIENT_ID)
+        logger.info(f"Loaded connection config: port={self.tws_port}, client_id={self.tws_client_id}")
         # Load persisted groups
         self._load_groups_from_manager()
         self.status_message = "Click 'Connect' to connect to TWS"
 
+    def set_tws_port(self, value: str):
+        """Set TWS port (only when disconnected)."""
+        if self.is_connected:
+            return
+        try:
+            port = int(value)
+            if 1 <= port <= 65535:
+                self.tws_port = port
+                save_connection_config(self.tws_port, self.tws_client_id)
+        except (ValueError, TypeError):
+            pass
+
+    def set_tws_client_id(self, value: str):
+        """Set TWS client ID (only when disconnected)."""
+        if self.is_connected:
+            return
+        try:
+            client_id = int(value)
+            if client_id >= 0:
+                self.tws_client_id = client_id
+                save_connection_config(self.tws_port, self.tws_client_id)
+        except (ValueError, TypeError):
+            pass
+
     def connect_tws(self):
         """Connect to TWS."""
-        logger.info("Connecting to TWS...")
+        logger.info(f"Connecting to TWS at port={self.tws_port}, client_id={self.tws_client_id}...")
         self.connection_status = "Connecting..."
         self.status_message = "Connecting to TWS..."
+
+        # Update broker config before connecting
+        BROKER.port = self.tws_port
+        BROKER.client_id = self.tws_client_id
 
         success = BROKER.connect()
 

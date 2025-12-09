@@ -45,7 +45,7 @@ def tab_button(tab_id: str, tab_name: str) -> rx.Component:
 
 def topbar() -> rx.Component:
     """
-    Sticky Topbar - Logo + Connection + Controls (RiskRanger style)
+    Sticky Topbar - Logo + Connection Config + Controls (RiskRanger style)
     """
     return rx.box(
         rx.hstack(
@@ -67,6 +67,30 @@ def topbar() -> rx.Component:
             ),
 
             rx.spacer(),
+
+            # Connection config inputs (Port + Client ID)
+            rx.hstack(
+                rx.text("Port:", size="1", color=COLORS["text_secondary"]),
+                rx.input(
+                    value=AppState.tws_port.to(str),
+                    on_change=AppState.set_tws_port,
+                    width="70px",
+                    size="1",
+                    disabled=AppState.is_connected,
+                    placeholder="7497",
+                ),
+                rx.text("Client ID:", size="1", color=COLORS["text_secondary"]),
+                rx.input(
+                    value=AppState.tws_client_id.to(str),
+                    on_change=AppState.set_tws_client_id,
+                    width="50px",
+                    size="1",
+                    disabled=AppState.is_connected,
+                    placeholder="1",
+                ),
+                spacing="2",
+                align_items="center",
+            ),
 
             # Connection status with reconnect support
             rx.hstack(
@@ -114,6 +138,7 @@ def topbar() -> rx.Component:
             width="100%",
             align_items="center",
             height="100%",
+            gap="4",
         ),
         height=TOPBAR_STYLES["height"],
         padding=TOPBAR_STYLES["padding"],
