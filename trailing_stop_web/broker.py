@@ -261,6 +261,11 @@ class TWSBroker:
         self._trading_hours_cache: dict[str, dict] = {}
         self._last_cache_date: str = ""  # Track date for midnight cache clear
 
+        # Market rules cache: {(conId, exchange): [PriceIncrement, ...]}
+        # Stores tick size rules loaded from reqMarketRule() for each contract
+        # Used by _get_price_increment() to determine correct tick size at any price level
+        self._market_rules_cache: dict[tuple[int, str], list] = {}
+
     def _run_loop(self):
         """Run ib_insync event loop in separate thread with reconnection support."""
         self._loop = asyncio.new_event_loop()
@@ -1049,18 +1054,23 @@ class TWSBroker:
     # APP-CONTROLLED STOP ORDERS (replaces TWS-native TRAIL orders for combos)
     # ==========================================================================
 
-    # Cache for market rules by (conId, exchange)
-    _market_rules_cache: dict[tuple[int, str], list] = {}
-
     def _preload_market_rules(self):
         """Pre-load market rules for all positions during sync load.
 
-        This is called from load_portfolio() to ensure market rules are cached
-        BEFORE order placement. The reqContractDetails/reqMarketRule calls
-        can't run during async handlers (event loop conflict).
+        This is called from load_portfolio() and _attempt_connection() to ensure
+        market rules are cached BEFORE order placement. The reqContractDetails/
+        reqMarketRule calls can't run during async handlers (event loop conflict).
+
+        Market rules define price increments (tick sizes) that can vary by price level.
+        For example, SPX options use 0.05 tick for prices >= $3.00, but 0.01 below.
+
+        The cache stores either:
+        - Full market rules from reqMarketRule() (list of PriceIncrement objects)
+        - Fallback minTick from ContractDetails if rules unavailable (single-element list)
         """
         logger.info(f"Pre-loading market rules for {len(self._positions)} positions...")
         loaded = 0
+        fallback_count = 0
 
         for con_id, pos in self._positions.items():
             if not pos.raw_contract:
@@ -1080,8 +1090,13 @@ class TWSBroker:
                     continue
 
                 cd = details[0]
-                exchanges = cd.validExchanges.split(",")
-                rule_ids = cd.marketRuleIds.split(",")
+
+                # Extract minTick as fallback (always available in ContractDetails)
+                min_tick = getattr(cd, 'minTick', 0.01) or 0.01
+
+                # Try to get full market rules for price-dependent tick sizes
+                exchanges = (cd.validExchanges or "").split(",")
+                rule_ids = (cd.marketRuleIds or "").split(",")
 
                 # Find the rule ID for our exchange (positional mapping)
                 exchange = contract.exchange or "SMART"
@@ -1090,25 +1105,52 @@ class TWSBroker:
                 if exchange in exchanges:
                     idx = exchanges.index(exchange)
                     if idx < len(rule_ids) and rule_ids[idx]:
-                        rule_id_to_use = int(rule_ids[idx])
+                        try:
+                            rule_id_to_use = int(rule_ids[idx])
+                        except ValueError:
+                            pass
 
                 # Fallback: use first rule if exchange not found
                 if rule_id_to_use is None and rule_ids and rule_ids[0]:
-                    rule_id_to_use = int(rule_ids[0])
+                    try:
+                        rule_id_to_use = int(rule_ids[0])
+                    except ValueError:
+                        pass
 
                 if rule_id_to_use is not None:
                     rule = self.ib.reqMarketRule(rule_id_to_use)
-                    self._market_rules_cache[cache_key] = rule if rule else []
-                    loaded += 1
-                    logger.debug(f"Loaded market rule {rule_id_to_use} for {contract.symbol} "
-                                f"{contract.secType}: {len(rule) if rule else 0} price levels")
+                    if rule:
+                        self._market_rules_cache[cache_key] = rule
+                        loaded += 1
+                        # Log actual tick sizes from the rule
+                        tick_info = ", ".join(f"≥${r.lowEdge}→{r.increment}" for r in rule[:3])
+                        if len(rule) > 3:
+                            tick_info += f", ...({len(rule)} levels)"
+                        logger.info(f"[TICK] {contract.symbol} {contract.secType}: {tick_info}")
+                    else:
+                        # reqMarketRule returned empty - use minTick fallback
+                        self._market_rules_cache[cache_key] = self._create_fallback_rule(min_tick)
+                        fallback_count += 1
+                        logger.debug(f"[TICK] {contract.symbol}: market rule empty, using minTick={min_tick}")
                 else:
-                    self._market_rules_cache[cache_key] = []
+                    # No rule ID found - use minTick fallback
+                    self._market_rules_cache[cache_key] = self._create_fallback_rule(min_tick)
+                    fallback_count += 1
+                    logger.debug(f"[TICK] {contract.symbol}: no rule ID, using minTick={min_tick}")
 
             except Exception as e:
                 logger.warning(f"Failed to load market rule for {contract.symbol}: {e}")
 
-        logger.info(f"Pre-loaded {loaded} market rules")
+        logger.info(f"Pre-loaded {loaded} market rules ({fallback_count} using minTick fallback)")
+
+    def _create_fallback_rule(self, min_tick: float) -> list:
+        """Create a fallback market rule using minTick from ContractDetails.
+
+        Returns a list with a single SimpleNamespace object that mimics
+        the PriceIncrement structure from reqMarketRule().
+        """
+        from types import SimpleNamespace
+        return [SimpleNamespace(lowEdge=0.0, increment=min_tick)]
 
     def _get_price_increment(self, contract: Contract, price: float) -> float:
         """Get price increment for a contract at a given price using MarketRules.
