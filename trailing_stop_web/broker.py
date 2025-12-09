@@ -1194,14 +1194,17 @@ class TWSBroker:
             return default_tick
 
         # Find increment for this price level
+        # Use abs(price) because credit spreads can have negative prices
+        # but tick size is determined by absolute price magnitude
+        abs_price = abs(price)
         increment = default_tick
         for price_rule in rule:
-            if price_rule.lowEdge <= price:
+            if price_rule.lowEdge <= abs_price:
                 increment = float(price_rule.increment)
             else:
                 break
 
-        logger.debug(f"[TICK] {contract.symbol} {contract.secType} at ${price:.2f}: increment={increment}")
+        logger.debug(f"[TICK] {contract.symbol} {contract.secType} at ${price:.2f} (abs=${abs_price:.2f}): increment={increment}")
         return increment
 
     def _get_min_tick(self, contract: Contract) -> float:
