@@ -365,23 +365,32 @@ def _group_header_collapsible(
     is_collapsed: bool,
     is_selected: bool = False,
 ) -> rx.Component:
-    """Collapsible group card header with chevron, name, badges, and key metrics.
+    """Collapsible group card header with chevron button, name, badges, and key metrics.
 
     When collapsed, shows: Name, PnL, Mid, Stop inline.
     When expanded, shows: Name + badges on top row.
+
+    Only the chevron button toggles collapse - not the entire header.
     """
     is_active = group["is_active"]
     is_credit = group["is_credit"]
     strategy_tag = group.get("strategy_tag", "Custom")
 
-    # Chevron icon (rotates based on collapsed state)
-    chevron = rx.icon(
-        rx.cond(is_collapsed, "chevron-right", "chevron-down"),
-        size=16,
-        color=COLORS["text_secondary"],
+    # Chevron button - dedicated clickable area for collapse toggle
+    chevron_button = rx.box(
+        rx.icon(
+            rx.cond(is_collapsed, "chevron-right", "chevron-down"),
+            size=16,
+            color=COLORS["text_secondary"],
+        ),
+        on_click=AppState.toggle_group_collapsed(group_id),
+        cursor="pointer",
+        padding="1",
+        border_radius="4px",
+        _hover={"background": COLORS["bg_hover"]},
     )
 
-    # Badges row (shown in expanded mode)
+    # Badges row (always shown)
     badges = rx.hstack(
         rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
         rx.badge(strategy_tag, color_scheme="gold", size="1"),
@@ -422,8 +431,8 @@ def _group_header_collapsible(
         flex_wrap="wrap",
     )
 
-    # Collapsed summary: key metrics inline
-    collapsed_summary = rx.hstack(
+    # Key metrics (shown inline, always visible)
+    key_metrics = rx.hstack(
         rx.text(
             group["pnl_mark_str"],
             size="2",
@@ -440,9 +449,9 @@ def _group_header_collapsible(
 
     return rx.box(
         rx.hstack(
-            # Left: Chevron + Name
+            # Left: Chevron button + Name
             rx.hstack(
-                chevron,
+                chevron_button,
                 rx.text(
                     group["name"],
                     size="2",
@@ -453,21 +462,16 @@ def _group_header_collapsible(
                 spacing="2",
                 align="center",
             ),
+            # Center: Key metrics (always visible)
+            key_metrics,
             rx.spacer(),
-            # Right: Collapsed summary OR badges
-            rx.cond(
-                is_collapsed,
-                collapsed_summary,
-                badges,
-            ),
+            # Right: Badges
+            badges,
             width="100%",
             align="center",
+            gap="3",
         ),
-        on_click=AppState.toggle_group_collapsed(group_id),
-        cursor="pointer",
         padding="2",
-        _hover={"background": COLORS["bg_hover"]},
-        border_radius="4px",
         width="100%",
     )
 
