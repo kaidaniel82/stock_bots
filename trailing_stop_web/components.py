@@ -338,10 +338,13 @@ def _group_header(group: dict, is_selected: bool = False) -> rx.Component:
     """Group card header with name, badges, and status."""
     is_active = group["is_active"]
     is_credit = group["is_credit"]
+    strategy_tag = group.get("strategy_tag", "Custom")
     return rx.hstack(
         # Left side: badges
         rx.hstack(
             rx.badge(group["total_qty_str"], color_scheme="blue", size="1"),
+            # Strategy tag badge (prominent, gold color)
+            rx.badge(strategy_tag, color_scheme="gold", size="1"),
             rx.badge(
                 rx.cond(is_credit, "CREDIT", "DEBIT"),
                 color_scheme=rx.cond(is_credit, "orange", "cyan"),
