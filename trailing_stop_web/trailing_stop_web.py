@@ -23,12 +23,9 @@ def app_layout() -> rx.Component:
     - Content: scrollable, with padding
     """
     return rx.box(
-        # Interval for real-time updates (every 500ms when connected)
-        rx.cond(
-            AppState.is_connected,
-            rx.moment(interval=500, on_change=AppState.tick_update),
-            rx.text("", display="none"),
-        ),
+        # Interval for real-time updates (every 500ms)
+        # MUST run always - also during disconnect to detect reconnect status
+        rx.moment(interval=500, on_change=AppState.tick_update),
 
         # Sticky Topbar
         topbar(),
