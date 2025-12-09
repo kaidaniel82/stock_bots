@@ -331,19 +331,42 @@ class AppState(rx.State):
 
         # Convert string keys to int and apply sign from portfolio positions
         # This ensures position_quantities stores SIGNED values (positive=long, negative=short)
+        # Also extract leg data for strategy classification
         position_quantities = {}
+        leg_data = []
         for k, v in self.selected_quantities.items():
             con_id = int(k)
-            # Find portfolio position to get the sign
+            # Find portfolio position to get the sign and leg info
             portfolio_qty = 0
+            pos_data = None
             for pos in self.positions:
                 if pos["con_id"] == con_id:
                     portfolio_qty = pos["quantity"]
+                    pos_data = pos
                     break
             # Apply sign: if portfolio is short (negative), make allocated qty negative
             signed_qty = -abs(v) if portfolio_qty < 0 else abs(v)
             position_quantities[con_id] = signed_qty
             logger.debug(f"Position {con_id}: portfolio_qty={portfolio_qty}, allocated={v}, signed={signed_qty}")
+
+            # Extract leg data for strategy classification
+            if pos_data:
+                strike_str = pos_data.get("strike_str", "-")
+                try:
+                    strike = float(strike_str) if strike_str not in ("-", "") else 0.0
+                except ValueError:
+                    strike = 0.0
+                side_str = pos_data.get("side_str", "-")
+                right = side_str if side_str in ("C", "P") else ""
+                expiry = pos_data.get("expiry", "-")
+                if expiry == "-":
+                    expiry = ""
+                leg_data.append({
+                    "strike": strike,
+                    "right": right,
+                    "quantity": signed_qty,
+                    "expiry": expiry,
+                })
 
         # Calculate initial value and determine if credit position
         con_ids = list(position_quantities.keys())
@@ -365,6 +388,7 @@ class AppState(rx.State):
             initial_value=trigger_value,  # Per-contract price for correct stop calculation
             is_credit=is_credit,  # Immutable after creation
             entry_price=entry_price,  # Immutable after creation
+            leg_data=leg_data,  # For strategy classification
         )
 
         # Refresh positions if connected (don't clear if disconnected)
@@ -490,6 +514,8 @@ class AppState(rx.State):
                 "vega_str": metrics["vega_str"],
                 # Position type from STORED group (immutable)
                 "is_credit": g.is_credit,
+                # Strategy classification
+                "strategy_tag": g.strategy_tag or "Custom",
                 # Statistics
                 "modification_count": g.modification_count,
             })

@@ -7,6 +7,7 @@ from typing import Optional
 
 from .logger import logger
 from .metrics import calculate_stop_price
+from .strategy_classifier import classify_from_leg_data
 
 # Data directory for persistence - in project folder (hot-reload excluded via REFLEX_HOT_RELOAD_EXCLUDE_PATHS)
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -56,6 +57,9 @@ class Group:
 
     # === STATISTICS ===
     modification_count: int = 0           # Number of stop price modifications
+
+    # === STRATEGY CLASSIFICATION ===
+    strategy_tag: str = ""                # e.g., "Bull Put Spread", "Iron Condor"
 
     # Backwards compatibility: alias for trail_value
     @property
@@ -147,6 +151,7 @@ class GroupManager:
         initial_value: float = 0.0,
         is_credit: bool = False,
         entry_price: float = 0.0,
+        leg_data: list[dict] = None,  # [{strike, right, quantity, expiry}, ...]
     ) -> Group:
         """Create a new group.
 
@@ -155,12 +160,20 @@ class GroupManager:
             position_quantities: dict mapping con_id -> quantity to allocate
             is_credit: True for credit/short positions (immutable after creation)
             entry_price: Entry price per unit at creation (immutable after creation)
+            leg_data: Optional list of leg info for strategy classification
         """
         group_id = f"grp_{len(self._groups) + 1}_{datetime.now().strftime('%H%M%S')}"
         stop_price = calculate_stop_price(initial_value, trail_mode, trail_value, is_credit=is_credit)
 
         # Convert int keys to str for JSON serialization
         pos_qty_str = {str(k): v for k, v in position_quantities.items()}
+
+        # Classify strategy from leg data (with fallback on error)
+        try:
+            strategy_tag = classify_from_leg_data(leg_data) if leg_data else "Custom"
+        except Exception as e:
+            logger.warning(f"Strategy classification failed: {e}, using 'Custom'")
+            strategy_tag = "Custom"
 
         group = Group(
             id=group_id,
@@ -180,6 +193,7 @@ class GroupManager:
             entry_price=entry_price,
             high_water_mark=initial_value,
             stop_price=stop_price,
+            strategy_tag=strategy_tag,
         )
         self._groups[group.id] = group
         self._save()
@@ -188,7 +202,7 @@ class GroupManager:
         from functools import reduce
         abs_qtys = [abs(q) for q in position_quantities.values()]
         unit_qty = reduce(gcd, abs_qtys) if abs_qtys else 0
-        logger.info(f"Group created: {group.name} ({group.id}) with {len(position_quantities)} legs, {unit_qty} units, credit={is_credit}")
+        logger.info(f"Group created: {group.name} ({group.id}) with {len(position_quantities)} legs, {unit_qty} units, credit={is_credit}, strategy={strategy_tag}")
         return group
 
     def delete(self, group_id: str) -> bool:
