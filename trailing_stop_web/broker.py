@@ -261,10 +261,12 @@ class TWSBroker:
         self._trading_hours_cache: dict[str, dict] = {}
         self._last_cache_date: str = ""  # Track date for midnight cache clear
 
-        # Market rules cache: {(conId, exchange): [PriceIncrement, ...]}
+        # Market rules cache: {conId: [PriceIncrement, ...]}
         # Stores tick size rules loaded from reqMarketRule() for each contract
         # Used by _get_price_increment() to determine correct tick size at any price level
-        self._market_rules_cache: dict[tuple[int, str], list] = {}
+        # Key is conId only (unique identifier) - previously used (conId, exchange) which
+        # caused mismatches when BAG contracts had different exchange than position contracts
+        self._market_rules_cache: dict[int, list] = {}
 
     def _run_loop(self):
         """Run ib_insync event loop in separate thread with reconnection support."""
@@ -1077,7 +1079,10 @@ class TWSBroker:
                 continue
 
             contract = pos.raw_contract
-            cache_key = (contract.conId, contract.exchange or "SMART")
+            # Use conId as cache key (unique identifier)
+            # Previously used (conId, exchange) but this caused mismatches
+            # when BAG contracts had different exchange than position contracts
+            cache_key = contract.conId
 
             # Skip if already cached
             if cache_key in self._market_rules_cache:
@@ -1098,8 +1103,14 @@ class TWSBroker:
                 exchanges = (cd.validExchanges or "").split(",")
                 rule_ids = (cd.marketRuleIds or "").split(",")
 
+                # Log exchanges and rule IDs for debugging
+                logger.debug(f"[TICK] {contract.symbol} conId={contract.conId}: "
+                            f"validExchanges={exchanges[:5]}, marketRuleIds={rule_ids[:5]}, "
+                            f"contract.exchange={contract.exchange}, minTick={min_tick}")
+
                 # Find the rule ID for our exchange (positional mapping)
-                exchange = contract.exchange or "SMART"
+                # Prefer primaryExchange for options (e.g., CBOE for SPX)
+                exchange = contract.primaryExchange or contract.exchange or "SMART"
                 rule_id_to_use = None
 
                 if exchange in exchanges:
@@ -1110,7 +1121,16 @@ class TWSBroker:
                         except ValueError:
                             pass
 
-                # Fallback: use first rule if exchange not found
+                # Fallback: try contract.exchange if primaryExchange didn't work
+                if rule_id_to_use is None and contract.exchange and contract.exchange in exchanges:
+                    idx = exchanges.index(contract.exchange)
+                    if idx < len(rule_ids) and rule_ids[idx]:
+                        try:
+                            rule_id_to_use = int(rule_ids[idx])
+                        except ValueError:
+                            pass
+
+                # Last fallback: use first rule if exchange not found
                 if rule_id_to_use is None and rule_ids and rule_ids[0]:
                     try:
                         rule_id_to_use = int(rule_ids[0])
@@ -1181,7 +1201,8 @@ class TWSBroker:
             logger.warning(f"BAG contract {contract.symbol}: could not get tick from legs!")
             return default_tick
 
-        cache_key = (contract.conId, contract.exchange or "SMART")
+        # Use conId as cache key (unique identifier, same as in _preload_market_rules)
+        cache_key = contract.conId
 
         # Use pre-loaded cache only (no API calls during async handlers)
         # Market rules are loaded in _preload_market_rules() during load_portfolio()

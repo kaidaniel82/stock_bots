@@ -94,17 +94,20 @@ IB liefert Status wie:
 
 **Tick Size ist PREIS-ABHÄNGIG!**
 
-Viele Instrumente (besonders SPX-Optionen) haben unterschiedliche Tick-Sizes je nach Preisniveau:
+Viele Instrumente (besonders SPX-Optionen) haben unterschiedliche Tick-Sizes je nach Preisniveau.
 
+**SPX-Optionen (CBOE offiziell):**
 | Preisniveau | Tick Size | Beispiel |
 |-------------|-----------|----------|
-| < $3.00     | 0.01      | $2.50 → gültige Preise: 2.50, 2.51, 2.52 |
-| ≥ $3.00     | 0.05      | $4.60 → gültige Preise: 4.55, 4.60, 4.65 |
+| < $3.00     | $0.05     | $2.50 → gültige Preise: 2.45, 2.50, 2.55 |
+| ≥ $3.00     | $0.10     | $4.60 → gültige Preise: 4.50, 4.60, 4.70 |
+
+Quelle: https://www.cboe.com/tradable_products/sp_500/spx_options/specifications/
 
 ### Bug-Hintergrund (Fix Dezember 2024)
 
 **Problem:** Trailing Stops verwendeten fälschlich `tick=0.01` für alle Preise.
-Bei SPX-Optionen mit Preis ≥ $3.00 muss aber `tick=0.05` verwendet werden.
+Bei SPX-Optionen mit Preis ≥ $3.00 muss `tick=0.10` verwendet werden.
 
 **Symptom:** Order-Rejection oder falsche Stop-Preise.
 
@@ -114,7 +117,8 @@ Bei SPX-Optionen mit Preis ≥ $3.00 muss aber `tick=0.05` verwendet werden.
 
 ```python
 # 1. Cache-Initialisierung (Instanz-Variable!)
-self._market_rules_cache: dict[tuple[int, str], list] = {}
+# Key ist nur conId (nicht (conId, exchange) - vermeidet Cache-Mismatches)
+self._market_rules_cache: dict[int, list] = {}
 
 # 2. Pre-Loading beim Connect
 def _preload_market_rules(self):
@@ -123,7 +127,7 @@ def _preload_market_rules(self):
 
 # 3. Tick-Size-Auflösung
 def _get_price_increment(self, contract, price) -> float:
-    # Sucht korrekte Tick-Size für gegebenen Preis
+    # Verwendet abs(price) für negative Preise (Credit Spreads)
     # BAG (Combo): Holt Tick vom ersten Leg
 ```
 
@@ -140,11 +144,11 @@ def _get_price_increment(self, contract, price) -> float:
 
 **Fallback:** Wenn `reqMarketRule` leer zurückkommt → `minTick` aus ContractDetails verwenden.
 
-### Beispiel: SPX Option Market Rule (ID 239)
+### Beispiel: SPX Option Market Rule (ID 110)
 
 ```
-lowEdge=0.0  → increment=0.01  (unter $3)
-lowEdge=3.0  → increment=0.05  (ab $3)
+lowEdge=0.0  → increment=0.05  (unter $3)
+lowEdge=3.0  → increment=0.10  (ab $3)
 ```
 
 ### Testabdeckung
@@ -156,9 +160,9 @@ tests/ib/fixtures/market_rules.py       # Fixtures mit echten IB-Daten
 
 **Kritischer Test-Case:**
 ```python
-def test_bug_case_price_460_must_use_005(self):
-    """CRITICAL: Price $4.60 MUST use 0.05 tick (the original bug)."""
-    assert get_tick_for_price(4.60) == 0.05  # NOT 0.01!
+def test_bug_case_price_460_must_use_010(self):
+    """CRITICAL: Price $4.60 MUST use 0.10 tick for SPX."""
+    assert get_tick_for_price(4.60) == 0.10  # NOT 0.01!
 ```
 
 ---

@@ -26,17 +26,23 @@ from ib.fixtures.market_rules import (
     STOCK_MARKET_RULE,
     SPX_OPTION_CONTRACT_DETAILS,
     SPX_TICK_SIZE_TEST_CASES,
-    BUG_CASE_TICK_005,
+    BUG_CASE_TICK_010,
     create_spx_option_contract,
     MockPriceIncrement,
 )
 
 
 class TestTickSizeResolution:
-    """Test tick size resolution from market rules."""
+    """Test tick size resolution from market rules.
 
-    def test_spx_option_below_3_uses_001_tick(self):
-        """SPX option priced below $3 should use 0.01 tick."""
+    SPX official tick sizes (CBOE):
+    - Below $3.00: tick = 0.05 ($5.00)
+    - At/above $3.00: tick = 0.10 ($10.00)
+    Source: https://www.cboe.com/tradable_products/sp_500/spx_options/specifications/
+    """
+
+    def test_spx_option_below_3_uses_005_tick(self):
+        """SPX option priced below $3 should use 0.05 tick."""
         # Simulate the tick size lookup logic
         price = 2.50
         rule = SPX_OPTION_MARKET_RULE
@@ -49,10 +55,10 @@ class TestTickSizeResolution:
             else:
                 break
 
-        assert increment == 0.01, f"Price ${price} should use 0.01 tick"
+        assert increment == 0.05, f"Price ${price} should use 0.05 tick"
 
-    def test_spx_option_at_3_uses_005_tick(self):
-        """SPX option priced at exactly $3 should use 0.05 tick."""
+    def test_spx_option_at_3_uses_010_tick(self):
+        """SPX option priced at exactly $3 should use 0.10 tick."""
         price = 3.00
         rule = SPX_OPTION_MARKET_RULE
 
@@ -63,10 +69,10 @@ class TestTickSizeResolution:
             else:
                 break
 
-        assert increment == 0.05, f"Price ${price} should use 0.05 tick"
+        assert increment == 0.10, f"Price ${price} should use 0.10 tick"
 
-    def test_spx_option_above_3_uses_005_tick(self):
-        """SPX option priced above $3 should use 0.05 tick."""
+    def test_spx_option_above_3_uses_010_tick(self):
+        """SPX option priced above $3 should use 0.10 tick."""
         price = 4.60  # The specific bug case
         rule = SPX_OPTION_MARKET_RULE
 
@@ -77,7 +83,7 @@ class TestTickSizeResolution:
             else:
                 break
 
-        assert increment == 0.05, f"Price ${price} should use 0.05 tick, NOT 0.01"
+        assert increment == 0.10, f"Price ${price} should use 0.10 tick, NOT 0.01"
 
     @pytest.mark.parametrize("price,expected_tick,description", SPX_TICK_SIZE_TEST_CASES)
     def test_spx_tick_size_at_price_levels(self, price, expected_tick, description):
@@ -93,9 +99,9 @@ class TestTickSizeResolution:
 
         assert increment == expected_tick, description
 
-    def test_bug_case_price_460_must_use_005(self):
-        """CRITICAL: Price $4.60 MUST use 0.05 tick (the original bug)."""
-        price, expected_tick, description = BUG_CASE_TICK_005
+    def test_bug_case_price_460_must_use_010(self):
+        """CRITICAL: Price $4.60 MUST use 0.10 tick for SPX (the original bug)."""
+        price, expected_tick, description = BUG_CASE_TICK_010
         rule = SPX_OPTION_MARKET_RULE
 
         increment = 0.01
@@ -143,7 +149,12 @@ class TestBrokerTickSizeIntegration:
     """Integration tests for TWSBroker tick size methods."""
 
     def test_get_price_increment_with_cached_rules(self):
-        """Test _get_price_increment uses cached market rules."""
+        """Test _get_price_increment uses cached market rules.
+
+        SPX official tick sizes (CBOE):
+        - Below $3.00: tick = 0.05
+        - At/above $3.00: tick = 0.10
+        """
         from trailing_stop_web.broker import TWSBroker
 
         broker = TWSBroker()
@@ -156,21 +167,25 @@ class TestBrokerTickSizeIntegration:
         contract.exchange = "SMART"
         contract.comboLegs = None
 
-        # Pre-populate the cache with SPX market rules
-        cache_key = (contract.conId, "SMART")
-        broker._market_rules_cache[cache_key] = [
-            SimpleNamespace(lowEdge=0.0, increment=0.01),
-            SimpleNamespace(lowEdge=3.0, increment=0.05),
+        # Pre-populate the cache with SPX market rules (correct CBOE values)
+        # Cache key is conId only (unique identifier)
+        broker._market_rules_cache[contract.conId] = [
+            SimpleNamespace(lowEdge=0.0, increment=0.05),   # Below $3: 0.05
+            SimpleNamespace(lowEdge=3.0, increment=0.10),   # $3 and above: 0.10
         ]
 
         # Test at various price levels
-        assert broker._get_price_increment(contract, 2.50) == 0.01
-        assert broker._get_price_increment(contract, 3.00) == 0.05
-        assert broker._get_price_increment(contract, 4.60) == 0.05
-        assert broker._get_price_increment(contract, 10.00) == 0.05
+        assert broker._get_price_increment(contract, 2.50) == 0.05   # Below $3
+        assert broker._get_price_increment(contract, 3.00) == 0.10   # At $3
+        assert broker._get_price_increment(contract, 4.60) == 0.10   # Above $3
+        assert broker._get_price_increment(contract, 10.00) == 0.10  # Well above $3
 
     def test_get_price_increment_with_negative_prices(self):
-        """Test _get_price_increment handles negative prices (credit spreads)."""
+        """Test _get_price_increment handles negative prices (credit spreads).
+
+        Credit spread prices are negative, but tick size is based on abs(price).
+        SPX: 0.05 below $3, 0.10 at/above $3
+        """
         from trailing_stop_web.broker import TWSBroker
 
         broker = TWSBroker()
@@ -182,19 +197,19 @@ class TestBrokerTickSizeIntegration:
         contract.exchange = "SMART"
         contract.comboLegs = None
 
-        # Pre-populate the cache with SPX market rules
-        cache_key = (contract.conId, "SMART")
-        broker._market_rules_cache[cache_key] = [
-            SimpleNamespace(lowEdge=0.0, increment=0.01),
-            SimpleNamespace(lowEdge=3.0, increment=0.05),
+        # Pre-populate the cache with SPX market rules (correct CBOE values)
+        # Cache key is conId only (unique identifier)
+        broker._market_rules_cache[contract.conId] = [
+            SimpleNamespace(lowEdge=0.0, increment=0.05),   # Below $3: 0.05
+            SimpleNamespace(lowEdge=3.0, increment=0.10),   # $3 and above: 0.10
         ]
 
         # Credit spread prices are negative, but tick size is based on abs(price)
-        # Price -4.60 has abs value 4.60, which is >= 3.0, so tick = 0.05
-        assert broker._get_price_increment(contract, -4.60) == 0.05
-        assert broker._get_price_increment(contract, -2.50) == 0.01
-        assert broker._get_price_increment(contract, -3.00) == 0.05
-        assert broker._get_price_increment(contract, -10.00) == 0.05
+        # Price -4.60 has abs value 4.60, which is >= 3.0, so tick = 0.10
+        assert broker._get_price_increment(contract, -4.60) == 0.10   # abs=4.60 >= 3
+        assert broker._get_price_increment(contract, -2.50) == 0.05   # abs=2.50 < 3
+        assert broker._get_price_increment(contract, -3.00) == 0.10   # abs=3.00 >= 3
+        assert broker._get_price_increment(contract, -10.00) == 0.10  # abs=10.00 >= 3
 
     def test_get_price_increment_cache_miss_returns_default(self):
         """Test _get_price_increment returns default when cache miss."""
@@ -275,15 +290,16 @@ class TestComboTickSize:
         pos.raw_contract = leg_contract
         broker._positions[111111] = pos
 
-        # Cache market rules for the leg
-        broker._market_rules_cache[(111111, "SMART")] = [
-            SimpleNamespace(lowEdge=0.0, increment=0.01),
-            SimpleNamespace(lowEdge=3.0, increment=0.05),
+        # Cache market rules for the leg (key is conId only)
+        # Use correct SPX values: 0.05 below $3, 0.10 at/above $3
+        broker._market_rules_cache[111111] = [
+            SimpleNamespace(lowEdge=0.0, increment=0.05),
+            SimpleNamespace(lowEdge=3.0, increment=0.10),
         ]
 
         # BAG should get tick from first leg
-        assert broker._get_price_increment(combo_contract, 4.60) == 0.05
-        assert broker._get_price_increment(combo_contract, 2.50) == 0.01
+        assert broker._get_price_increment(combo_contract, 4.60) == 0.10   # >= $3
+        assert broker._get_price_increment(combo_contract, 2.50) == 0.05   # < $3
 
 
 class TestCreateFallbackRule:
@@ -324,8 +340,8 @@ class TestCreateFallbackRule:
         contract.exchange = "SMART"
         contract.comboLegs = None
 
-        # Use fallback rule in cache
-        broker._market_rules_cache[(888888, "SMART")] = broker._create_fallback_rule(0.05)
+        # Use fallback rule in cache (key is conId only)
+        broker._market_rules_cache[888888] = broker._create_fallback_rule(0.05)
 
         # Should use 0.05 at all price levels
         assert broker._get_price_increment(contract, 1.00) == 0.05

@@ -52,11 +52,14 @@ class MockContract:
 # MARKET RULE FIXTURES
 # =============================================================================
 
-# SPX Option Market Rule (Rule ID 239)
-# This is the critical case: tick size changes at $3.00
+# SPX Option Market Rule (Rule ID 110 from IB)
+# CBOE official tick sizes for SPX:
+# - Below $3.00: tick = 0.05 ($5.00)
+# - At/above $3.00: tick = 0.10 ($10.00)
+# Source: https://www.cboe.com/tradable_products/sp_500/spx_options/specifications/
 SPX_OPTION_MARKET_RULE = [
-    MockPriceIncrement(lowEdge=0.0, increment=0.01),   # Below $3: tick=0.01
-    MockPriceIncrement(lowEdge=3.0, increment=0.05),   # $3 and above: tick=0.05
+    MockPriceIncrement(lowEdge=0.0, increment=0.05),   # Below $3: tick=0.05
+    MockPriceIncrement(lowEdge=3.0, increment=0.10),   # $3 and above: tick=0.10
 ]
 
 # Stock Market Rule (typical US equities)
@@ -146,16 +149,18 @@ def create_stock_contract(
 
 # These test cases verify the tick size at different price levels
 # Format: (price, expected_tick, description)
+# SPX official: 0.05 below $3, 0.10 at/above $3
 SPX_TICK_SIZE_TEST_CASES = [
-    (0.50, 0.01, "SPX option below $3 should use 0.01 tick"),
-    (1.00, 0.01, "SPX option at $1 should use 0.01 tick"),
-    (2.99, 0.01, "SPX option just below $3 should use 0.01 tick"),
-    (3.00, 0.05, "SPX option at exactly $3 should use 0.05 tick"),
-    (3.01, 0.05, "SPX option just above $3 should use 0.05 tick"),
-    (5.00, 0.05, "SPX option at $5 should use 0.05 tick"),
-    (10.00, 0.05, "SPX option at $10 should use 0.05 tick"),
-    (50.00, 0.05, "SPX option at $50 should use 0.05 tick"),
+    (0.50, 0.05, "SPX option below $3 should use 0.05 tick"),
+    (1.00, 0.05, "SPX option at $1 should use 0.05 tick"),
+    (2.99, 0.05, "SPX option just below $3 should use 0.05 tick"),
+    (3.00, 0.10, "SPX option at exactly $3 should use 0.10 tick"),
+    (3.01, 0.10, "SPX option just above $3 should use 0.10 tick"),
+    (5.00, 0.10, "SPX option at $5 should use 0.10 tick"),
+    (10.00, 0.10, "SPX option at $10 should use 0.10 tick"),
+    (50.00, 0.10, "SPX option at $50 should use 0.10 tick"),
 ]
 
 # This is the specific bug case: price >= $3 was incorrectly using 0.01
-BUG_CASE_TICK_005 = (4.60, 0.05, "Price $4.60 MUST use 0.05 tick, not 0.01")
+# The correct tick for SPX at $4.60 is 0.10 (not 0.01, not 0.05)
+BUG_CASE_TICK_010 = (4.60, 0.10, "Price $4.60 MUST use 0.10 tick for SPX")
