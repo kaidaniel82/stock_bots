@@ -262,6 +262,7 @@ class TWSBroker:
         self._last_heartbeat: Optional[float] = None  # Last successful heartbeat
         self._reconnect_count: int = 0  # Total reconnects since start
         self._last_disconnect_reason: str = ""  # Why we disconnected
+        self._current_status: str = "Disconnected"  # Current status string for UI
 
         # Trading hours cache: {symbol: {date: str, trading_hours: str, liquid_hours: str, time_zone_id: str}}
         # Cached per symbol (not per position) and invalidated on date change or at midnight
@@ -477,7 +478,8 @@ class TWSBroker:
         )
 
     def _notify_status(self, status: str) -> None:
-        """Notify status change via callback."""
+        """Notify status change via callback and store for polling."""
+        self._current_status = status  # Always store for get_connection_status()
         if self._connection_status_callback:
             try:
                 self._connection_status_callback(status)
@@ -487,6 +489,18 @@ class TWSBroker:
     def set_connection_status_callback(self, callback: Callable[[str], None]) -> None:
         """Set callback for connection status changes."""
         self._connection_status_callback = callback
+
+    def get_connection_status(self) -> str:
+        """Get current connection status string for UI display.
+
+        Returns status like:
+        - "Disconnected"
+        - "Connecting..."
+        - "Connected"
+        - "Connection lost"
+        - "Reconnecting in Xs (#N) (reason)"
+        """
+        return self._current_status
 
     def get_connection_metrics(self) -> dict:
         """Get connection metrics for monitoring/debugging.

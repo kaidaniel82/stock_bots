@@ -142,9 +142,40 @@ class TestReconnectCountTracking:
             broker._stop_requested = True  # Stop immediately
             broker._last_disconnect_reason = ""
             broker._connection_status_callback = None
+            broker._current_status = "Disconnected"
             broker.ib = Mock()
 
             broker._handle_reconnection()
 
             assert broker._reconnect_attempt == 1
             assert broker._reconnect_count == 1
+
+
+class TestConnectionStatusPolling:
+    """Test that connection status can be polled by UI."""
+
+    def test_get_connection_status_returns_current(self):
+        """get_connection_status should return _current_status."""
+        from trailing_stop_web.broker import TWSBroker
+
+        with patch.object(TWSBroker, '__init__', lambda x: None):
+            broker = TWSBroker()
+            broker._current_status = "Reconnecting in 5s (#2) (Heartbeat timeout)"
+
+            status = broker.get_connection_status()
+
+            assert status == "Reconnecting in 5s (#2) (Heartbeat timeout)"
+
+    def test_notify_status_updates_current_status(self):
+        """_notify_status should update _current_status for polling."""
+        from trailing_stop_web.broker import TWSBroker
+
+        with patch.object(TWSBroker, '__init__', lambda x: None):
+            broker = TWSBroker()
+            broker._current_status = "Disconnected"
+            broker._connection_status_callback = None
+
+            broker._notify_status("Connected")
+
+            assert broker._current_status == "Connected"
+            assert broker.get_connection_status() == "Connected"

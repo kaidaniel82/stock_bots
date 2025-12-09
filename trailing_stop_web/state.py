@@ -1112,10 +1112,17 @@ class AppState(rx.State):
         # 1. Sync connection status from broker
         t0 = time.perf_counter()
         broker_connected = BROKER.is_connected()
+        broker_status = BROKER.get_connection_status()
+
+        # Always sync status string (shows reconnect progress)
+        if broker_status != self.connection_status:
+            self.connection_status = broker_status
+            # Log status changes for visibility
+            logger.debug(f"Connection status: {broker_status}")
+
         if broker_connected != self.is_connected:
             self.is_connected = broker_connected
             if broker_connected:
-                self.connection_status = "Connected"
                 self.is_monitoring = True
                 self.status_message = "Connected - refreshing positions..."
                 # Initialize chart states for all groups
@@ -1123,8 +1130,6 @@ class AppState(rx.State):
                 # Load underlying history if group selected
                 if self.selected_group_id:
                     self._load_group_chart_data(self.selected_group_id)
-            else:
-                self.connection_status = "Disconnected"
         timings["1_broker_sync"] = (time.perf_counter() - t0) * 1000
 
         if not self.is_connected or not self.is_monitoring:
