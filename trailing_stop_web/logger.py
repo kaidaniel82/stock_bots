@@ -4,19 +4,16 @@ Log Levels:
 - INFO: Zusammenfassungen, wichtige Events (Connection, Stop Triggered, etc.)
 - DEBUG: Detail-Logs pro Tick (für Entwicklung)
 """
-from pathlib import Path
 from loguru import logger
 
-# Log directory
-LOG_DIR = Path(__file__).parent.parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+from .paths import LOGS_DIR
 
 # Remove default handler (no console output!)
 logger.remove()
 
 # Single file handler - DEBUG level (all logs)
 logger.add(
-    LOG_DIR / "trailing_stop_{time:YYYY-MM-DD}.log",
+    LOGS_DIR / "trailing_stop_{time:YYYY-MM-DD}.log",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
     level="DEBUG",
     rotation="00:00",

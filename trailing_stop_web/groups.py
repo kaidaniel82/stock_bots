@@ -1,16 +1,15 @@
 """Group management with JSON persistence."""
 import json
-from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Optional
 
 from .logger import logger
 from .metrics import calculate_stop_price
+from .paths import DATA_DIR
 from .strategy_classifier import classify_from_leg_data
 
-# Data directory for persistence - in project folder (hot-reload excluded via REFLEX_HOT_RELOAD_EXCLUDE_PATHS)
-DATA_DIR = Path(__file__).parent.parent / "data"
+# Groups file in platform-specific data directory
 GROUPS_FILE = DATA_DIR / "groups.json"
 
 
