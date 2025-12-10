@@ -2033,7 +2033,7 @@ class AppState(rx.State):
 
         fig.update_layout(
             xaxis_rangeslider_visible=False,
-            height=230,
+            autosize=True,
             margin=dict(l=5, r=50, t=0, b=25),
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(30,30,30,0.8)',
@@ -2158,7 +2158,7 @@ class AppState(rx.State):
             y_range = None
 
         fig.update_layout(
-            height=230,
+            autosize=True,
             margin=dict(l=5, r=50, t=0, b=25),
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(30,30,30,0.8)',
@@ -2265,7 +2265,7 @@ class AppState(rx.State):
 
         fig.update_layout(
             xaxis_rangeslider_visible=False,
-            height=230,
+            autosize=True,
             margin=dict(l=5, r=50, t=0, b=25),
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(30,30,30,0.8)',

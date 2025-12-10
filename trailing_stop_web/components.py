@@ -168,7 +168,8 @@ def tab_navigation() -> rx.Component:
         rx.spacer(),
         rx.text(AppState.status_message, size="2", color=COLORS["text_muted"]),
         width="100%",
-        padding_x="4",
+        padding_left="1rem",
+        padding_right="1rem",
         padding_y="0",
         align="center",
         background=COLORS["bg_app"],
@@ -938,7 +939,7 @@ def underlying_chart() -> rx.Component:
                 rx.plotly(
                     data=AppState.underlying_figure,
                     width="100%",
-                    height="230px",
+                    height="calc((100vh - 400px) / 3)",
                 ),
                 rx.text("Select a group to view charts", color=COLORS["text_muted"]),
             ),
@@ -987,7 +988,7 @@ def combo_price_chart() -> rx.Component:
                 rx.plotly(
                     data=AppState.position_figure,
                     width="100%",
-                    height="230px",
+                    height="calc((100vh - 400px) / 3)",
                 ),
                 rx.text("Select a group", color=COLORS["text_muted"]),
             ),
@@ -1030,7 +1031,7 @@ def live_oscillator_chart() -> rx.Component:
                 rx.plotly(
                     data=AppState.pnl_figure,
                     width="100%",
-                    height="230px",
+                    height="calc((100vh - 400px) / 3)",
                 ),
                 rx.text("Select a group", color=COLORS["text_muted"]),
             ),
@@ -1056,7 +1057,8 @@ def charts_section() -> rx.Component:
         # Row 3: P&L History (full width)
         live_oscillator_chart(),
         width="100%",
-        spacing="3",
+        height="100%",
+        spacing="1",
     )
 
 
@@ -1124,12 +1126,12 @@ def monitor_tab() -> rx.Component:
         rx.box(
             charts_section(),
             flex="1",
-            padding="3",
-            overflow_y="auto",
+            padding="2",
+            height="100%",
         ),
         width="100%",
-        height="calc(100vh - 100px)",
-        spacing="0",
+        height="calc(100vh - 95px)",
+        spacing="4",
         align_items="stretch",
     )
 

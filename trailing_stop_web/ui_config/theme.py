@@ -155,7 +155,7 @@ LAYOUT = {
 
     # Content Area
     "content_max_width": "100%",  # Full width for terminal
-    "content_padding": "1rem 4rem",  # More horizontal padding
+    "content_padding": "0.5rem 1rem 0.5rem 1rem",  # top right bottom left
 
     # Sidebar panels
     "sidebar_width": "300px",
