@@ -359,11 +359,30 @@ def create_group_panel() -> rx.Component:
 # SHARED GROUP CARD COMPONENTS
 # =============================================================================
 
+def _group_legs_display(group: dict) -> rx.Component:
+    """Legs display box using pre-formatted text (responsive via word-wrap)."""
+    return rx.box(
+        rx.text(
+            group["legs_str"],
+            size="1",
+            white_space="pre-wrap",  # Allows wrapping on small screens
+            word_break="break-word",
+            font_family="monospace",
+            color=COLORS["text_secondary"],
+        ),
+        padding="2",
+        background=COLORS["bg_elevated"],
+        border_radius="6px",
+        width="100%",
+        overflow_x="auto",
+    )
+
+
 def _group_header(group: dict, is_selected: bool = False) -> rx.Component:
     """Group card header with name, badges, and status."""
     is_active = group["is_active"]
     is_credit = group["is_credit"]
-    strategy_tag = group.get("strategy_tag", "Custom")
+    strategy_tag = group["strategy_tag"]
     return rx.hstack(
         # Left side: badges
         rx.hstack(
@@ -669,93 +688,191 @@ def _group_time_exit_config(group: dict, group_id: str) -> rx.Component:
 
 
 def group_card(group: dict, mode: str = "setup") -> rx.Component:
-    """Unified group card component.
+    """Unified group card component for Setup tab.
 
     Args:
         group: Group data dict
-        mode: "setup" (full config) or "monitor" (compact, clickable)
+        mode: "setup" (full config) - kept for compatibility
     """
+    group_id = group["id"]
+    is_active = group["is_active"]
+
+    # Build content for setup card
+    content = [
+        _group_header(group, is_selected=False),
+        # Responsive legs table (replaces pre-formatted text)
+        _group_legs_display(group),
+        # Prices row
+        _group_prices_row(group, size="2"),
+        # Greeks row
+        _group_greeks_row(group),
+        # Trailing config
+        _group_trailing_config(group, group_id),
+        # HWM/Stop row
+        _group_hwm_stop_row(group, show_trail=False),
+        # Time exit config
+        _group_time_exit_config(group, group_id),
+        # Action buttons
+        _group_action_buttons(group_id, is_active),
+    ]
+
+    return rx.box(
+        rx.vstack(*content, width="100%", spacing="2"),
+        background=COLORS["bg_panel"],
+        border=PANEL_STYLES["border"],
+        border_left=PANEL_STYLES["border_left"],
+        border_radius=PANEL_STYLES["border_radius"],
+        padding=PANEL_STYLES["padding"],
+        width="100%",
+    )
+
+
+def _monitor_card_collapsed_view(group: dict) -> rx.Component:
+    """Collapsed view for monitor card: Name, PnL, Mid, Stop only."""
+    group_id = group["id"]
+    is_active = group["is_active"]
+
+    return rx.vstack(
+        # Row 1: Expand button + Name + Badges
+        rx.hstack(
+            # Expand button (stop propagation to prevent triggering card's on_click)
+            rx.box(
+                rx.icon_button(
+                    rx.icon("chevron-right", size=16),
+                    on_click=AppState.toggle_group_collapsed(group_id),
+                    variant="ghost",
+                    size="1",
+                    color=COLORS["text_muted"],
+                ),
+                on_click=rx.stop_propagation,
+            ),
+            # Name
+            rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
+                   font_family=TYPOGRAPHY["font_family"]),
+            rx.spacer(),
+            # Badges
+            rx.hstack(
+                rx.badge(
+                    rx.cond(is_active, "ACTIVE", "IDLE"),
+                    color_scheme=rx.cond(is_active, "green", "gray"),
+                    size="1",
+                ),
+                rx.badge(group["strategy_tag"], color_scheme="gold", size="1"),
+                spacing="1",
+            ),
+            width="100%",
+            align="center",
+        ),
+        # Row 2: KPIs - Mid, Stop, P&L
+        rx.hstack(
+            rx.hstack(
+                rx.text("Mid:", size="1", color=COLORS["text_muted"]),
+                rx.text(group["mid_value_str"], size="1", weight="bold", color=COLORS["text_primary"]),
+                spacing="1",
+            ),
+            rx.hstack(
+                rx.text("Stop:", size="1", color=COLORS["text_muted"]),
+                rx.text(group["stop_str"], size="1", weight="bold", color=COLORS["stop"]),
+                spacing="1",
+            ),
+            rx.hstack(
+                rx.text("P&L:", size="1", color=COLORS["text_muted"]),
+                rx.text(group["pnl_mark_str"], size="1", weight="bold", color=group["pnl_color"]),
+                spacing="1",
+            ),
+            spacing="4",
+            width="100%",
+            justify="start",
+            padding_left="6",  # Align with name (after chevron)
+        ),
+        width="100%",
+        spacing="1",
+        padding="2",
+    )
+
+
+def _monitor_card_expanded_view(group: dict) -> rx.Component:
+    """Expanded view for monitor card: All details."""
     group_id = group["id"]
     is_active = group["is_active"]
     is_selected = AppState.selected_group_id == group_id
 
-    # Common content for both modes
-    content = [
-        _group_header(group, is_selected if mode == "monitor" else False),
-    ]
-
-    # Legs (Setup mode only)
-    if mode == "setup":
-        content.append(
+    return rx.vstack(
+        # Header with collapse button (stop propagation to prevent triggering card's on_click)
+        rx.hstack(
             rx.box(
-                rx.text(group["legs_str"], size="1", white_space="pre", font_family="monospace", color=COLORS["text_secondary"]),
-                padding="2",
-                background=COLORS["bg_elevated"],
-                border_radius="6px",
-                width="100%",
-            )
-        )
+                rx.icon_button(
+                    rx.icon("chevron-down", size=16),
+                    on_click=AppState.toggle_group_collapsed(group_id),
+                    variant="ghost",
+                    size="1",
+                    color=COLORS["text_muted"],
+                ),
+                on_click=rx.stop_propagation,
+            ),
+            rx.box(_group_header(group, is_selected=is_selected), flex="1"),
+            width="100%",
+            align="center",
+        ),
+        # Legs table
+        _group_legs_display(group),
+        # Prices row
+        _group_prices_row(group, size="1"),
+        # Greeks row
+        _group_greeks_row(group),
+        # HWM/Stop row with trail
+        _group_hwm_stop_row(group, show_trail=True),
+        # Action buttons
+        _group_action_buttons(group_id, is_active),
+        width="100%",
+        spacing="2",
+    )
 
-    # Prices row
-    content.append(_group_prices_row(group, size="2" if mode == "setup" else "1"))
 
-    # Greeks row
-    content.append(_group_greeks_row(group))
+def monitor_group_card(group: dict) -> rx.Component:
+    """Monitor tab group card with collapse/expand functionality."""
+    group_id = group["id"]
+    is_selected = AppState.selected_group_id == group_id
+    is_collapsed = AppState.collapsed_groups.contains(group_id)
 
-    # Trailing config (Setup mode only)
-    if mode == "setup":
-        content.append(_group_trailing_config(group, group_id))
-
-    # HWM/Stop row
-    content.append(_group_hwm_stop_row(group, show_trail=(mode == "monitor")))
-
-    # Time exit config (Setup mode only)
-    if mode == "setup":
-        content.append(_group_time_exit_config(group, group_id))
-
-    # Action buttons
-    content.append(_group_action_buttons(group_id, is_active))
-
-    # Build card with mode-specific styling
-    card_props = {
-        "background": COLORS["bg_panel"],
-        "border": PANEL_STYLES["border"],
-        "border_radius": PANEL_STYLES["border_radius"],
-        "padding": PANEL_STYLES["padding"],
-        "width": "100%",
-    }
-
-    if mode == "monitor":
-        card_props["on_click"] = AppState.select_group(group_id)
-        card_props["cursor"] = "pointer"
-        # Selected cards: full orange border, glow effect, subtle orange tint
-        card_props["border"] = rx.cond(
-            is_selected,
-            f"2px solid {COLORS['accent']}",
-            PANEL_STYLES["border"],
-        )
-        card_props["border_left"] = rx.cond(
-            is_selected,
-            f"4px solid {COLORS['accent']}",
-            PANEL_STYLES["border_left"],
-        )
-        card_props["background"] = rx.cond(
-            is_selected,
-            "rgba(255, 165, 0, 0.08)",  # Subtle orange tint
-            COLORS["bg_panel"],
-        )
-        card_props["box_shadow"] = rx.cond(
-            is_selected,
-            f"0 0 12px rgba(255, 165, 0, 0.25)",  # Orange glow
-            "none",
-        )
-        card_props["_hover"] = {"background": COLORS["bg_elevated"]}
-    else:
-        card_props["border_left"] = PANEL_STYLES["border_left"]
+    # Card styling
+    border = rx.cond(
+        is_selected,
+        f"2px solid {COLORS['accent']}",
+        PANEL_STYLES["border"],
+    )
+    border_left = rx.cond(
+        is_selected,
+        f"4px solid {COLORS['accent']}",
+        PANEL_STYLES["border_left"],
+    )
+    background = rx.cond(
+        is_selected,
+        "rgba(255, 165, 0, 0.08)",
+        COLORS["bg_panel"],
+    )
+    box_shadow = rx.cond(
+        is_selected,
+        "0 0 12px rgba(255, 165, 0, 0.25)",
+        "none",
+    )
 
     return rx.box(
-        rx.vstack(*content, width="100%", spacing="2"),
-        **card_props,
+        rx.cond(
+            is_collapsed,
+            _monitor_card_collapsed_view(group),
+            _monitor_card_expanded_view(group),
+        ),
+        background=background,
+        border=border,
+        border_left=border_left,
+        border_radius=PANEL_STYLES["border_radius"],
+        padding=PANEL_STYLES["padding"],
+        width="100%",
+        box_shadow=box_shadow,
+        cursor="pointer",
+        on_click=AppState.select_group(group_id),
+        _hover={"background": COLORS["bg_elevated"]},
     )
 
 
@@ -936,27 +1053,77 @@ def charts_section() -> rx.Component:
     )
 
 
-def monitor_tab() -> rx.Component:
-    """Monitor tab content - Groups overview with charts."""
-    return rx.vstack(
-        # Groups in 3-column grid with selection
-        rx.cond(
-            AppState.groups.length() > 0,
-            rx.box(
-                rx.grid(
-                    rx.foreach(AppState.groups, compact_group_card),
-                    columns="3",
-                    spacing="3",
-                    width="100%",
+def _groups_sidebar() -> rx.Component:
+    """Left sidebar with groups list (sorted alphabetically, collapsible)."""
+    return rx.box(
+        rx.vstack(
+            # Header with expand/collapse all buttons
+            rx.hstack(
+                rx.text("GROUPS", size="2", weight="bold", color=COLORS["primary"],
+                       font_family=TYPOGRAPHY["font_family"]),
+                rx.spacer(),
+                rx.hstack(
+                    rx.icon_button(
+                        rx.icon("chevrons-down-up", size=14),
+                        on_click=AppState.collapse_all_groups,
+                        variant="ghost",
+                        size="1",
+                        title="Collapse All",
+                    ),
+                    rx.icon_button(
+                        rx.icon("chevrons-up-down", size=14),
+                        on_click=AppState.expand_all_groups,
+                        variant="ghost",
+                        size="1",
+                        title="Expand All",
+                    ),
+                    spacing="1",
                 ),
                 width="100%",
+                align="center",
+                padding_bottom="2",
             ),
-            rx.text("No groups to monitor. Create groups in Setup tab.", color=COLORS["text_muted"]),
+            # Groups list (sorted alphabetically)
+            rx.cond(
+                AppState.groups_sorted.length() > 0,
+                rx.vstack(
+                    rx.foreach(AppState.groups_sorted, monitor_group_card),
+                    spacing="2",
+                    width="100%",
+                ),
+                rx.text("No groups yet.", color=COLORS["text_muted"], size="1"),
+            ),
+            width="100%",
+            spacing="2",
+            overflow_y="auto",
+            max_height="calc(100vh - 150px)",
         ),
-        # Charts section (3 charts: Underlying, Position Price, Live P&L)
-        charts_section(),
+        width="320px",
+        min_width="280px",
+        max_width="400px",
+        padding="3",
+        background=COLORS["bg_surface"],
+        border_right=f"1px solid {COLORS['border']}",
+        height="100%",
+    )
+
+
+def monitor_tab() -> rx.Component:
+    """Monitor tab content - 2-column layout: Groups left, Charts right."""
+    return rx.hstack(
+        # Left: Groups sidebar (vertical list, alphabetically sorted)
+        _groups_sidebar(),
+        # Right: Charts section
+        rx.box(
+            charts_section(),
+            flex="1",
+            padding="3",
+            overflow_y="auto",
+        ),
         width="100%",
-        spacing="4",
+        height="calc(100vh - 100px)",
+        spacing="0",
+        align_items="stretch",
     )
 
 
