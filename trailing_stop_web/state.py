@@ -2257,16 +2257,49 @@ class AppState(rx.State):
 
     # === Order Management ===
 
+    @rx.event
     def cancel_all_orders(self):
         """Cancel all orders for all groups at IB."""
         logger.info("Canceling all orders...")
         cancelled_count = 0
 
         for g in GROUP_MANAGER.get_all():
-            if g.is_active and g.oca_group_id:
+            if not g.is_active:
+                continue
+
+            logger.info(f"Processing group {g.id} ({g.name}): trailing_order_id={g.trailing_order_id}, "
+                       f"oca_group_id={g.oca_group_id}, time_exit_order_id={g.time_exit_order_id}")
+
+            cancelled = False
+
+            # For combo orders: OCA is not supported, use trailing_order_id directly
+            if g.trailing_order_id:
+                logger.info(f"Canceling trailing order: {g.trailing_order_id}")
+                if BROKER.cancel_order(g.trailing_order_id):
+                    cancelled = True
+                    logger.info(f"Successfully cancelled trailing order {g.trailing_order_id}")
+                else:
+                    logger.warning(f"Failed to cancel trailing order {g.trailing_order_id}")
+
+            # Try OCA group as fallback (only works for single-leg orders)
+            if not cancelled and g.oca_group_id:
+                logger.info(f"Canceling OCA group: {g.oca_group_id}")
                 if BROKER.cancel_oca_group(g.oca_group_id):
-                    cancelled_count += 1
-                GROUP_MANAGER.deactivate(g.id, clear_orders=True)
+                    cancelled = True
+                    logger.info(f"Successfully cancelled OCA group {g.oca_group_id}")
+                else:
+                    logger.warning(f"Failed to cancel OCA group {g.oca_group_id}")
+
+            # Also try to cancel time exit order if present
+            if g.time_exit_order_id:
+                logger.info(f"Canceling time exit order: {g.time_exit_order_id}")
+                BROKER.cancel_order(g.time_exit_order_id)
+
+            if cancelled:
+                cancelled_count += 1
+
+            # Deactivate group and clear orders
+            GROUP_MANAGER.deactivate(g.id, clear_orders=True)
 
         self._load_groups_from_manager()
         self.status_message = f"Cancelled {cancelled_count} order groups"
