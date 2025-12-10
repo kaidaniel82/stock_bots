@@ -172,6 +172,11 @@ class AppState(rx.State):
     delete_confirm_group_id: str = ""  # Group ID pending delete confirmation
     selected_group_id: str = ""  # Currently selected group in monitor tab
 
+    # === Collapsed Groups (for Monitor tab) ===
+    # Groups that are collapsed (showing only KPIs: Name, PnL, Mid, Stop)
+    # Default: all collapsed on monitor tab
+    collapsed_groups: list[str] = []  # List of group IDs that are collapsed
+
     # === Chart Header Info (updated every render cycle) ===
     # Position OHLC Header: Trigger value (based on trigger_price_type), Stop, Limit, HWM, Fill
     chart_trigger_label: str = "Mid"  # "Mark", "Mid", "Bid", "Ask", "Last"
@@ -1322,6 +1327,9 @@ class AppState(rx.State):
     def set_active_tab(self, tab: str):
         """Switch between setup and monitor tabs."""
         self.active_tab = tab
+        # Auto-collapse all groups when switching to monitor tab
+        if tab == "monitor":
+            self.collapsed_groups = [g["id"] for g in self.groups]
 
     def select_group(self, group_id: str):
         """Select a group in monitor view and load chart data."""
@@ -1332,6 +1340,25 @@ class AppState(rx.State):
             self._init_chart_state(group_id)
         # Load underlying history for Chart 1
         self._load_group_chart_data(group_id)
+
+    def toggle_group_collapsed(self, group_id: str):
+        """Toggle collapsed state of a group card on monitor tab."""
+        logger.debug(f"toggle_group_collapsed called with group_id={group_id}")
+        new_collapsed = list(self.collapsed_groups)
+        if group_id in new_collapsed:
+            new_collapsed.remove(group_id)
+        else:
+            new_collapsed.append(group_id)
+        self.collapsed_groups = new_collapsed
+
+    def collapse_all_groups(self):
+        """Collapse all groups on monitor tab."""
+        all_group_ids = [g["id"] for g in self.groups]
+        self.collapsed_groups = all_group_ids
+
+    def expand_all_groups(self):
+        """Expand all groups on monitor tab."""
+        self.collapsed_groups = []
 
     def _load_group_chart_data(self, group_id: str):
         """Load underlying historical chart data for a group.
@@ -1391,6 +1418,11 @@ class AppState(rx.State):
             if p["con_id"] == first_con_id:
                 return p["symbol"]
         return ""
+
+    @rx.var
+    def groups_sorted(self) -> list[dict]:
+        """Get groups sorted alphabetically by name for monitor tab."""
+        return sorted(self.groups, key=lambda g: g.get("name", "").lower())
 
     # === Chart Rendering Methods (NOT @rx.var - controlled updates) ===
 
