@@ -753,11 +753,12 @@ def _monitor_card_collapsed_view(group: dict) -> rx.Component:
                     color=COLORS["text_muted"],
                 ),
                 on_click=rx.stop_propagation,
+                display="flex",
+                align_items="center",
             ),
             # Name
             rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
                    font_family=TYPOGRAPHY["font_family"]),
-            rx.spacer(),
             # Badges
             rx.hstack(
                 rx.badge(
@@ -767,9 +768,12 @@ def _monitor_card_collapsed_view(group: dict) -> rx.Component:
                 ),
                 rx.badge(group["strategy_tag"], color_scheme="gold", size="1"),
                 spacing="1",
+                align="center",
             ),
             width="100%",
             align="center",
+            justify="start",
+            spacing="2",
         ),
         # Row 2: KPIs - Mid, Stop, P&L
         rx.hstack(
@@ -795,7 +799,7 @@ def _monitor_card_collapsed_view(group: dict) -> rx.Component:
         ),
         width="100%",
         spacing="1",
-        padding="2",
+        padding="1",
     )
 
 
@@ -806,8 +810,9 @@ def _monitor_card_expanded_view(group: dict) -> rx.Component:
     is_selected = AppState.selected_group_id == group_id
 
     return rx.vstack(
-        # Header with collapse button (stop propagation to prevent triggering card's on_click)
+        # Header with collapse button - same layout as collapsed view
         rx.hstack(
+            # Collapse button (stop propagation to prevent triggering card's on_click)
             rx.box(
                 rx.icon_button(
                     rx.icon("chevron-down", size=16),
@@ -817,10 +822,27 @@ def _monitor_card_expanded_view(group: dict) -> rx.Component:
                     color=COLORS["text_muted"],
                 ),
                 on_click=rx.stop_propagation,
+                display="flex",
+                align_items="center",
             ),
-            rx.box(_group_header(group, is_selected=is_selected), flex="1"),
+            # Name
+            rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
+                   font_family=TYPOGRAPHY["font_family"]),
+            # Badges
+            rx.hstack(
+                rx.badge(
+                    rx.cond(is_active, "ACTIVE", "IDLE"),
+                    color_scheme=rx.cond(is_active, "green", "gray"),
+                    size="1",
+                ),
+                rx.badge(group["strategy_tag"], color_scheme="gold", size="1"),
+                spacing="1",
+                align="center",
+            ),
             width="100%",
             align="center",
+            justify="start",
+            spacing="2",
         ),
         # Legs table
         _group_legs_display(group),
@@ -833,7 +855,8 @@ def _monitor_card_expanded_view(group: dict) -> rx.Component:
         # Action buttons
         _group_action_buttons(group_id, is_active),
         width="100%",
-        spacing="2",
+        spacing="1",
+        padding="1",
     )
 
 
@@ -875,7 +898,7 @@ def monitor_group_card(group: dict) -> rx.Component:
         border=border,
         border_left=border_left,
         border_radius=PANEL_STYLES["border_radius"],
-        padding=PANEL_STYLES["padding"],
+        padding="0.5rem",
         width="100%",
         box_shadow=box_shadow,
         cursor="pointer",
