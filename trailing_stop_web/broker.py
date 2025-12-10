@@ -387,10 +387,13 @@ class TWSBroker:
             self.ib.sleep(0.1)  # Process IB events
 
             if not self.ib.isConnected():
-                self._last_disconnect_reason = "ib.isConnected() returned False"
-                logger.warning(f"TWS connection lost: {self._last_disconnect_reason}")
-                self._connected = False
-                self._notify_status("Connection lost")
+                # Only report "Connection lost" if NOT a manual disconnect
+                # Manual disconnect sets _stop_requested=True before ib.disconnect()
+                if not self._stop_requested:
+                    self._last_disconnect_reason = "ib.isConnected() returned False"
+                    logger.warning(f"TWS connection lost: {self._last_disconnect_reason}")
+                    self._connected = False
+                    self._notify_status("Connection lost")
                 break
 
             # Check for midnight and clear trading hours cache
@@ -401,10 +404,12 @@ class TWSBroker:
             # Heartbeat watchdog: send reqCurrentTime every HEARTBEAT_INTERVAL
             if now - last_heartbeat_check >= HEARTBEAT_INTERVAL:
                 if not self._send_heartbeat():
-                    self._last_disconnect_reason = "Heartbeat timeout"
-                    logger.warning(f"TWS connection lost: {self._last_disconnect_reason}")
-                    self._connected = False
-                    self._notify_status("Connection lost (heartbeat timeout)")
+                    # Only report if NOT a manual disconnect
+                    if not self._stop_requested:
+                        self._last_disconnect_reason = "Heartbeat timeout"
+                        logger.warning(f"TWS connection lost: {self._last_disconnect_reason}")
+                        self._connected = False
+                        self._notify_status("Connection lost (heartbeat timeout)")
                     break
                 last_heartbeat_check = now
 
@@ -641,6 +646,8 @@ class TWSBroker:
         self._reconnect_delay = RECONNECT_INITIAL_DELAY
 
         if self._thread is None or not self._thread.is_alive():
+            # Create fresh IB instance for clean connect after previous disconnect
+            self.ib = IB()
             self._thread = Thread(target=self._run_loop, daemon=True)
             self._thread.start()
 
