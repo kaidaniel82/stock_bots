@@ -48,6 +48,10 @@ COLORS = {
     "bid": "#FFB347",      # Bid - amber
     "connected": "#00D26A",
     "disconnected": "#FF3B30",
+
+    # Market status backgrounds (for legs display)
+    "market_open_bg": "rgba(0, 210, 106, 0.15)",    # Greenish when market open
+    "market_closed_bg": "rgba(112, 112, 112, 0.15)",  # Gray when market closed
 }
 
 

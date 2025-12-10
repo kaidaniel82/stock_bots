@@ -360,7 +360,19 @@ def create_group_panel() -> rx.Component:
 # =============================================================================
 
 def _group_legs_display(group: dict) -> rx.Component:
-    """Legs display box using pre-formatted text (responsive via word-wrap)."""
+    """Legs display box using pre-formatted text (responsive via word-wrap).
+
+    Background color indicates market status:
+    - Greenish when market is open
+    - Gray when market is closed
+    """
+    # Dynamic background based on market status
+    bg_color = rx.cond(
+        group["market_status"] == "Open",
+        COLORS["market_open_bg"],
+        COLORS["market_closed_bg"],
+    )
+
     return rx.box(
         rx.text(
             group["legs_str"],
@@ -371,7 +383,7 @@ def _group_legs_display(group: dict) -> rx.Component:
             color=COLORS["text_secondary"],
         ),
         padding="2",
-        background=COLORS["bg_elevated"],
+        background=bg_color,
         border_radius="6px",
         width="100%",
         overflow_x="auto",
@@ -379,7 +391,11 @@ def _group_legs_display(group: dict) -> rx.Component:
 
 
 def _group_header(group: dict, is_selected: bool = False) -> rx.Component:
-    """Group card header with name, badges, and status."""
+    """Group card header with name, badges, and status.
+
+    Note: Market status is now indicated by the legs display background color,
+    not by a separate badge (greenish = open, gray = closed).
+    """
     is_active = group["is_active"]
     is_credit = group["is_credit"]
     strategy_tag = group["strategy_tag"]
@@ -392,15 +408,6 @@ def _group_header(group: dict, is_selected: bool = False) -> rx.Component:
             rx.badge(
                 rx.cond(is_credit, "CREDIT", "DEBIT"),
                 color_scheme=rx.cond(is_credit, "orange", "cyan"),
-                size="1",
-            ),
-            rx.badge(
-                group["market_status"],
-                color_scheme=rx.cond(
-                    group["market_status"] == "Open",
-                    "green",
-                    rx.cond(group["market_status"] == "Closed", "red", "gray"),
-                ),
                 size="1",
             ),
             rx.badge(
