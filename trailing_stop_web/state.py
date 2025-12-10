@@ -3,7 +3,6 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 from threading import Lock
 import reflex as rx
 import plotly.graph_objects as go
@@ -18,9 +17,10 @@ from .config import (
     TWS_PORT, TWS_CLIENT_ID
 )
 from .logger import logger
+from .paths import DATA_DIR
 
-# Connection config file path (outside src/ to avoid hot-reload)
-CONNECTION_CONFIG_PATH = Path(__file__).parent.parent / "data" / "connection_config.json"
+# Connection config file in platform-specific data directory
+CONNECTION_CONFIG_PATH = DATA_DIR / "connection_config.json"
 
 
 def load_connection_config() -> dict:
