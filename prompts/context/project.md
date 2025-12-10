@@ -17,6 +17,9 @@
 - **Framework:** Reflex.dev (Python full-stack)
 - **Pattern:** States + Components in Python
 - **Styling:** Reflex built-in + Tailwind where needed
+- Wenn eine Aufgabe Reflex-Backend oder Reflex-UI betrifft,
+  muss der Plan berücksichtigen, dass `docs/reflex/REFLEX_GOTCHAS.md`
+  von den implementierenden Agents beachtet wird.
 
 ### Broker Integration
 - **Provider:** Interactive Brokers

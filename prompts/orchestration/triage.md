@@ -5,7 +5,21 @@
 > **KEINE Implementierung in diesem Schritt.**
 
 ---
+## Minimaler Output für Architect-light
+Architect-light nutzt dieses Dokument als Entscheidungsgrundlage,
+muss aber ein **vereinfachtes TRIAGE-Format** ausgeben.
 
+Verbindliches Ausgabeformat von Architect-light:
+
+[TRIAGE]
+SIZE: S|M|L
+Begründung: <1 kurzer Satz, warum diese Size gewählt wurde>
+[/TRIAGE]
+
+
+Die weiteren Abschnitte in diesem Dokument (Decision Tree, Keyword-Matrix,
+Pipelines etc.) dienen als **Guidelines** für die Entscheidung, aber müssen
+nicht 1:1 im Output wiederholt werden.
 ## Quick Decision Tree
 
 ```

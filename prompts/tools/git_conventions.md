@@ -1,5 +1,5 @@
 # Git Conventions
-
+> Für **alle** Änderungen (S, M, L) gilt: es wird immer auf einem Branch gearbeitet, nie direkt auf main/develop.
 > Branch- und Commit-Standards für alle Pipeline-Größen.
 
 ---
@@ -34,11 +34,14 @@ test/contract-tests-positions
 
 ### Branch pro Pipeline
 
+Für **jede** Pipeline (S, M, L) wird ein eigener Branch angelegt.  
+Es wird **niemals direkt** auf `main` oder `develop` entwickelt.
+
 | Pipeline | Branch erforderlich? |
-|----------|---------------------|
-| Direct (S) | Nein, direkt auf current |
-| Standard (M) | Ja, Feature-Branch |
-| Full (L) | Ja, Feature-Branch + optional Task-Branches |
+|----------|----------------------|
+| Direct (S)   | Ja, Feature-/Fix-Branch |
+| Standard (M) | Ja, Feature-/Fix-Branch |
+| Full (L)     | Ja, Feature-/Fix-Branch (+ optional Task-Branches) |
 
 ---
 
@@ -158,9 +161,18 @@ Sondern:
 ### Size S (Direct)
 
 ```bash
-# Direkt committen
+# Branch anlegen (z. B. Bugfix)
+git checkout -b fix/cancel-all-orders
+
+# Änderungen vornehmen ...
 git add .
-git commit -m "fix(ui): correct button alignment"
+
+git commit -m "fix(state): align cancel_all_orders with cancel_group_order"
+
+# Merge zurück auf main/develop
+git checkout main
+git merge fix/cancel-all-orders
+# optional: git merge --squash fix/cancel-all-orders
 ```
 
 ### Size M (Standard)

@@ -3,12 +3,21 @@
 > Definiert den Ablauf für jede Pipeline-Variante.
 > Wird vom Orchestrator nach Triage ausgeführt.
 
-## Pipeline Variants
+## Verwendung mit Architect-light
 
+Architect-light wählt auf Basis der TRIAGE-Entscheidung eine Pipeline
+(Direct | Standard | Full) und erstellt dann einen [PLAN]-Block.
+
+Das **Output-Format** von Architect-light ist in `prompts/agents/architect.md`
+definiert. Dieses Dokument (`pipeline.md`) dient als Referenz, wie die
+einzelnen Pipeline-Schritte aussehen sollen, und welche Gates (Review, QA,
+Integration) dazugehören. Es definiert **KEIN eigenes Pflichtformat** für den
+[PLAN]-Block, sondern nur die Inhalte, die der Plan berücksichtigen soll.
+
+## Pipeline Variants
 ---
 
 ## 1. Direct Pipeline (Size S)
-
 **Für:** Quick fixes, Typos, kleine Anpassungen (< 30 LOC, 1-2 Files)
 
 ### Ablauf
