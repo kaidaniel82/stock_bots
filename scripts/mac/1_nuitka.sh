@@ -58,7 +58,7 @@ $PYTHON -m nuitka \
     \
     --remove-output \
     \
-    "$PROJECT_ROOT/main.py"
+    "$PROJECT_ROOT/main_desktop.py"
 
 # Find the generated app bundle
 APP_BUNDLE=$(find "$BUILD_DIR" -maxdepth 1 -name "*.app" -type d | head -1)
