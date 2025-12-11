@@ -110,8 +110,9 @@ class MacBuilder:
             "--include-package=ib_insync",
 
             # Include data files
+            # NOTE: .web is copied separately after build to avoid codesign issues
+            # (node_modules has 29k+ files which exceeds macOS codesign limits)
             f"--include-data-dir={PROJECT_ROOT / 'trailing_stop_web'}=trailing_stop_web",
-            f"--include-data-dir={PROJECT_ROOT / '.web'}=.web",
             f"--include-data-file={PROJECT_ROOT / 'rxconfig.py'}=rxconfig.py",
             f"--include-data-dir={plotly_path / 'validators'}=plotly/validators",
 
@@ -147,6 +148,32 @@ class MacBuilder:
         shutil.move(str(output_app), str(final_app))
 
         self.log(f"App bundle created: {final_app}")
+
+        # Copy .web directory separately (without node_modules to avoid codesign issues)
+        self._copy_web_directory(final_app)
+
+    def _copy_web_directory(self, app_bundle: Path):
+        """Copy .web directory to app bundle, excluding node_modules."""
+        self.log("Copying .web directory (excluding node_modules)...")
+
+        source_web = PROJECT_ROOT / ".web"
+        # For macOS app bundle, resources go into Contents/MacOS (where binary runs)
+        dest_web = app_bundle / "Contents" / "MacOS" / ".web"
+
+        if dest_web.exists():
+            shutil.rmtree(dest_web)
+
+        # Copy everything except node_modules
+        def ignore_node_modules(directory, files):
+            if "node_modules" in files:
+                return ["node_modules"]
+            return []
+
+        shutil.copytree(source_web, dest_web, ignore=ignore_node_modules)
+
+        # Count files for logging
+        file_count = sum(1 for _ in dest_web.rglob("*") if _.is_file())
+        self.log(f"  Copied .web with {file_count} files (node_modules excluded)")
 
     def download_bun(self) -> Path:
         """Download Bun runtime for macOS."""

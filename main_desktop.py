@@ -142,37 +142,13 @@ class DesktopApp:
 
     def _apply_backend_patches(self):
         """Apply necessary patches for production mode."""
-        import reflex.app
-        import reflex.utils.prerequisites
         import reflex.utils.js_runtimes
 
-        # 1. Backend-only compile (skip frontend generation)
-        def _backend_only_compile(self, *args, **kwargs):
-            logger.info("Running backend-only compile...")
-            self._apply_decorated_pages()
-            self._pages = {}
-            for route in self._unevaluated_pages:
-                self._compile_page(route, save_page=False)
-            self._add_optional_endpoints()
-            logger.info(f"Backend compile done: {len(self._unevaluated_pages)} pages")
-
-        reflex.app.App._compile = _backend_only_compile
-
-        # 2. Disable frontend package installation
+        # Only disable frontend package installation since we run Bun separately
+        # Let Reflex compile normally - no _compile patch needed!
         reflex.utils.js_runtimes.install_frontend_packages = lambda *a, **kw: None
 
-        # 3. Patch Socket.IO for dual transport
-        import socketio
-        _orig_init = socketio.AsyncServer.__init__
-
-        def _patched_init(self, *args, **kwargs):
-            kwargs['transports'] = ['polling', 'websocket']
-            kwargs['allow_upgrades'] = True
-            kwargs['cors_allowed_origins'] = '*'
-            return _orig_init(self, *args, **kwargs)
-
-        socketio.AsyncServer.__init__ = _patched_init
-        logger.info("Applied production patches")
+        logger.info("Applied minimal production patches (frontend handled by Bun)")
 
     def start_frontend(self):
         """Start the frontend dev server using Bun."""

@@ -211,20 +211,33 @@ reflex.utils.prerequisites.get_app = patched_get_app
 
 | Problem | Status | Lösung |
 |---------|--------|--------|
-| Transport Mismatch | ✅ Gelöst | Dual-Transport Patch |
-| Environ Race Condition | 🔧 Patch implementiert | Retry-Logik, muss neu gebaut werden |
-| UI zeigt keine Daten | ❓ Unklar | Möglicherweise durch Race Condition verursacht |
-| Nuitka Symlinks | ✅ Gelöst | cp -RL |
-| Nuitka Codesign | 🔧 Lösung bekannt | Minimale .web ohne node_modules |
+| Transport Mismatch | ✅ Gelöst | Nicht mehr relevant - Bun-basiertes Frontend |
+| Environ Race Condition | ✅ Gelöst | Nicht mehr relevant - Bun-basiertes Frontend |
+| UI zeigt keine Daten | ✅ Gelöst | `_backend_only_compile` Patch entfernt |
+| Nuitka Symlinks | ✅ Gelöst | .web ohne node_modules kopieren |
+| Nuitka Codesign | ✅ Gelöst | .web separat kopieren nach Nuitka-Build |
 
 ---
 
-## Nächste Schritte
+## Lösung: Neuer Ansatz
 
-1. Nuitka-Bundle mit allen Patches neu bauen (minimale .web Version)
-2. Testen ob Race Condition Patch funktioniert
-3. Falls UI immer noch leer: State Variable Naming zwischen Frontend und Backend analysieren
-4. Ggf. Frontend neu exportieren mit aktuellem Backend-State
+**Statt statischem Frontend-Export verwenden wir jetzt Bun als gebündelten Runtime.**
+
+Siehe [DESKTOP_DEPLOYMENT.md](./DESKTOP_DEPLOYMENT.md) für Details.
+
+### Kernänderung in main_desktop.py
+
+```python
+def _apply_backend_patches(self):
+    """Apply necessary patches for production mode."""
+    import reflex.utils.js_runtimes
+
+    # ONLY disable frontend package installation since we run Bun separately
+    # Let Reflex compile normally - no _compile patch needed!
+    reflex.utils.js_runtimes.install_frontend_packages = lambda *a, **kw: None
+```
+
+**Wichtig**: Der `_backend_only_compile` Patch wurde entfernt, da er die State-Registrierung brach.
 
 ---
 

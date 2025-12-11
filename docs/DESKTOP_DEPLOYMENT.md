@@ -1,168 +1,259 @@
 # Desktop Deployment Guide
 
-This guide explains how to run the Trailing Stop Manager as a desktop application with system tray integration.
+Dieses Dokument beschreibt den Installer-basierten Deployment-Ansatz für die Trailing Stop Manager Desktop-App mit Nuitka-Kompilierung und gebündeltem Bun-Runtime.
 
-## Architecture
+## Architektur
 
-The desktop deployment consists of:
+```
+TrailingStopManager.app/
+└── Contents/
+    └── MacOS/
+        ├── main_desktop        # Nuitka-kompiliertes Python (282MB)
+        ├── bun                 # Bun JavaScript Runtime (60MB)
+        ├── .web/               # Reflex Frontend (ohne node_modules)
+        │   ├── app/
+        │   ├── components/
+        │   ├── package.json
+        │   └── ...
+        ├── trailing_stop_web/  # Python App-Module
+        ├── assets/             # Icons
+        └── *.so, *.dylib       # Native Libraries
+```
 
-1. **main.py**: Entry point that manages the application lifecycle
-2. **trailing_stop_web/tray.py**: System tray integration (cross-platform)
-3. **EdgeSeeker-Icon.png**: Application icon for the system tray
+### Komponenten
 
-## Installation
+| Komponente | Aufgabe | Port |
+|------------|---------|------|
+| `main_desktop` | Backend (uvicorn + Reflex) | 8000 |
+| `bun run dev` | Frontend (Vite Dev Server) | 5173 |
+| System Tray | App-Kontrolle | - |
 
-Install the additional dependencies required for desktop deployment:
+## Warum dieser Ansatz?
+
+### Problem mit statischem Frontend-Export
+
+Der ursprüngliche Ansatz (`reflex export --frontend-only`) hatte mehrere Probleme:
+
+1. **Socket.IO Transport Mismatch**: Statisches Frontend verwendet Polling, Backend nur WebSocket
+2. **Race Conditions**: Events kamen an bevor Session initialisiert war
+3. **State nicht aktualisiert**: UI zeigte keine Daten trotz funktionierender Verbindung
+
+### Lösung: Live Frontend mit Bun
+
+Statt das Frontend statisch zu exportieren, führen wir `bun run dev` aus:
+
+- Frontend entwickelt sich dynamisch mit Backend
+- Keine Transport-Mismatches
+- Keine Race Conditions bei der Initialisierung
+- Volle HMR-Unterstützung (Hot Module Replacement)
+
+**Trade-off**: ~60MB zusätzlich für Bun Runtime
+
+---
+
+## Build-Prozess (macOS)
+
+### Voraussetzungen
 
 ```bash
-pip install -r requirements.txt
+# Python Dependencies
+pip install nuitka pystray pillow
+
+# Icons generieren (einmalig)
+python scripts/generate_icons.py
 ```
 
-This includes:
-- `pystray>=0.19` - System tray integration
-- `Pillow>=10.0` - Image handling for the tray icon
-
-## Running the Application
-
-### Standard Mode (with System Tray)
+### Build-Schritte
 
 ```bash
-python main.py
+# Schritt 1: Nuitka-Kompilierung (10-30 Min beim ersten Mal)
+./scripts/mac/1_nuitka.sh
+
+# Schritt 2: .web Verzeichnis kopieren (ohne node_modules)
+./scripts/mac/2_copy_web.sh
+
+# Schritt 3: Bun Runtime hinzufügen
+./scripts/mac/3_add_bun.sh
+
+# Schritt 4: (Optional) .pkg Installer erstellen
+./scripts/mac/4_create_pkg.sh
 ```
 
-This will:
-1. Start the Reflex application
-2. Show a system tray icon
-3. Auto-open your browser to http://localhost:3000
-
-### Command Line Options
+Oder alle Schritte auf einmal:
 
 ```bash
-# Start without system tray (console only)
-python main.py --no-tray
-
-# Start without auto-opening browser
-python main.py --no-browser
-
-# Both options combined
-python main.py --no-tray --no-browser
+./scripts/mac/build.sh
 ```
 
-## System Tray Features
+### Testen
 
-When running with system tray, you can:
+```bash
+open dist/TrailingStopManager.app
+```
 
-- **Open in Browser**: Click to open http://localhost:3000 in your default browser
-- **Quit**: Gracefully shutdown the application
+---
 
-## Platform Support
+## Kritische Code-Änderungen
 
-The application is tested on:
-- **macOS**: Uses EdgeSeeker-Icon.png for the tray icon
-- **Windows**: Uses EdgeSeeker-Icon.png for the tray icon
+### main_desktop.py - Backend Patches
 
-## Graceful Shutdown
+**Wichtig**: Nur minimale Patches anwenden!
 
-The application handles shutdown gracefully:
+```python
+def _apply_backend_patches(self):
+    """Apply necessary patches for production mode."""
+    import reflex.utils.js_runtimes
 
-1. Via system tray "Quit" menu
-2. Via `Ctrl+C` in terminal
-3. Via `SIGTERM` signal
+    # ONLY disable frontend package installation since we run Bun separately
+    # Let Reflex compile normally - no _compile patch needed!
+    reflex.utils.js_runtimes.install_frontend_packages = lambda *a, **kw: None
 
-All methods ensure:
-- The Reflex subprocess is terminated properly
-- The system tray icon is removed
-- Resources are cleaned up
+    logger.info("Applied minimal production patches (frontend handled by Bun)")
+```
 
-## File Structure
+### Fehler, der vermieden werden muss
+
+Der ursprüngliche `_backend_only_compile` Patch brach die State-Registrierung:
+
+```python
+# NICHT VERWENDEN - bricht Positions-Anzeige!
+def _backend_only_compile(self, *args, **kwargs):
+    self._apply_decorated_pages()
+    self._pages = {}
+    for route in self._unevaluated_pages:
+        self._compile_page(route, save_page=False)
+    self._add_optional_endpoints()
+```
+
+Dieser Patch übersprang kritische Initialisierungsschritte, wodurch State-Variablen nicht korrekt registriert wurden.
+
+---
+
+## Startup-Ablauf
 
 ```
-stock_bots/
-├── main.py                              # Entry point
-├── trailing_stop_web/
-│   ├── tray.py                          # System tray integration
-│   ├── EdgeSeeker-Icon.png              # Application icon
-│   └── ...                              # Other app files
-└── requirements.txt                     # Dependencies
+1. main_desktop startet
+   ├── Backend-Thread: uvicorn auf Port 8000
+   │   └── Reflex kompiliert normal (20 pages)
+   ├── Frontend-Thread: bun install && bun run dev
+   │   └── Vite Dev Server auf Port 5173
+   └── Main-Thread: System Tray
+
+2. Nach ~30 Sekunden
+   ├── Backend ready (8000)
+   ├── Frontend ready (5173)
+   └── Browser öffnet http://localhost:5173
 ```
+
+---
+
+## Bekannte Issues
+
+### Port bereits belegt
+
+Wenn Port 5173 belegt ist, wechselt Vite auf 5174. Die App wartet dann auf den falschen Port.
+
+**Lösung**: Ports vor dem Start freigeben:
+```bash
+lsof -ti :5173 | xargs kill -9
+lsof -ti :8000 | xargs kill -9
+```
+
+### SitemapPlugin Warnung
+
+```
+Warning: `reflex.plugins.sitemap.SitemapPlugin` plugin is enabled by default...
+```
+
+Harmlos - kann in `rxconfig.py` deaktiviert werden:
+```python
+config = rx.Config(
+    disable_plugins=['reflex.plugins.sitemap.SitemapPlugin']
+)
+```
+
+---
+
+## Dateistruktur
+
+```
+scripts/
+├── mac/
+│   ├── config.sh           # Gemeinsame Konfiguration
+│   ├── 1_nuitka.sh         # Nuitka-Kompilierung
+│   ├── 2_copy_web.sh       # .web kopieren
+│   ├── 3_add_bun.sh        # Bun hinzufügen
+│   ├── 4_create_pkg.sh     # .pkg Installer
+│   └── build.sh            # Alle Schritte
+├── generate_icons.py       # Icon-Generierung
+└── deploy.py               # (Legacy, nicht mehr verwendet)
+
+assets/
+├── AppIcon.icns            # macOS App Icon
+├── AppIcon.ico             # Windows App Icon
+├── TrayIconTemplate.png    # macOS Tray (weiß)
+├── TrayIconTemplate@2x.png # macOS Tray @2x
+└── EdgeSeeker-Icon.png     # Quell-Icon
+
+installer/
+└── mac/
+    └── distribution.xml    # .pkg Konfiguration
+```
+
+---
+
+## Windows (TODO)
+
+Windows-Deployment folgt dem gleichen Konzept:
+
+1. Nuitka mit `--windows-console-mode=disable`
+2. Bun für Windows herunterladen
+3. Inno Setup für Installer
+
+---
 
 ## Troubleshooting
 
-### System Tray Icon Not Showing
-
-If the system tray icon doesn't appear:
-
-1. Check that `pystray` is installed: `pip show pystray`
-2. Try running with `--no-tray` flag to verify the app works
-3. Check console output for error messages
-
-### Icon Not Loading
-
-The tray integration tries multiple paths for the icon:
-1. `trailing_stop_web/EdgeSeeker-Icon.png`
-2. `assets/icon.png`
-
-If no icon is found, a simple green fallback icon is generated.
-
-### Port Already in Use
-
-If port 3000 is already in use, Reflex will fail to start. Check if another instance is running:
+### App startet nicht
 
 ```bash
-# macOS/Linux
-lsof -i :3000
-
-# Windows
-netstat -ano | findstr :3000
+# Logs anzeigen
+/path/to/TrailingStopManager.app/Contents/MacOS/main_desktop 2>&1
 ```
 
-## Development vs Production
+### Positionen werden nicht angezeigt
 
-### Development Mode
+1. TWS/IB Gateway läuft?
+2. Verbindung hergestellt? (Grüner Status)
+3. Backend-Logs prüfen auf Errors
+
+### Frontend lädt nicht
+
+1. Port 5173 frei?
+2. `bun install` erfolgreich?
+3. `.web/node_modules` vorhanden?
+
+---
+
+## Legacy: Development Mode
+
+Für Entwicklung ohne Nuitka:
+
 ```bash
-# Traditional Reflex development (hot reload)
+# Standard Reflex development (hot reload)
 reflex run
-```
 
-### Desktop Mode
-```bash
-# Desktop deployment with system tray
+# Oder mit System Tray
 python main.py
 ```
 
-The desktop mode is ideal for:
-- End users who want a simple "double-click" experience
-- Running the app in the background
-- Quick access via system tray
-- Clean shutdown without terminal access
+---
 
-## Creating a Standalone Executable (Optional)
+## Changelog
 
-For distribution to users without Python, you can create a standalone executable:
+### 2024-12-11
 
-### Using PyInstaller
-
-```bash
-# Install PyInstaller
-pip install pyinstaller
-
-# Create executable
-pyinstaller --name "Trailing Stop Manager" \
-            --windowed \
-            --icon=trailing_stop_web/EdgeSeeker-Icon.png \
-            --add-data "trailing_stop_web:trailing_stop_web" \
-            main.py
-```
-
-This will create a `dist/Trailing Stop Manager` executable that can be distributed to users.
-
-## Future Enhancements
-
-Potential improvements for desktop deployment:
-
-- [ ] Add "Restart" menu item to system tray
-- [ ] Show connection status in tray icon tooltip
-- [ ] Add tray notifications for important events
-- [ ] Create installers for macOS (.dmg) and Windows (.exe)
-- [ ] Add auto-updater functionality
-- [ ] Support custom port configuration
+- **Fix**: `_backend_only_compile` Patch entfernt - brach State-Registrierung
+- **Refactored**: Minimale Patches in `_apply_backend_patches()`
+- **Neu**: Modulare Build-Skripte für macOS
+- **Neu**: Bun-basiertes Frontend statt statischem Export
