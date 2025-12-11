@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Trailing Stop Manager</title>
+    <organization>com.edgeseeker.trailingstop</organization>
+    <domains enable_localSystem="true"/>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.edgeseeker.trailingstop"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default"/>
+    <choice id="com.edgeseeker.trailingstop" visible="false">
+        <pkg-ref id="com.edgeseeker.trailingstop"/>
+    </choice>
+
+    <pkg-ref id="com.edgeseeker.trailingstop" version="1.0.0" onConclusion="none">component.pkg</pkg-ref>
+</installer-gui-script>
