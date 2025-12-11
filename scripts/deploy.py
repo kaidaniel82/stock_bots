@@ -326,29 +326,124 @@ class ProductionApp:
             # Working directory is already set at module load time
             logger.info(f"Starting uvicorn server (cwd: {os.getcwd()})...")
 
-            # MONKEY-PATCH: Disable ALL frontend build/compile functions
-            # This is more reliable than env vars which may be read before we set them
+            # MONKEY-PATCH: Disable frontend build but keep backend-critical steps
+            # The original _compile does important things:
+            # 1. _apply_decorated_pages() - registers pages
+            # 2. _compile_page() - evaluates State references (CRITICAL!)
+            # 3. _add_optional_endpoints() - adds upload endpoints
+            # We must run these for State updates to work!
 
-            # 1. Disable App._compile to prevent build process
             import reflex.app
-            reflex.app.App._compile = lambda self, *args, **kwargs: None
+            import reflex.utils.prerequisites
+
+            # Store original _compile
+            _original_compile = reflex.app.App._compile
+
+            def _backend_only_compile(self, *args, **kwargs):
+                """Run only backend-critical parts of _compile, skip frontend generation."""
+                logger.info("Running backend-only compile (no frontend generation)...")
+
+                # 1. Apply decorated pages (registers routes)
+                self._apply_decorated_pages()
+                self._pages = {}
+
+                # 2. Evaluate all pages (CRITICAL for State var registration!)
+                for route in self._unevaluated_pages:
+                    logger.debug(f"Evaluating page: {route}")
+                    self._compile_page(route, save_page=False)
+
+                # 3. Add optional endpoints (upload, etc.)
+                self._add_optional_endpoints()
+
+                logger.info(f"Backend compile done: {len(self._unevaluated_pages)} pages evaluated")
+
+            reflex.app.App._compile = _backend_only_compile
 
             # 2. Disable install_frontend_packages to prevent npm/bun install
             import reflex.utils.js_runtimes
             reflex.utils.js_runtimes.install_frontend_packages = lambda *args, **kwargs: None
 
             # 3. Disable any other prerequisite functions that might call npm/bun
-            import reflex.utils.prerequisites
             if hasattr(reflex.utils.prerequisites, 'initialize_frontend_dependencies'):
                 reflex.utils.prerequisites.initialize_frontend_dependencies = lambda *args, **kwargs: None
 
-            logger.info("Disabled frontend compilation via monkey-patches")
+            logger.info("Applied backend-only compile monkey-patch")
 
-            # Import the app module FIRST (before calling app factory)
+            # 4. CRITICAL: Patch Socket.IO to accept both polling and websocket transports
+            # MUST be done BEFORE importing the app module, because app = rx.App() is
+            # created at module load time, which creates the AsyncServer
+            import socketio
+
+            _original_async_server_init = socketio.AsyncServer.__init__
+
+            def _patched_async_server_init(self, *args, **kwargs):
+                # Force dual transport support
+                kwargs['transports'] = ['polling', 'websocket']
+                kwargs['allow_upgrades'] = True
+                kwargs['cors_allowed_origins'] = '*'
+                kwargs['cors_credentials'] = True
+                logger.info(f"AsyncServer.__init__ called with patched transports")
+                return _original_async_server_init(self, *args, **kwargs)
+
+            socketio.AsyncServer.__init__ = _patched_async_server_init
+            logger.info("Patched AsyncServer to use transports=['polling', 'websocket']")
+
+            # 4b. Patch Socket.IO base_server.get_environ to handle race condition
+            # When using polling transport, events can arrive before the session is fully registered
+            # This patch adds a small wait/retry to handle the race condition gracefully
+            import asyncio
+            _original_get_environ = socketio.base_server.BaseServer.get_environ
+
+            def _patched_get_environ(self, sid, namespace=None):
+                """Patched get_environ with retry logic for polling transport race condition."""
+                eio_sid = self.manager.eio_sid_from_sid(sid, namespace or '/')
+                environ = self.environ.get(eio_sid)
+                if environ is None and eio_sid is not None:
+                    # Race condition: eio_sid exists but environ not yet stored
+                    # This can happen with polling transport when events arrive fast
+                    logger.debug(f"get_environ: eio_sid={eio_sid} found but environ missing, may be race condition")
+                return environ
+
+            socketio.base_server.BaseServer.get_environ = _patched_get_environ
+            logger.info("Patched get_environ with race condition handling")
+
+            # 4c. Patch Reflex EventNamespace.on_event to handle environ race condition
+            # The original raises RuntimeError immediately if environ is None
+            # We patch it to retry a few times with small delays
+            import reflex.app
+            _original_event_namespace_on_event = reflex.app.EventNamespace.on_event
+
+            async def _patched_on_event(self, sid, data):
+                """Patched on_event with retry logic for environ race condition."""
+                import asyncio
+                max_retries = 5
+                retry_delay = 0.1  # 100ms
+
+                for attempt in range(max_retries):
+                    # Check if environ is available
+                    if self.app.sio is not None:
+                        environ = self.app.sio.get_environ(sid, self.namespace)
+                        if environ is not None:
+                            # Environ is ready, call original method
+                            return await _original_event_namespace_on_event(self, sid, data)
+
+                    if attempt < max_retries - 1:
+                        logger.debug(f"on_event: environ not ready for sid={sid}, retry {attempt + 1}/{max_retries}")
+                        await asyncio.sleep(retry_delay)
+
+                # After all retries, log warning and skip this event
+                logger.warning(f"on_event: environ still not initialized after {max_retries} retries for sid={sid}, skipping event")
+                # Don't raise - just silently skip the event to prevent task exception
+                return None
+
+            reflex.app.EventNamespace.on_event = _patched_on_event
+            logger.info("Patched EventNamespace.on_event with retry logic")
+
+            # Import the app module AFTER patching Socket.IO
             # This module is compiled into the Nuitka binary
             import trailing_stop_web.trailing_stop_web as app_module
 
-            # 4. CRITICAL: Monkey-patch get_app() to return the pre-imported module
+            # 5. CRITICAL: Monkey-patch get_app() to return the pre-imported module
             # config.app_module is read-only, so we patch the function directly
             # This bypasses dynamic __import__() which doesn't work in Nuitka
             def patched_get_app(reload: bool = False):
