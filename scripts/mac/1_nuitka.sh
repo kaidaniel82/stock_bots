@@ -18,7 +18,17 @@ fi
 
 # Clean previous build and dist
 log_info "Cleaning previous build and dist..."
-rm -rf "$BUILD_DIR" "$DIST_DIR"
+# Force remove even if files are locked (macOS)
+rm -rf "$BUILD_DIR" "$DIST_DIR" 2>/dev/null || true
+# If still exists, try with sudo-less force
+if [[ -d "$DIST_DIR" ]]; then
+    find "$DIST_DIR" -type f -exec rm -f {} \; 2>/dev/null || true
+    find "$DIST_DIR" -type d -empty -delete 2>/dev/null || true
+    rm -rf "$DIST_DIR" 2>/dev/null || true
+fi
+if [[ -d "$BUILD_DIR" ]]; then
+    rm -rf "$BUILD_DIR" 2>/dev/null || true
+fi
 mkdir -p "$BUILD_DIR"
 
 # Get plotly validators path
