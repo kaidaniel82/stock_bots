@@ -1,3 +1,3 @@
 """Version information for Trailing Stop Manager."""
 
-__version__ = "251212-004"
+__version__ = "251212-005"
