@@ -6,7 +6,7 @@ from typing import Callable, Optional
 import asyncio
 import logging
 from pathlib import Path
-from ib_insync import IB, Contract, Option, Stock, Index, Future, ComboLeg, PortfolioItem, Ticker, util, Order, Trade
+from ib_insync import IB, Contract, Option, Stock, Index, Future, ComboLeg, PortfolioItem, Ticker, util, Order, Trade, TimeCondition
 import uuid
 
 # Enable ib_insync debug logging to file
@@ -1382,9 +1382,11 @@ class TWSBroker:
         quantity: int,
         stop_price: float,
         limit_price: float = 0.0,  # 0 = Stop-Market, >0 = Stop-Limit
-        oca_group: str = "",
         action: str = "SELL",
         trigger_method: int = 0,
+        # Deprecated parameters (kept for compatibility)
+        oca_group: str = "",
+        transmit: bool = True,
     ) -> Optional[Trade]:
         """Place a Stop or Stop-Limit order (App controls trailing).
 
@@ -1397,7 +1399,6 @@ class TWSBroker:
             quantity: Total quantity to trade
             stop_price: Trigger price (auxPrice in TWS)
             limit_price: Limit price for execution. If 0, places STP (market) order.
-            oca_group: OCA group identifier
             action: "SELL" or "BUY"
             trigger_method: IB trigger method (0=default, 2=last, 4=bid/ask, 8=mid)
 
@@ -1439,13 +1440,6 @@ class TWSBroker:
         order.triggerMethod = trigger_method
         order.transmit = True
         order.tif = "GTC"  # Good Till Cancelled
-
-        # OCA group settings
-        # Note: BAG (combo) orders do NOT support OCA groups for stop orders
-        # Only set OCA for single-leg orders
-        if oca_group and contract.secType != "BAG":
-            order.ocaGroup = oca_group
-            order.ocaType = 1  # Cancel all remaining on fill
 
         # Log contract details for debugging
         logger.debug(f"place_stop_order: Placing {order.orderType} {order.action} order on "
@@ -1566,8 +1560,9 @@ class TWSBroker:
         contract: Contract,
         quantity: int,
         exit_time: str,  # "HH:MM" format
-        oca_group: str,
-        action: str = "SELL"
+        oca_group: str = "",
+        action: str = "SELL",
+        transmit: bool = True,
     ) -> Optional[Trade]:
         """Place a time-based market order (Good After Time).
 
@@ -1575,8 +1570,9 @@ class TWSBroker:
             contract: Contract to trade
             quantity: Quantity
             exit_time: Time in HH:MM format (ET)
-            oca_group: OCA group identifier
+            oca_group: OCA group identifier (for single-leg)
             action: "SELL" or "BUY"
+            transmit: If False, order is held until another order with transmit=True
 
         Returns:
             Trade object or None if failed
@@ -1590,20 +1586,35 @@ class TWSBroker:
             return None
 
         # Build order object (can be done in any thread)
-        today = datetime.now().strftime("%Y%m%d")
-        gat_time = f"{today} {exit_time}:00 US/Eastern"
+        from zoneinfo import ZoneInfo
+
+        # Convert exit_time (HH:MM Berlin) to UTC for TimeCondition
+        berlin_tz = ZoneInfo("Europe/Berlin")
+        utc_tz = ZoneInfo("UTC")
+        today = datetime.now(berlin_tz).date()
+        hour, minute = map(int, exit_time.split(":"))
+        exit_dt_berlin = datetime(today.year, today.month, today.day, hour, minute, 0, tzinfo=berlin_tz)
+        exit_dt_utc = exit_dt_berlin.astimezone(utc_tz)
+        time_condition_str = exit_dt_utc.strftime("%Y%m%d %H:%M:%S")
+
+        logger.info(f"TimeCondition: exit_time={exit_time} Berlin -> {time_condition_str} UTC")
 
         order = Order()
         order.action = action
         order.totalQuantity = abs(quantity)
         order.orderType = "MKT"
-        order.goodAfterTime = gat_time
-        order.tif = "DAY"
-        order.transmit = True
+        order.tif = "GTC"  # GTC for conditional orders
+        order.transmit = transmit
 
-        # OCA group settings
-        # Note: BAG (combo) orders do NOT support OCA groups
-        if contract.secType != "BAG":
+        # Use TimeCondition instead of goodAfterTime (works better with BAG contracts)
+        time_condition = TimeCondition(
+            isMore=True,
+            time=time_condition_str,
+        )
+        order.conditions = [time_condition]
+
+        # OCA group settings - only for single-leg (BAG contracts don't support OCA)
+        if oca_group and contract.secType != "BAG":
             order.ocaGroup = oca_group
             order.ocaType = 1  # Cancel all remaining on fill
 
@@ -1636,34 +1647,31 @@ class TWSBroker:
         position_quantities: dict[int, int],
         stop_type: str,
         limit_offset: float,
-        time_exit_enabled: bool,
-        time_exit_time: str,
         initial_stop_price: float,
         initial_limit_price: float = 0.0,
         trigger_price_type: str = "mark",
         is_credit: bool = False,
+        # Deprecated parameters (kept for compatibility)
+        time_exit_enabled: bool = False,
+        time_exit_time: str = "",
     ) -> Optional[dict]:
-        """Place complete OCA order group (stop order + optional time exit).
+        """Place a stop order for a position group.
 
-        NOTE: This now uses app-controlled STP/STP LMT orders instead of
-        TWS-native TRAIL orders, because TRAIL doesn't work with BAG contracts.
-        The app will modify stop prices dynamically via modify_stop_order().
+        NOTE: Time exit feature is disabled. This function now only places
+        a single stop order (STP or STP LMT).
 
         Args:
-            group_name: Name for logging and OCA group ID
+            group_name: Name for logging
             position_quantities: {con_id: quantity} mapping
             stop_type: "market" (STP) or "limit" (STP LMT)
             limit_offset: Offset for limit price (only used if stop_type="limit")
-            time_exit_enabled: Whether to place time exit order
-            time_exit_time: Time for exit in HH:MM format
             initial_stop_price: Initial stop trigger price
             initial_limit_price: Initial limit price (0 for stop-market)
             trigger_price_type: "mark", "mid", "bid", "ask", "last"
             is_credit: True for credit/short positions (action=BUY to close)
 
         Returns:
-            Dict with oca_group_id, trailing_order_id, time_exit_order_id
-            or None if failed
+            Dict with trailing_order_id or None if failed
         """
         try:
             # Log input for debugging
@@ -1745,13 +1753,13 @@ class TWSBroker:
                 else:
                     limit_price = abs(base_limit)
 
-            # Place app-controlled stop order (STP or STP LMT)
+            # Place stop order (no OCA needed - time exit feature disabled)
             stop_trade = self.place_stop_order(
                 contract=contract,
                 quantity=total_qty,
                 stop_price=stop_price_for_order,
                 limit_price=limit_price,
-                oca_group=oca_group,
+                oca_group="",  # No OCA needed
                 action=action,
                 trigger_method=trigger_method,
             )
@@ -1759,27 +1767,13 @@ class TWSBroker:
             if not stop_trade:
                 return None
 
-            time_exit_order_id = 0
-
-            # Place time exit if enabled
-            if time_exit_enabled and time_exit_time:
-                time_trade = self.place_time_exit_order(
-                    contract=contract,
-                    quantity=total_qty,
-                    exit_time=time_exit_time,
-                    oca_group=oca_group,
-                    action=action
-                )
-                if time_trade:
-                    time_exit_order_id = time_trade.order.orderId
-
-            logger.info(f"OCA group placed: {oca_group} action={action} stop={stop_trade.order.orderId} "
-                       f"type={stop_trade.order.orderType} time_exit={time_exit_order_id}")
+            logger.info(f"Stop order placed: orderId={stop_trade.order.orderId} "
+                       f"type={stop_trade.order.orderType} stop=${stop_price_for_order:.2f}")
 
             return {
-                "oca_group_id": oca_group,
-                "trailing_order_id": stop_trade.order.orderId,  # Keep field name for compatibility
-                "time_exit_order_id": time_exit_order_id
+                "oca_group_id": "",
+                "trailing_order_id": stop_trade.order.orderId,
+                "time_exit_order_id": 0
             }
 
         except Exception as e:

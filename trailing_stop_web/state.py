@@ -1033,6 +1033,17 @@ class AppState(rx.State):
         No type annotations to avoid Reflex type validation issues.
         """
         logger.debug(f"update_group_time_exit_enabled: group_id={group_id}, checked={checked}")
+
+        # Block enabling only if exit time is in the past
+        if checked:
+            group = GROUP_MANAGER.get(str(group_id))
+            if group and group.time_exit_time:
+                if self._is_time_exit_past(group.time_exit_time):
+                    self.status_message = f"Time Exit nicht möglich - {group.time_exit_time} ist bereits vorbei"
+                    logger.warning(f"Cannot enable time exit: {group.time_exit_time} has passed")
+                    self._load_groups_from_manager()  # Refresh UI
+                    return
+
         GROUP_MANAGER.update(str(group_id), time_exit_enabled=bool(checked))
         self._sync_broker_state()
         self._load_groups_from_manager()
@@ -1050,6 +1061,31 @@ class AppState(rx.State):
             GROUP_MANAGER.update(str(group_id), time_exit_time=str(value))
             self._sync_broker_state()
             self._load_groups_from_manager()
+
+    def _is_time_exit_past(self, exit_time: str) -> bool:
+        """Check if the exit time (HH:MM Berlin) has already passed today.
+
+        Args:
+            exit_time: Time in HH:MM format (Berlin Time)
+
+        Returns:
+            True if current Berlin time is past the exit time
+        """
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            berlin_tz = ZoneInfo("Europe/Berlin")
+            now_berlin = datetime.now(berlin_tz)
+
+            # Parse exit time
+            hour, minute = map(int, exit_time.split(":"))
+            exit_datetime = now_berlin.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+            return now_berlin >= exit_datetime
+        except Exception as e:
+            logger.error(f"Error checking time exit: {e}")
+            return False  # Allow on error
 
     def _sync_broker_state(self):
         """Sync state variables from broker singleton."""

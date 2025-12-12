@@ -720,8 +720,8 @@ def group_card(group: dict, mode: str = "setup") -> rx.Component:
         _group_trailing_config(group, group_id),
         # HWM/Stop row
         _group_hwm_stop_row(group, show_trail=False),
-        # Time exit config
-        _group_time_exit_config(group, group_id),
+        # Time exit config - DISABLED (BAG contracts don't support OCA linkage)
+        # _group_time_exit_config(group, group_id),
         # Action buttons
         _group_action_buttons(group_id, is_active),
     ]
