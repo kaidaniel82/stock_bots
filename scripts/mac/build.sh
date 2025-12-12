@@ -9,6 +9,55 @@ check_macos
 SKIP_NUITKA=false
 SKIP_PKG=false
 
+# =============================================================================
+# Version Management (YYMMDD-NNN format)
+# =============================================================================
+bump_version() {
+    local VERSION_FILE="$PROJECT_ROOT/trailing_stop_web/version.py"
+    local TODAY=$(date +"%y%m%d")
+
+    # Read current version (macOS compatible)
+    local CURRENT_VERSION=$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' "$VERSION_FILE" 2>/dev/null || echo "")
+
+    if [[ -z "$CURRENT_VERSION" ]]; then
+        # No version found, start fresh
+        NEW_VERSION="${TODAY}-001"
+    else
+        # Parse current version
+        local CURRENT_DATE="${CURRENT_VERSION%-*}"
+        local CURRENT_NUM="${CURRENT_VERSION##*-}"
+
+        if [[ "$CURRENT_DATE" == "$TODAY" ]]; then
+            # Same day: increment build number
+            local NEXT_NUM=$(printf "%03d" $((10#$CURRENT_NUM + 1)))
+            NEW_VERSION="${TODAY}-${NEXT_NUM}"
+        else
+            # New day: reset to 001
+            NEW_VERSION="${TODAY}-001"
+        fi
+    fi
+
+    # Write new version (proper Python format)
+    cat > "$VERSION_FILE" << EOF
+"""Version information for Trailing Stop Manager."""
+
+__version__ = "$NEW_VERSION"
+EOF
+
+    log_success "Version bumped to: $NEW_VERSION"
+
+    # Git commit and push
+    log_info "Committing version bump..."
+    cd "$PROJECT_ROOT"
+    git add "$VERSION_FILE"
+    git commit -m "$NEW_VERSION"
+    git push
+    log_success "Version committed and pushed"
+
+    # Export for use in rest of script
+    export APP_VERSION="$NEW_VERSION"
+}
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -35,7 +84,11 @@ log_info "Building $APP_NAME for macOS"
 log_info "=============================================="
 echo ""
 
-# Step 0: Generate icons if needed
+# Step 0: Bump version and commit
+bump_version
+echo ""
+
+# Step 1: Generate icons if needed
 if [[ ! -f "$ASSETS_DIR/AppIcon.icns" ]]; then
     log_info "Generating icons..."
     $PYTHON "$PROJECT_ROOT/scripts/generate_icons.py"

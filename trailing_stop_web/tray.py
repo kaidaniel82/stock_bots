@@ -15,6 +15,8 @@ from PIL import Image
 import pystray
 from pystray import MenuItem as Item
 
+from trailing_stop_web.version import __version__
+
 # Hide Dock icon on macOS
 if sys.platform == "darwin":
     try:
@@ -117,7 +119,7 @@ class SystemTray:
         self.icon = pystray.Icon(
             name="Trailing Stop Manager",
             icon=icon_image,
-            title="Trailing Stop Manager",
+            title=f"Trailing Stop Manager v{__version__}",
             menu=pystray.Menu(*self._create_menu()),
         )
 
