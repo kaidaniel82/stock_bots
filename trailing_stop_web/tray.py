@@ -15,7 +15,10 @@ from PIL import Image
 import pystray
 from pystray import MenuItem as Item
 
-from trailing_stop_web.version import __version__
+try:
+    from trailing_stop_web.version import __version__
+except ImportError:
+    __version__ = "unknown"
 
 # Hide Dock icon on macOS
 if sys.platform == "darwin":
