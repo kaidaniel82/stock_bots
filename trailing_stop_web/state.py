@@ -23,6 +23,11 @@ from .paths import DATA_DIR
 # Connection config file in platform-specific data directory
 CONNECTION_CONFIG_PATH = DATA_DIR / "connection_config.json"
 
+# Position filter: Only show these security types in UI
+# Options module: OPT (stock options), FOP (futures options), BAG (combos)
+# Future modules can use different filters, e.g. {"STK"} for stocks
+DEFAULT_ALLOWED_SEC_TYPES: set[str] = {"OPT", "FOP", "BAG"}
+
 
 def load_connection_config() -> dict:
     """Load connection config from JSON file."""
@@ -1065,9 +1070,24 @@ class AppState(rx.State):
         self.status_message = "Monitoring active..."
         logger.info("Monitoring started")
 
-    def _refresh_positions(self):
-        """Refresh positions from broker - calculate all values ourselves."""
+    def _refresh_positions(self, allowed_sec_types: set[str] | None = None):
+        """Refresh positions from broker - calculate all values ourselves.
+
+        Args:
+            allowed_sec_types: Filter by security type. Options:
+                - None: Use DEFAULT_ALLOWED_SEC_TYPES (OPT, FOP, BAG)
+                - set(): Empty set = show ALL positions (no filter)
+                - {"STK"}: Only stocks (for future stock module)
+        """
+        # Apply default filter if not specified
+        if allowed_sec_types is None:
+            allowed_sec_types = DEFAULT_ALLOWED_SEC_TYPES
+
         broker_positions = BROKER.get_positions()
+
+        # Filter by sec_type early (before expensive processing)
+        if allowed_sec_types:
+            broker_positions = [p for p in broker_positions if p.sec_type in allowed_sec_types]
         # Get usage counts from GroupManager
         used_quantities = GROUP_MANAGER.get_used_quantities()
         result = []
