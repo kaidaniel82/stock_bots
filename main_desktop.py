@@ -72,29 +72,57 @@ def save_pids(pids: dict[str, int]) -> None:
         logger.debug(f"Could not save PIDs: {e}")
 
 
-def cleanup_previous_instance() -> None:
-    """Kill processes from previous instance using saved PIDs."""
-    pid_file = get_pid_file_path()
-    if not pid_file.exists():
-        return
-
-    try:
-        with open(pid_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if ":" in line:
-                    name, pid_str = line.split(":", 1)
+def cleanup_ports() -> None:
+    """Kill any processes using our ports (5173, 8000)."""
+    ports = [5173, 8000]
+    for port in ports:
+        try:
+            # Use lsof to find PIDs on port
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for pid_str in result.stdout.strip().split('\n'):
                     try:
                         pid = int(pid_str)
-                        os.kill(pid, signal.SIGKILL)
-                        logger.info(f"Killed previous {name} (PID {pid})")
-                    except (ProcessLookupError, ValueError):
-                        pass  # Process already dead
-                    except PermissionError:
-                        logger.warning(f"No permission to kill {name} (PID {pid_str})")
-        pid_file.unlink(missing_ok=True)
-    except Exception as e:
-        logger.debug(f"Cleanup error: {e}")
+                        # Don't kill ourselves
+                        if pid != os.getpid():
+                            os.kill(pid, signal.SIGKILL)
+                            logger.info(f"Killed process on port {port} (PID {pid})")
+                    except (ProcessLookupError, ValueError, PermissionError):
+                        pass
+        except Exception:
+            pass
+
+
+def cleanup_previous_instance() -> None:
+    """Kill processes from previous instance using saved PIDs and port cleanup."""
+    # First: cleanup by PID file
+    pid_file = get_pid_file_path()
+    if pid_file.exists():
+        try:
+            with open(pid_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if ":" in line:
+                        name, pid_str = line.split(":", 1)
+                        try:
+                            pid = int(pid_str)
+                            os.kill(pid, signal.SIGKILL)
+                            logger.info(f"Killed previous {name} (PID {pid})")
+                        except (ProcessLookupError, ValueError):
+                            pass  # Process already dead
+                        except PermissionError:
+                            logger.warning(f"No permission to kill {name} (PID {pid_str})")
+            pid_file.unlink(missing_ok=True)
+        except Exception as e:
+            logger.debug(f"PID cleanup error: {e}")
+
+    # Second: cleanup by ports (catches orphaned processes)
+    cleanup_ports()
 
 
 def remove_pid_file() -> None:
