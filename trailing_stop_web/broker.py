@@ -1087,35 +1087,52 @@ class TWSBroker:
             logger.error("Cannot place order: not connected")
             return None
 
+        if not self._loop:
+            logger.error("Cannot place order: no event loop available")
+            return None
+
+        # Build order object (can be done in any thread)
+        order = Order()
+        order.action = action
+        order.totalQuantity = abs(quantity)
+        order.transmit = True
+
+        # OCA group settings
+        order.ocaGroup = oca_group
+        order.ocaType = 1  # Cancel all remaining on fill
+
+        if trail_mode == "percent":
+            order.orderType = "TRAIL" if stop_type == "market" else "TRAIL LIMIT"
+            order.trailingPercent = trail_amount
+            if stop_type == "limit":
+                order.lmtPriceOffset = limit_offset
+                if initial_stop_price > 0:
+                    order.trailStopPrice = initial_stop_price
+        else:  # absolute
+            order.orderType = "TRAIL" if stop_type == "market" else "TRAIL LIMIT"
+            order.auxPrice = trail_amount  # Trail amount in dollars
+            if stop_type == "limit":
+                order.lmtPriceOffset = limit_offset
+                if initial_stop_price > 0:
+                    order.trailStopPrice = initial_stop_price
+
+        # Execute placeOrder in broker's event loop thread (thread-safe)
+        async def _place_async():
+            try:
+                trade = self.ib.placeOrder(contract, order)
+                await asyncio.sleep(0.1)  # Brief wait for status
+                return trade
+            except Exception as e:
+                logger.error(f"Async place trailing stop error: {e}")
+                return None
+
         try:
-            order = Order()
-            order.action = action
-            order.totalQuantity = abs(quantity)
-            order.transmit = True
+            future = asyncio.run_coroutine_threadsafe(_place_async(), self._loop)
+            trade = future.result(timeout=10)
 
-            # OCA group settings
-            order.ocaGroup = oca_group
-            order.ocaType = 1  # Cancel all remaining on fill
-
-            if trail_mode == "percent":
-                order.orderType = "TRAIL" if stop_type == "market" else "TRAIL LIMIT"
-                order.trailingPercent = trail_amount
-                if stop_type == "limit":
-                    order.lmtPriceOffset = limit_offset
-                    if initial_stop_price > 0:
-                        order.trailStopPrice = initial_stop_price
-            else:  # absolute
-                order.orderType = "TRAIL" if stop_type == "market" else "TRAIL LIMIT"
-                order.auxPrice = trail_amount  # Trail amount in dollars
-                if stop_type == "limit":
-                    order.lmtPriceOffset = limit_offset
-                    if initial_stop_price > 0:
-                        order.trailStopPrice = initial_stop_price
-
-            trade = self.ib.placeOrder(contract, order)
-
-            logger.info(f"Placed trailing stop: orderId={trade.order.orderId} "
-                       f"type={order.orderType} trail={trail_amount} mode={trail_mode}")
+            if trade:
+                logger.info(f"Placed trailing stop: orderId={trade.order.orderId} "
+                           f"type={order.orderType} trail={trail_amount} mode={trail_mode}")
 
             return trade
 
@@ -1391,63 +1408,73 @@ class TWSBroker:
             logger.error("Cannot place order: not connected")
             return None
 
+        if not self._loop:
+            logger.error("Cannot place order: no event loop available")
+            return None
+
+        # Build order object (can be done in any thread)
+        order = Order()
+        order.action = action
+        order.totalQuantity = abs(quantity)
+
+        # Get price increment based on actual price level and round
+        # For combos: auxPrice can be NEGATIVE (credit spreads use SELL @ negative price)
+        stop_increment = self._get_price_increment(contract, abs(stop_price))
+        stop_price_rounded = self._round_to_tick(stop_price, stop_increment)
+        logger.debug(f"Price rounding: ${stop_price:.4f} -> ${stop_price_rounded:.2f} (tick={stop_increment})")
+
+        if limit_price == 0 or limit_price is None:
+            # Stop-Market Order
+            order.orderType = "STP"
+            order.auxPrice = stop_price_rounded
+        else:
+            # Stop-Limit Order - limit price may have different increment
+            # For combos: lmtPrice can be NEGATIVE (credit spreads use SELL @ negative price)
+            limit_increment = self._get_price_increment(contract, abs(limit_price))
+            limit_price_rounded = self._round_to_tick(limit_price, limit_increment)
+            order.orderType = "STP LMT"
+            order.auxPrice = stop_price_rounded
+            order.lmtPrice = limit_price_rounded
+
+        order.triggerMethod = trigger_method
+        order.transmit = True
+        order.tif = "GTC"  # Good Till Cancelled
+
+        # OCA group settings
+        # Note: BAG (combo) orders do NOT support OCA groups for stop orders
+        # Only set OCA for single-leg orders
+        if oca_group and contract.secType != "BAG":
+            order.ocaGroup = oca_group
+            order.ocaType = 1  # Cancel all remaining on fill
+
+        # Log contract details for debugging
+        logger.debug(f"place_stop_order: Placing {order.orderType} {order.action} order on "
+                    f"{contract.secType} {contract.symbol} conId={contract.conId} "
+                    f"exchange={contract.exchange} stop=${stop_price_rounded:.2f}")
+
+        # Execute placeOrder in broker's event loop thread (thread-safe)
+        async def _place_async():
+            try:
+                trade = self.ib.placeOrder(contract, order)
+                await asyncio.sleep(0.2)  # Wait for order status update
+                return trade
+            except Exception as e:
+                logger.error(f"Async place order error: {e}")
+                return None
+
         try:
-            order = Order()
-            order.action = action
-            order.totalQuantity = abs(quantity)
+            future = asyncio.run_coroutine_threadsafe(_place_async(), self._loop)
+            trade = future.result(timeout=10)
 
-            # Get price increment based on actual price level and round
-            # For combos: auxPrice can be NEGATIVE (credit spreads use SELL @ negative price)
-            stop_increment = self._get_price_increment(contract, abs(stop_price))
-            stop_price_rounded = self._round_to_tick(stop_price, stop_increment)
-            logger.debug(f"Price rounding: ${stop_price:.4f} -> ${stop_price_rounded:.2f} (tick={stop_increment})")
+            if trade:
+                status = trade.orderStatus.status if trade.orderStatus else "Unknown"
+                logger.info(f"Placed {order.orderType} order: orderId={trade.order.orderId} "
+                           f"status={status} stop=${stop_price:.2f} action={action} "
+                           f"contract={contract.localSymbol or contract.symbol}")
 
-            if limit_price == 0 or limit_price is None:
-                # Stop-Market Order
-                order.orderType = "STP"
-                order.auxPrice = stop_price_rounded
-            else:
-                # Stop-Limit Order - limit price may have different increment
-                # For combos: lmtPrice can be NEGATIVE (credit spreads use SELL @ negative price)
-                limit_increment = self._get_price_increment(contract, abs(limit_price))
-                limit_price_rounded = self._round_to_tick(limit_price, limit_increment)
-                order.orderType = "STP LMT"
-                order.auxPrice = stop_price_rounded
-                order.lmtPrice = limit_price_rounded
-
-            order.triggerMethod = trigger_method
-            order.transmit = True
-            order.tif = "GTC"  # Good Till Cancelled
-
-            # OCA group settings
-            # Note: BAG (combo) orders do NOT support OCA groups for stop orders
-            # Only set OCA for single-leg orders
-            if oca_group and contract.secType != "BAG":
-                order.ocaGroup = oca_group
-                order.ocaType = 1  # Cancel all remaining on fill
-
-            # Log contract details for debugging
-            logger.debug(f"place_stop_order: Placing {order.orderType} {order.action} order on "
-                        f"{contract.secType} {contract.symbol} conId={contract.conId} "
-                        f"exchange={contract.exchange} stop=${stop_price_rounded:.2f}")
-            logger.debug(f"Placing order on contract: {contract.secType} {contract.symbol} "
-                        f"conId={contract.conId} exchange={contract.exchange}")
-
-            trade = self.ib.placeOrder(contract, order)
-
-            # Brief wait to receive order status update from TWS
-            import time as time_module
-            time_module.sleep(0.2)  # Simple sync wait - avoid asyncio issues
-
-            # Check order status
-            status = trade.orderStatus.status if trade.orderStatus else "Unknown"
-            logger.info(f"Placed {order.orderType} order: orderId={trade.order.orderId} "
-                       f"status={status} stop=${stop_price:.2f} action={action} "
-                       f"contract={contract.localSymbol or contract.symbol}")
-
-            # Warn if order rejected (PendingSubmit is normal - order in transit to TWS)
-            if status in ("ApiCancelled", "Cancelled", "Inactive"):
-                logger.warning(f"Order {trade.order.orderId} rejected: {status}")
+                # Warn if order rejected (PendingSubmit is normal - order in transit to TWS)
+                if status in ("ApiCancelled", "Cancelled", "Inactive"):
+                    logger.warning(f"Order {trade.order.orderId} rejected: {status}")
 
             return trade
 
@@ -1477,49 +1504,58 @@ class TWSBroker:
             logger.warning("Cannot modify order: not connected")
             return False
 
+        if not self._loop:
+            logger.error("Cannot modify order: no event loop available")
+            return False
+
+        # Execute modification in broker's event loop thread (thread-safe)
+        async def _modify_async():
+            try:
+                # Find the existing trade
+                trades = [t for t in self.ib.openTrades() if t.order.orderId == order_id]
+                if not trades:
+                    logger.warning(f"Order {order_id} not found in open trades - may have been filled")
+                    return False
+
+                trade = trades[0]
+                order = trade.order
+
+                # Check if order is in a modifiable state
+                status = trade.orderStatus.status if trade.orderStatus else ""
+                if status in ("PendingSubmit", "PendingCancel", "Cancelled", "Filled"):
+                    logger.debug(f"Order {order_id} not modifiable (status={status})")
+                    return False
+
+                # Check if prices actually changed (avoid unnecessary modifications)
+                stop_changed = abs(order.auxPrice - new_stop_price) >= 0.01
+                limit_changed = (new_limit_price != 0 and
+                               hasattr(order, 'lmtPrice') and
+                               abs(order.lmtPrice - new_limit_price) >= 0.01)
+
+                if not stop_changed and not limit_changed:
+                    return True  # No change needed
+
+                # Get price increment and round
+                stop_increment = self._get_price_increment(trade.contract, abs(new_stop_price))
+                order.auxPrice = self._round_to_tick(new_stop_price, stop_increment)
+                if new_limit_price != 0:
+                    limit_increment = self._get_price_increment(trade.contract, abs(new_limit_price))
+                    order.lmtPrice = self._round_to_tick(new_limit_price, limit_increment)
+
+                # Re-place the order (ib_insync handles modification)
+                self.ib.placeOrder(trade.contract, order)
+
+                limit_str = f"${new_limit_price:.2f}" if new_limit_price else "N/A"
+                logger.debug(f"Modified order {order_id}: stop=${new_stop_price:.2f} limit={limit_str}")
+                return True
+
+            except Exception as e:
+                logger.error(f"Async modify order error: {e}")
+                return False
+
         try:
-            # Find the existing trade
-            trades = [t for t in self.ib.openTrades() if t.order.orderId == order_id]
-            if not trades:
-                logger.warning(f"Order {order_id} not found in open trades - may have been filled")
-                return False
-
-            trade = trades[0]
-            order = trade.order
-
-            # Check if order is in a modifiable state
-            # Skip modification if order is still being submitted or already cancelled/filled
-            status = trade.orderStatus.status if trade.orderStatus else ""
-            if status in ("PendingSubmit", "PendingCancel", "Cancelled", "Filled"):
-                logger.debug(f"Order {order_id} not modifiable (status={status})")
-                return False
-
-            # Check if prices actually changed (avoid unnecessary modifications)
-            # For combos, new_stop_price may be negative (credit spreads)
-            stop_changed = abs(order.auxPrice - new_stop_price) >= 0.01
-            limit_changed = (new_limit_price != 0 and
-                           hasattr(order, 'lmtPrice') and
-                           abs(order.lmtPrice - new_limit_price) >= 0.01)
-
-            if not stop_changed and not limit_changed:
-                return True  # No change needed
-
-            # Get price increment based on actual price level and round
-            # Preserve sign for combo credit spreads
-            stop_increment = self._get_price_increment(trade.contract, abs(new_stop_price))
-
-            # Update prices (preserve sign for combos)
-            order.auxPrice = self._round_to_tick(new_stop_price, stop_increment)
-            if new_limit_price != 0:
-                limit_increment = self._get_price_increment(trade.contract, abs(new_limit_price))
-                order.lmtPrice = self._round_to_tick(new_limit_price, limit_increment)
-
-            # Re-place the order (ib_insync handles modification)
-            self.ib.placeOrder(trade.contract, order)
-
-            limit_str = f"${new_limit_price:.2f}" if new_limit_price else "N/A"
-            logger.debug(f"Modified order {order_id}: stop=${new_stop_price:.2f} limit={limit_str}")
-            return True
+            future = asyncio.run_coroutine_threadsafe(_modify_async(), self._loop)
+            return future.result(timeout=10)
 
         except Exception as e:
             logger.error(f"Failed to modify order {order_id}: {e}")
@@ -1549,28 +1585,44 @@ class TWSBroker:
             logger.error("Cannot place order: not connected")
             return None
 
+        if not self._loop:
+            logger.error("Cannot place order: no event loop available")
+            return None
+
+        # Build order object (can be done in any thread)
+        today = datetime.now().strftime("%Y%m%d")
+        gat_time = f"{today} {exit_time}:00 US/Eastern"
+
+        order = Order()
+        order.action = action
+        order.totalQuantity = abs(quantity)
+        order.orderType = "MKT"
+        order.goodAfterTime = gat_time
+        order.tif = "DAY"
+        order.transmit = True
+
+        # OCA group settings
+        # Note: BAG (combo) orders do NOT support OCA groups
+        if contract.secType != "BAG":
+            order.ocaGroup = oca_group
+            order.ocaType = 1  # Cancel all remaining on fill
+
+        # Execute placeOrder in broker's event loop thread (thread-safe)
+        async def _place_async():
+            try:
+                trade = self.ib.placeOrder(contract, order)
+                await asyncio.sleep(0.1)  # Brief wait for status
+                return trade
+            except Exception as e:
+                logger.error(f"Async place time exit error: {e}")
+                return None
+
         try:
-            # Convert HH:MM to TWS format (YYYYMMDD HH:MM:SS timezone)
-            today = datetime.now().strftime("%Y%m%d")
-            gat_time = f"{today} {exit_time}:00 US/Eastern"
+            future = asyncio.run_coroutine_threadsafe(_place_async(), self._loop)
+            trade = future.result(timeout=10)
 
-            order = Order()
-            order.action = action
-            order.totalQuantity = abs(quantity)
-            order.orderType = "MKT"
-            order.goodAfterTime = gat_time
-            order.tif = "DAY"
-            order.transmit = True
-
-            # OCA group settings
-            # Note: BAG (combo) orders do NOT support OCA groups
-            if contract.secType != "BAG":
-                order.ocaGroup = oca_group
-                order.ocaType = 1  # Cancel all remaining on fill
-
-            trade = self.ib.placeOrder(contract, order)
-
-            logger.info(f"Placed time exit: orderId={trade.order.orderId} at {exit_time}")
+            if trade:
+                logger.info(f"Placed time exit: orderId={trade.order.orderId} at {exit_time}")
 
             return trade
 
@@ -1746,33 +1798,45 @@ class TWSBroker:
         if not self.is_connected():
             return False
 
-        try:
-            # Find the existing trade
-            trades = [t for t in self.ib.openTrades() if t.order.orderId == order_id]
-            if not trades:
-                logger.error(f"Order {order_id} not found in open trades")
+        if not self._loop:
+            logger.error("modify_trailing_stop: no event loop available")
+            return False
+
+        # Execute in broker's event loop thread (thread-safe)
+        async def _modify_async():
+            try:
+                trades = [t for t in self.ib.openTrades() if t.order.orderId == order_id]
+                if not trades:
+                    logger.error(f"Order {order_id} not found in open trades")
+                    return False
+
+                trade = trades[0]
+                order = trade.order
+
+                # Modify only the trail parameters
+                if trail_mode == "percent":
+                    order.trailingPercent = trail_amount
+                    order.auxPrice = 0  # Clear absolute trail
+                else:
+                    order.auxPrice = trail_amount
+                    order.trailingPercent = 0  # Clear percent trail
+
+                if stop_type == "limit":
+                    order.lmtPriceOffset = limit_offset
+
+                # Re-place the order (ib_insync handles modification)
+                self.ib.placeOrder(trade.contract, order)
+
+                logger.info(f"Modified order {order_id}: trail={trail_amount} mode={trail_mode}")
+                return True
+
+            except Exception as e:
+                logger.error(f"Async modify trailing stop error: {e}")
                 return False
 
-            trade = trades[0]
-            order = trade.order
-
-            # Modify only the trail parameters
-            if trail_mode == "percent":
-                order.trailingPercent = trail_amount
-                order.auxPrice = 0  # Clear absolute trail
-            else:
-                order.auxPrice = trail_amount
-                order.trailingPercent = 0  # Clear percent trail
-
-            if stop_type == "limit":
-                order.lmtPriceOffset = limit_offset
-
-            # Re-place the order (ib_insync handles modification)
-            self.ib.placeOrder(trade.contract, order)
-
-            logger.info(f"Modified order {order_id}: trail={trail_amount} mode={trail_mode}")
-            return True
-
+        try:
+            future = asyncio.run_coroutine_threadsafe(_modify_async(), self._loop)
+            return future.result(timeout=10)
         except Exception as e:
             logger.error(f"Failed to modify order {order_id}: {e}")
             return False
@@ -1785,21 +1849,34 @@ class TWSBroker:
             logger.warning("cancel_order: not connected to TWS")
             return False
 
-        try:
-            open_trades = self.ib.openTrades()
-            logger.debug(f"Open trades: {[t.order.orderId for t in open_trades]}")
-
-            trades = [t for t in open_trades if t.order.orderId == order_id]
-            if trades:
-                trade = trades[0]
-                logger.info(f"Found order {order_id}: status={trade.orderStatus.status}, "
-                           f"type={trade.order.orderType}, action={trade.order.action}")
-                self.ib.cancelOrder(trade.order)
-                logger.info(f"Cancel request sent for order {order_id}")
-                return True
-
-            logger.warning(f"Order {order_id} not found in open trades: {[t.order.orderId for t in open_trades]}")
+        if not self._loop:
+            logger.error("cancel_order: no event loop available")
             return False
+
+        # Execute in broker's event loop thread (thread-safe)
+        async def _cancel_async():
+            try:
+                open_trades = self.ib.openTrades()
+                logger.debug(f"Open trades: {[t.order.orderId for t in open_trades]}")
+
+                trades = [t for t in open_trades if t.order.orderId == order_id]
+                if trades:
+                    trade = trades[0]
+                    logger.info(f"Found order {order_id}: status={trade.orderStatus.status}, "
+                               f"type={trade.order.orderType}, action={trade.order.action}")
+                    self.ib.cancelOrder(trade.order)
+                    logger.info(f"Cancel request sent for order {order_id}")
+                    return True
+
+                logger.warning(f"Order {order_id} not found in open trades")
+                return False
+            except Exception as e:
+                logger.error(f"Async cancel order error: {e}")
+                return False
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_cancel_async(), self._loop)
+            return future.result(timeout=10)
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
@@ -1812,27 +1889,39 @@ class TWSBroker:
             logger.warning("cancel_oca_group: not connected to TWS")
             return False
 
+        if not self._loop:
+            logger.error("cancel_oca_group: no event loop available")
+            return False
+
+        # Execute in broker's event loop thread (thread-safe)
+        async def _cancel_async():
+            try:
+                open_trades = self.ib.openTrades()
+                logger.debug(f"Searching for OCA group '{oca_group}' in {len(open_trades)} open trades")
+
+                oca_groups_found = set(t.order.ocaGroup for t in open_trades if t.order.ocaGroup)
+                logger.debug(f"OCA groups in open trades: {oca_groups_found}")
+
+                cancelled = 0
+                for trade in open_trades:
+                    if trade.order.ocaGroup == oca_group:
+                        logger.info(f"Found matching order: {trade.order.orderId} in OCA group {oca_group}")
+                        self.ib.cancelOrder(trade.order)
+                        cancelled += 1
+
+                if cancelled > 0:
+                    logger.info(f"Cancelled {cancelled} orders in OCA group {oca_group}")
+                else:
+                    logger.warning(f"No orders found in OCA group '{oca_group}'. "
+                                  f"Available OCA groups: {oca_groups_found}")
+                return cancelled > 0
+            except Exception as e:
+                logger.error(f"Async cancel OCA group error: {e}")
+                return False
+
         try:
-            open_trades = self.ib.openTrades()
-            logger.debug(f"Searching for OCA group '{oca_group}' in {len(open_trades)} open trades")
-
-            # Log all OCA groups found
-            oca_groups_found = set(t.order.ocaGroup for t in open_trades if t.order.ocaGroup)
-            logger.debug(f"OCA groups in open trades: {oca_groups_found}")
-
-            cancelled = 0
-            for trade in open_trades:
-                if trade.order.ocaGroup == oca_group:
-                    logger.info(f"Found matching order: {trade.order.orderId} in OCA group {oca_group}")
-                    self.ib.cancelOrder(trade.order)
-                    cancelled += 1
-
-            if cancelled > 0:
-                logger.info(f"Cancelled {cancelled} orders in OCA group {oca_group}")
-            else:
-                logger.warning(f"No orders found in OCA group '{oca_group}'. "
-                              f"Available OCA groups: {oca_groups_found}")
-            return cancelled > 0
+            future = asyncio.run_coroutine_threadsafe(_cancel_async(), self._loop)
+            return future.result(timeout=10)
         except Exception as e:
             logger.error(f"Failed to cancel OCA group {oca_group}: {e}")
             return False

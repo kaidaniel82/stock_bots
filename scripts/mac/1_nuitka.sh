@@ -16,12 +16,9 @@ if [[ ! -f "$ASSETS_DIR/AppIcon.icns" ]]; then
     exit 1
 fi
 
-# Clean previous build
-if [[ -d "$BUILD_DIR" ]]; then
-    log_info "Cleaning previous build..."
-    rm -rf "$BUILD_DIR"
-fi
-
+# Clean previous build and dist
+log_info "Cleaning previous build and dist..."
+rm -rf "$BUILD_DIR" "$DIST_DIR"
 mkdir -p "$BUILD_DIR"
 
 # Get plotly validators path
@@ -47,6 +44,11 @@ $PYTHON -m nuitka \
     --include-package=PIL \
     --include-package=plotly \
     --include-package=ib_insync \
+    \
+    --nofollow-import-to=plotly.matplotlylib.mplexporter.tests \
+    --nofollow-import-to=pytest \
+    --nofollow-import-to=_pytest \
+    --nofollow-import-to=hypothesis \
     \
     --include-data-dir="$PROJECT_ROOT/trailing_stop_web"=trailing_stop_web \
     --include-data-file="$PROJECT_ROOT/rxconfig.py"=rxconfig.py \

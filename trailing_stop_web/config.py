@@ -86,15 +86,6 @@ HEARTBEAT_TIMEOUT = 5
 
 
 # =============================================================================
-# GROUP SLOTS (for Nuitka compatibility)
-# =============================================================================
-
-# Maximum number of groups (static slots to avoid rx.foreach issues in Nuitka)
-# Increase this if you need more groups (requires rebuild)
-MAX_GROUPS = 10
-
-
-# =============================================================================
 # LOGGING
 # =============================================================================
 
