@@ -46,12 +46,11 @@ EOF
 
     log_success "Version bumped to: $NEW_VERSION"
 
-    # Git commit and push
+    # Git commit and push (use -C to avoid changing directory)
     log_info "Committing version bump..."
-    cd "$PROJECT_ROOT"
-    git add "$VERSION_FILE"
-    git commit -m "$NEW_VERSION"
-    git push
+    git -C "$PROJECT_ROOT" add "$VERSION_FILE"
+    git -C "$PROJECT_ROOT" commit -m "$NEW_VERSION"
+    git -C "$PROJECT_ROOT" push
     log_success "Version committed and pushed"
 
     # Export for use in rest of script
