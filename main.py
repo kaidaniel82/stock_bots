@@ -54,11 +54,10 @@ def save_pids(pids: dict[str, int]) -> None:
 
 
 def cleanup_ports() -> None:
-    """Kill any processes using our ports (3000, 8000)."""
-    ports = [3000, 8000]
+    """Kill any processes using our ports (3000-3005, 8000-8005)."""
+    ports = list(range(3000, 3006)) + list(range(8000, 8006))
     for port in ports:
         try:
-            # Use lsof to find PIDs on port
             result = subprocess.run(
                 ["lsof", "-ti", f":{port}"],
                 capture_output=True,
@@ -69,7 +68,6 @@ def cleanup_ports() -> None:
                 for pid_str in result.stdout.strip().split('\n'):
                     try:
                         pid = int(pid_str)
-                        # Don't kill ourselves
                         if pid != os.getpid():
                             os.kill(pid, signal.SIGKILL)
                             logger.info(f"Killed process on port {port} (PID {pid})")
@@ -79,9 +77,50 @@ def cleanup_ports() -> None:
             pass
 
 
+def cleanup_processes_by_name() -> None:
+    """Kill related processes by name patterns."""
+    patterns = [
+        "reflex run",
+        "trailing_stop_web",
+        "bun run dev",
+        "bun.*trailing",
+    ]
+    for pattern in patterns:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for pid_str in result.stdout.strip().split('\n'):
+                    try:
+                        pid = int(pid_str)
+                        if pid != os.getpid():
+                            os.kill(pid, signal.SIGKILL)
+                            logger.info(f"Killed '{pattern}' (PID {pid})")
+                    except (ProcessLookupError, ValueError, PermissionError):
+                        pass
+        except Exception:
+            pass
+
+
+def cleanup_vite_cache() -> None:
+    """Clear Vite cache to prevent module import errors."""
+    vite_cache = Path(__file__).parent / ".web" / "node_modules" / ".vite"
+    if vite_cache.exists():
+        try:
+            import shutil
+            shutil.rmtree(vite_cache)
+            logger.info("Cleared Vite cache")
+        except Exception as e:
+            logger.debug(f"Could not clear Vite cache: {e}")
+
+
 def cleanup_previous_instance() -> None:
-    """Kill processes from previous instance using saved PIDs and port cleanup."""
-    # First: cleanup by PID file
+    """Kill processes from previous instance (aggressive cleanup)."""
+    # 1. Cleanup by PID file
     pid_file = get_pid_file_path()
     if pid_file.exists():
         try:
@@ -95,15 +134,21 @@ def cleanup_previous_instance() -> None:
                             os.kill(pid, signal.SIGKILL)
                             logger.info(f"Killed previous {name} (PID {pid})")
                         except (ProcessLookupError, ValueError):
-                            pass  # Process already dead
+                            pass
                         except PermissionError:
                             logger.warning(f"No permission to kill {name} (PID {pid_str})")
             pid_file.unlink(missing_ok=True)
         except Exception as e:
             logger.debug(f"PID cleanup error: {e}")
 
-    # Second: cleanup by ports (catches orphaned processes)
+    # 2. Cleanup by process name patterns
+    cleanup_processes_by_name()
+
+    # 3. Cleanup by ports
     cleanup_ports()
+
+    # 4. Clear Vite cache
+    cleanup_vite_cache()
 
 
 def remove_pid_file() -> None:
