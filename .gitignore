@@ -53,3 +53,5 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+nuitka-crash-report.xml
+docs/GIT_STATE.md
