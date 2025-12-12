@@ -251,6 +251,14 @@ python main.py
 
 ## Changelog
 
+### 2024-12-12
+
+- **Fix**: `@rx.var` computed properties funktionieren nicht in Nuitka Bundles
+  - `position_rows` → reguläre State-Variable + `_compute_position_rows()`
+  - `groups_sorted` → reguläre State-Variable + `_compute_groups_sorted()`
+  - `selected_underlying_symbol` → reguläre State-Variable + `_compute_selected_underlying_symbol()`
+- **Dokumentation**: Problem 7 in `docs/reflex/REFLEX_GOTCHAS.md` hinzugefügt
+
 ### 2024-12-11
 
 - **Fix**: `_backend_only_compile` Patch entfernt - brach State-Registrierung

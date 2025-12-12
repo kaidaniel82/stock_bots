@@ -240,6 +240,103 @@ Wenn die App nach einer Aktion "kaputt geht":
 
 ---
 
+## Problem 7: @rx.var Computed Properties funktionieren NICHT in Nuitka Bundles
+
+### Symptom
+- App funktioniert in Entwicklung (`python main.py` oder `reflex run`)
+- Nach Nuitka-Kompilierung fehlen Daten im Frontend
+- WebSocket-Messages zeigen, dass computed vars (z.B. `position_rows_rx_state_`) **fehlen** im Delta
+- Normale State-Variablen (z.B. `status_message_rx_state_`) funktionieren
+
+### Ursache
+`@rx.var` dekorierte computed properties werden zur Laufzeit berechnet und in den State-Delta eingefügt.
+In Nuitka-kompilierten Bundles funktioniert dieser Mechanismus nicht korrekt - die computed vars werden
+nie berechnet oder nie zum Delta hinzugefügt.
+
+### FALSCH (funktioniert nicht in Nuitka)
+```python
+class AppState(rx.State):
+    positions: list[dict] = []
+    groups: list[dict] = []
+    selected_group_id: str = ""
+
+    @rx.var
+    def position_rows(self) -> list[list[str]]:
+        """Computed property - FUNKTIONIERT NICHT IN NUITKA!"""
+        rows = []
+        for p in self.positions:
+            rows.append([p["symbol"], p["price"], ...])
+        return rows
+
+    @rx.var
+    def groups_sorted(self) -> list[dict]:
+        """Computed property - FUNKTIONIERT NICHT IN NUITKA!"""
+        return sorted(self.groups, key=lambda g: g["name"])
+
+    @rx.var
+    def selected_underlying_symbol(self) -> str:
+        """Computed property - FUNKTIONIERT NICHT IN NUITKA!"""
+        if not self.selected_group_id:
+            return ""
+        # ... Berechnung ...
+        return symbol
+```
+
+### RICHTIG (funktioniert in Nuitka)
+```python
+class AppState(rx.State):
+    positions: list[dict] = []
+    groups: list[dict] = []
+    selected_group_id: str = ""
+
+    # Computed vars als REGULÄRE State-Variablen
+    position_rows: list[list[str]] = []
+    groups_sorted: list[dict] = []
+    selected_underlying_symbol: str = ""
+
+    def _compute_position_rows(self):
+        """Manuell aufrufen nach _refresh_positions()."""
+        rows = []
+        for p in self.positions:
+            rows.append([p["symbol"], p["price"], ...])
+        self.position_rows = rows  # State-Variable setzen!
+
+    def _compute_groups_sorted(self):
+        """Manuell aufrufen nach _load_groups_from_manager()."""
+        self.groups_sorted = sorted(self.groups, key=lambda g: g["name"])
+
+    def _compute_selected_underlying_symbol(self):
+        """Manuell aufrufen bei select_group() und _render_all_charts()."""
+        if not self.selected_group_id:
+            self.selected_underlying_symbol = ""
+            return
+        # ... Berechnung ...
+        self.selected_underlying_symbol = symbol
+
+    def _refresh_positions(self):
+        # ... Position-Logik ...
+        self.positions = result
+        self._compute_position_rows()  # WICHTIG: Manuell aufrufen!
+
+    def _load_groups_from_manager(self):
+        # ... Groups laden ...
+        self.groups = result
+        self._compute_groups_sorted()  # WICHTIG: Manuell aufrufen!
+```
+
+### Debugging
+1. **Browser DevTools → Network → WS → Messages**
+2. Suche nach dem State-Variable-Namen mit `_rx_state_` Suffix
+3. Wenn es **fehlt** im Delta aber andere vars da sind → Computed var Problem
+
+### Betroffene Dateien (dieses Projekt)
+- `trailing_stop_web/state.py`:
+  - `position_rows` → `_compute_position_rows()`
+  - `groups_sorted` → `_compute_groups_sorted()`
+  - `selected_underlying_symbol` → `_compute_selected_underlying_symbol()`
+
+---
+
 ## Zusammenfassung
 
 | Problem | Symptom | Lösung |
@@ -250,3 +347,4 @@ Wenn die App nach einer Aktion "kaputt geht":
 | Type Annotations | Handler-Fehler | Annotations weglassen |
 | Checkbox mit Label | Checkbox nicht klickbar | Label separat als rx.text() |
 | Partial Application | Argumente vertauscht | `handler(partial_arg, event_value)` |
+| **@rx.var in Nuitka** | **Computed vars fehlen im Bundle** | **Reguläre State-Vars + manuelle Berechnung** |

@@ -754,9 +754,9 @@ class TWSBroker:
                         start = tz.localize(start)
                         end = tz.localize(end)
                         if start <= now <= end:
-                            logger.info(f"[MARKET] {pos.symbol}: OPEN via TradingHours (tz={pos.time_zone_id})")
+                            logger.debug(f"[MARKET] {pos.symbol}: OPEN via TradingHours (tz={pos.time_zone_id})")
                             return True
-                logger.info(f"[MARKET] {pos.symbol}: CLOSED via TradingHours")
+                logger.debug(f"[MARKET] {pos.symbol}: CLOSED via TradingHours")
                 return False
             except Exception as e:
                 logger.debug(f"Error parsing trading hours: {e}")
@@ -764,7 +764,7 @@ class TWSBroker:
         # Fallback: Check if bid/ask are valid
         quote = self.get_quote_data(con_id)
         is_open = quote.get('bid', 0) > 0 and quote.get('ask', 0) > 0
-        logger.info(f"[MARKET] {pos.symbol}: {'OPEN' if is_open else 'CLOSED'} via FALLBACK (bid/ask)")
+        logger.debug(f"[MARKET] {pos.symbol}: {'OPEN' if is_open else 'CLOSED'} via FALLBACK (bid/ask)")
         return is_open
 
     def get_market_status(self, con_id: int) -> str:
@@ -986,8 +986,8 @@ class TWSBroker:
         if len(position_quantities) == 1:
             # Single leg - return the position's contract
             con_id = list(position_quantities.keys())[0]
-            print(f"[BROKER] Single-leg: looking for con_id={con_id} (type={type(con_id)})")
-            print(f"[BROKER] Available positions: {list(self._positions.keys())}")
+            logger.debug(f"Single-leg: looking for con_id={con_id} (type={type(con_id)})")
+            logger.debug(f"Available positions: {list(self._positions.keys())}")
             pos = self._positions.get(con_id)
             if pos and pos.raw_contract:
                 contract = pos.raw_contract
@@ -996,10 +996,9 @@ class TWSBroker:
                     contract.exchange = contract.primaryExchange
                 elif not contract.exchange:
                     contract.exchange = "SMART"
-                print(f"[BROKER] Found single-leg contract: {contract.localSymbol} conId={con_id} exchange={contract.exchange}")
-                logger.debug(f"Using single-leg contract: {contract.localSymbol} conId={con_id}")
+                logger.debug(f"Found single-leg contract: {contract.localSymbol} conId={con_id} exchange={contract.exchange}")
                 return contract
-            print(f"[BROKER] ERROR: Position {con_id} not found! pos={pos}")
+            logger.error(f"Position {con_id} not found! pos={pos}")
             logger.error(f"Position {con_id} not found in available positions: {available_ids}")
             return None
 
@@ -1401,7 +1400,7 @@ class TWSBroker:
             # For combos: auxPrice can be NEGATIVE (credit spreads use SELL @ negative price)
             stop_increment = self._get_price_increment(contract, abs(stop_price))
             stop_price_rounded = self._round_to_tick(stop_price, stop_increment)
-            print(f"[BROKER] Price rounding: ${stop_price:.4f} -> ${stop_price_rounded:.2f} (tick={stop_increment})")
+            logger.debug(f"Price rounding: ${stop_price:.4f} -> ${stop_price_rounded:.2f} (tick={stop_increment})")
 
             if limit_price == 0 or limit_price is None:
                 # Stop-Market Order
@@ -1428,9 +1427,9 @@ class TWSBroker:
                 order.ocaType = 1  # Cancel all remaining on fill
 
             # Log contract details for debugging
-            print(f"[BROKER] place_stop_order: Placing {order.orderType} {order.action} order on "
-                  f"{contract.secType} {contract.symbol} conId={contract.conId} "
-                  f"exchange={contract.exchange} stop=${stop_price_rounded:.2f}")
+            logger.debug(f"place_stop_order: Placing {order.orderType} {order.action} order on "
+                        f"{contract.secType} {contract.symbol} conId={contract.conId} "
+                        f"exchange={contract.exchange} stop=${stop_price_rounded:.2f}")
             logger.debug(f"Placing order on contract: {contract.secType} {contract.symbol} "
                         f"conId={contract.conId} exchange={contract.exchange}")
 
@@ -1442,14 +1441,12 @@ class TWSBroker:
 
             # Check order status
             status = trade.orderStatus.status if trade.orderStatus else "Unknown"
-            print(f"[BROKER] Order placed: orderId={trade.order.orderId} status={status}")
             logger.info(f"Placed {order.orderType} order: orderId={trade.order.orderId} "
                        f"status={status} stop=${stop_price:.2f} action={action} "
                        f"contract={contract.localSymbol or contract.symbol}")
 
             # Warn if order rejected (PendingSubmit is normal - order in transit to TWS)
             if status in ("ApiCancelled", "Cancelled", "Inactive"):
-                print(f"[BROKER] WARNING: Order {trade.order.orderId} REJECTED: {status}")
                 logger.warning(f"Order {trade.order.orderId} rejected: {status}")
 
             return trade
@@ -1633,27 +1630,22 @@ class TWSBroker:
                 action = "SELL"
                 # Always invert leg actions for SELL order (IBKR inverts them back)
                 invert_legs = True
-                print(f"[BROKER] Multi-leg order: action=SELL, invert_legs=True")
-                logger.info(f"Multi-leg order: action=SELL, invert_legs=True")
+                logger.debug(f"Multi-leg order: action=SELL, invert_legs=True")
             else:
                 # Single leg: BUY to close short, SELL to close long
                 action = "BUY" if is_credit else "SELL"
                 invert_legs = False
-                print(f"[BROKER] Single-leg order: action={action}, is_credit={is_credit}")
-                logger.info(f"Single-leg order: action={action}, is_credit={is_credit}")
+                logger.debug(f"Single-leg order: action={action}, is_credit={is_credit}")
 
             # Build contract
-            print(f"[BROKER] Building contract for position_quantities={position_quantities}")
+            logger.debug(f"Building contract for position_quantities={position_quantities}")
             contract = self.build_combo_contract(position_quantities, invert_leg_actions=invert_legs)
             if not contract:
-                print(f"[BROKER] ERROR: Failed to build contract!")
                 logger.error(f"Failed to build contract for position_quantities={position_quantities}")
                 return None
 
-            print(f"[BROKER] Contract built: secType={contract.secType}, symbol={contract.symbol}, "
-                  f"conId={contract.conId}, exchange={contract.exchange}, localSymbol={contract.localSymbol}")
-            logger.info(f"Contract built: secType={contract.secType}, symbol={contract.symbol}, "
-                       f"conId={contract.conId}, exchange={contract.exchange}, localSymbol={contract.localSymbol}")
+            logger.debug(f"Contract built: secType={contract.secType}, symbol={contract.symbol}, "
+                        f"conId={contract.conId}, exchange={contract.exchange}, localSymbol={contract.localSymbol}")
 
             # For BAG contracts, the ratios are encoded in ComboLegs
             # Order quantity should be 1 (meaning: 1 unit of the combo)

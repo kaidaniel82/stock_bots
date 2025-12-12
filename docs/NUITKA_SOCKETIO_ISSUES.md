@@ -216,6 +216,7 @@ reflex.utils.prerequisites.get_app = patched_get_app
 | UI zeigt keine Daten | ✅ Gelöst | `_backend_only_compile` Patch entfernt |
 | Nuitka Symlinks | ✅ Gelöst | .web ohne node_modules kopieren |
 | Nuitka Codesign | ✅ Gelöst | .web separat kopieren nach Nuitka-Build |
+| **@rx.var nicht in Nuitka** | ✅ Gelöst | Reguläre State-Vars + manuelle `_compute_*()` Methoden |
 
 ---
 

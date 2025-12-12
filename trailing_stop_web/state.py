@@ -120,6 +120,9 @@ class AppState(rx.State):
 
     # Portfolio - use list[dict] for proper Reflex serialization (not dataclass)
     positions: list[dict] = []
+    # Position rows for table rendering (computed from positions, stored as regular state var)
+    # This replaces the @rx.var computed property which doesn't work in Nuitka bundles
+    position_rows: list[list[str]] = []
     # Selected positions with quantities: {con_id_str: quantity} - JSON uses string keys
     selected_quantities: dict[str, int] = {}
 
@@ -171,6 +174,9 @@ class AppState(rx.State):
     active_tab: str = "setup"  # "setup" or "monitor"
     delete_confirm_group_id: str = ""  # Group ID pending delete confirmation
     selected_group_id: str = ""  # Currently selected group in monitor tab
+    # Computed vars converted to state vars for Nuitka compatibility
+    groups_sorted: list[dict] = []  # Sorted groups for monitor tab
+    selected_underlying_symbol: str = ""  # Underlying symbol for selected group
 
     # === Collapsed Groups (for Monitor tab) ===
     # Groups that are collapsed (showing only KPIs: Name, PnL, Mid, Stop)
@@ -190,17 +196,17 @@ class AppState(rx.State):
     chart_pnl_current: str = "-"
     chart_pnl_stop: str = "-"
 
-    @rx.var
-    def position_rows(self) -> list[list[str]]:
-        """Computed var - returns position data as simple list of lists for table.
+    def _compute_position_rows(self):
+        """Compute position_rows from positions and update state.
+
+        This replaces the @rx.var computed property which doesn't work in Nuitka bundles.
+        Called after _refresh_positions() to update the table data.
 
         Column order: [con_id, symbol, type, expiry, strike, side, qty, fill_price,
                        bid, mid, ask, last, mark, net_cost, net_value, pnl, pnl_color,
                        is_selected, qty_usage_str, is_fully_used, selected_qty,
                        available_qty, qty_options, market_status]
         """
-        # Access refresh_tick to force recomputation on every tick
-        _ = self.refresh_tick
         rows = []
         for p in self.positions:
             pnl_val = p.get("pnl", 0)
@@ -239,7 +245,8 @@ class AppState(rx.State):
         # Log first row to verify data
         if rows:
             logger.debug(f"UI row[0]: {rows[0][1]} fill={rows[0][6]} mark={rows[0][11]} pnl={rows[0][14]} selected={rows[0][16]} usage={rows[0][17]}")
-        return rows
+        # Update state variable (triggers frontend update)
+        self.position_rows = rows
 
     def on_mount(self):
         """Called when page mounts - just initialize UI, don't auto-connect."""
@@ -328,6 +335,7 @@ class AppState(rx.State):
     def _load_positions(self):
         """Load positions from broker (uses live prices when available)."""
         self._refresh_positions()
+        self._compute_position_rows()
 
     def toggle_position(self, con_id):
         """Toggle position selection (selects with default qty=1 or deselects)."""
@@ -464,6 +472,7 @@ class AppState(rx.State):
         # Refresh positions if connected (don't clear if disconnected)
         if BROKER.is_connected():
             self._refresh_positions()
+            self._compute_position_rows()
         self._load_groups_from_manager()
 
         # Initialize chart state for new group
@@ -589,6 +598,8 @@ class AppState(rx.State):
                 # Statistics
                 "modification_count": g.modification_count,
             })
+        # Update sorted groups for monitor tab (replaces @rx.var)
+        self._compute_groups_sorted()
 
     def _calc_group_value(self, con_ids: list[int]) -> float:
         """Calculate total value of positions in group."""
@@ -1016,9 +1027,11 @@ class AppState(rx.State):
         if self.is_connected:
             self.connection_status = "Connected"
             self._refresh_positions()
+            self._compute_position_rows()
         else:
             self.connection_status = "Disconnected"
             self.positions = []
+            self._compute_position_rows()
 
     def start_monitoring(self):
         """Start the price monitoring (driven by frontend interval)."""
@@ -1208,6 +1221,7 @@ class AppState(rx.State):
         # 2. Refresh positions (necessary for price data)
         t0 = time.perf_counter()
         self._refresh_positions()
+        self._compute_position_rows()
         self.refresh_tick += 1
         timings["2_refresh_pos"] = (time.perf_counter() - t0) * 1000
 
@@ -1335,6 +1349,8 @@ class AppState(rx.State):
         """Select a group in monitor view and load chart data."""
         logger.debug(f"select_group called with group_id={group_id}")
         self.selected_group_id = group_id
+        # Update underlying symbol (replaces @rx.var)
+        self._compute_selected_underlying_symbol()
         # Initialize chart state if not exists
         if group_id not in self.chart_data:
             self._init_chart_state(group_id)
@@ -1405,24 +1421,31 @@ class AppState(rx.State):
         """DEPRECATED: PnL history now collected live from connect time."""
         pass
 
-    @rx.var
-    def selected_underlying_symbol(self) -> str:
-        """Get the underlying symbol for the selected group."""
+    def _compute_selected_underlying_symbol(self):
+        """Compute the underlying symbol for the selected group.
+
+        This replaces the @rx.var computed property which doesn't work in Nuitka bundles.
+        """
         if not self.selected_group_id:
-            return ""
+            self.selected_underlying_symbol = ""
+            return
         group = GROUP_MANAGER.get(self.selected_group_id)
         if not group or not group.con_ids:
-            return ""
+            self.selected_underlying_symbol = ""
+            return
         first_con_id = group.con_ids[0]
         for p in self.positions:
             if p["con_id"] == first_con_id:
-                return p["symbol"]
-        return ""
+                self.selected_underlying_symbol = p["symbol"]
+                return
+        self.selected_underlying_symbol = ""
 
-    @rx.var
-    def groups_sorted(self) -> list[dict]:
-        """Get groups sorted alphabetically by name for monitor tab."""
-        return sorted(self.groups, key=lambda g: g.get("name", "").lower())
+    def _compute_groups_sorted(self):
+        """Compute groups sorted alphabetically by name for monitor tab.
+
+        This replaces the @rx.var computed property which doesn't work in Nuitka bundles.
+        """
+        self.groups_sorted = sorted(self.groups, key=lambda g: g.get("name", "").lower())
 
     # === Chart Rendering Methods (NOT @rx.var - controlled updates) ===
 
@@ -1715,6 +1738,8 @@ class AppState(rx.State):
             return
 
         group_id = self.selected_group_id
+        # Update underlying symbol for render (replaces @rx.var)
+        self._compute_selected_underlying_symbol()
         if group_id not in self.chart_data:
             self._init_chart_state(group_id)
 
