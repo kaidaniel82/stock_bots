@@ -14,6 +14,7 @@ Arguments:
 import argparse
 import atexit
 import logging
+import os
 import signal
 import subprocess
 import sys
@@ -23,6 +24,7 @@ import urllib.request
 from pathlib import Path
 
 from trailing_stop_web.tray import SystemTray
+from trailing_stop_web.paths import get_app_data_dir
 
 # Configure logging
 logging.basicConfig(
@@ -31,6 +33,57 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+# === PID Management (shared with main_desktop.py) ===
+def get_pid_file_path() -> Path:
+    """Get PID file path in app data directory."""
+    return get_app_data_dir() / ".trailing_stop.pid"
+
+
+def save_pids(pids: dict[str, int]) -> None:
+    """Save process IDs to file for cleanup on next start."""
+    try:
+        pid_file = get_pid_file_path()
+        with open(pid_file, "w") as f:
+            for name, pid in pids.items():
+                f.write(f"{name}:{pid}\n")
+        logger.info(f"Saved PIDs to {pid_file}")
+    except Exception as e:
+        logger.debug(f"Could not save PIDs: {e}")
+
+
+def cleanup_previous_instance() -> None:
+    """Kill processes from previous instance using saved PIDs."""
+    pid_file = get_pid_file_path()
+    if not pid_file.exists():
+        return
+
+    try:
+        with open(pid_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if ":" in line:
+                    name, pid_str = line.split(":", 1)
+                    try:
+                        pid = int(pid_str)
+                        os.kill(pid, signal.SIGKILL)
+                        logger.info(f"Killed previous {name} (PID {pid})")
+                    except (ProcessLookupError, ValueError):
+                        pass  # Process already dead
+                    except PermissionError:
+                        logger.warning(f"No permission to kill {name} (PID {pid_str})")
+        pid_file.unlink(missing_ok=True)
+    except Exception as e:
+        logger.debug(f"Cleanup error: {e}")
+
+
+def remove_pid_file() -> None:
+    """Remove PID file on clean shutdown."""
+    try:
+        get_pid_file_path().unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 class ReflexApp:
@@ -185,6 +238,9 @@ class ReflexApp:
             except Exception as e:
                 logger.debug(f"Tray already stopped: {e}")
 
+        # Remove PID file on clean shutdown
+        remove_pid_file()
+
     def run(self, use_tray: bool = True, open_browser: bool = True) -> None:
         """Run the application.
 
@@ -204,6 +260,9 @@ class ReflexApp:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
+        # Clean up any leftover processes from previous runs
+        cleanup_previous_instance()
+
         # Start Reflex in separate thread to avoid blocking
         reflex_thread = threading.Thread(target=self.start_reflex, daemon=False)
         reflex_thread.start()
@@ -217,6 +276,12 @@ class ReflexApp:
                 return
 
         logger.info("Reflex is ready!")
+
+        # Save PIDs for cleanup on next start
+        pids = {"main": os.getpid()}
+        if self.process and self.process.pid:
+            pids["reflex"] = self.process.pid
+        save_pids(pids)
 
         # Auto-open browser if requested
         if open_browser and self._reflex_ready.is_set():
