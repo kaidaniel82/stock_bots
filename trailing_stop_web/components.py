@@ -568,23 +568,27 @@ def _group_hwm_stop_row(group: dict, show_trail: bool = False) -> rx.Component:
 
 
 def _group_action_buttons(group_id: str, is_active: bool) -> rx.Component:
-    """Action buttons (Activate/Deactivate, Cancel, Delete)."""
+    """Action buttons (Activate/Deactivate, Cancel, Delete).
+
+    Note: Uses set_pending_* methods instead of direct calls for Nuitka compatibility.
+    Partial application in rx.foreach doesn't work in Nuitka bundles.
+    """
     return rx.hstack(
         rx.button(
             rx.cond(is_active, "Deactivate", "Activate"),
-            on_click=AppState.toggle_group_active(group_id),
+            on_click=AppState.set_pending_toggle(group_id),
             color_scheme=rx.cond(is_active, "orange", "blue"),
             size="1",
         ),
         rx.button(
             "Cancel",
-            on_click=AppState.cancel_group_order(group_id),
+            on_click=AppState.set_pending_cancel(group_id),
             color_scheme="yellow",
             size="1",
         ),
         rx.button(
             "Delete",
-            on_click=AppState.request_delete_group(group_id),
+            on_click=AppState.set_pending_delete(group_id),
             color_scheme="red",
             size="1",
         ),

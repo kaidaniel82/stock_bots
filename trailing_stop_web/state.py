@@ -181,6 +181,10 @@ class AppState(rx.State):
     active_tab: str = "setup"  # "setup" or "monitor"
     delete_confirm_group_id: str = ""  # Group ID pending delete confirmation
     selected_group_id: str = ""  # Currently selected group in monitor tab
+    # Nuitka workaround: store group_id before action (partial application doesn't work in rx.foreach)
+    pending_toggle_group_id: str = ""  # Group ID for pending toggle action
+    pending_cancel_group_id: str = ""  # Group ID for pending cancel action
+    pending_delete_group_id: str = ""  # Group ID for pending delete action
     # Computed vars converted to state vars for Nuitka compatibility
     groups_sorted: list[dict] = []  # Sorted groups for monitor tab
     selected_underlying_symbol: str = ""  # Underlying symbol for selected group
@@ -828,6 +832,32 @@ class AppState(rx.State):
             new_data = {k: v for k, v in self.chart_data.items() if k != group_id}
             self.chart_data = new_data
         self.status_message = "Group deleted"
+
+    # === Nuitka Workaround: Two-step actions for rx.foreach compatibility ===
+    # Partial application doesn't work in Nuitka bundles, so we store group_id first,
+    # then trigger the actual action in a chained event.
+
+    def set_pending_toggle(self, group_id: str):
+        """Store group_id and execute toggle directly. Workaround for Nuitka partial application bug."""
+        self.pending_toggle_group_id = group_id
+        # Execute directly instead of chaining - simpler and works in Nuitka
+        if self.pending_toggle_group_id:
+            self.toggle_group_active(self.pending_toggle_group_id)
+            self.pending_toggle_group_id = ""
+
+    def set_pending_cancel(self, group_id: str):
+        """Store group_id and execute cancel directly. Workaround for Nuitka partial application bug."""
+        self.pending_cancel_group_id = group_id
+        if self.pending_cancel_group_id:
+            self.cancel_group_order(self.pending_cancel_group_id)
+            self.pending_cancel_group_id = ""
+
+    def set_pending_delete(self, group_id: str):
+        """Store group_id and execute delete dialog directly. Workaround for Nuitka partial application bug."""
+        self.pending_delete_group_id = group_id
+        if self.pending_delete_group_id:
+            self.request_delete_group(self.pending_delete_group_id)
+            self.pending_delete_group_id = ""
 
     def toggle_group_active(self, group_id: str):
         """Toggle group monitoring on/off - places/cancels orders at TWS."""
