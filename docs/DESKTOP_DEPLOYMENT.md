@@ -153,7 +153,9 @@ Dieser Patch übersprang kritische Initialisierungsschritte, wodurch State-Varia
 
 Wenn Port 5173 belegt ist, wechselt Vite auf 5174. Die App wartet dann auf den falschen Port.
 
-**Lösung**: Ports vor dem Start freigeben:
+**Lösung**: Wird automatisch beim Start gehandhabt durch `cleanup_previous_instance()`.
+
+Falls manuell nötig:
 ```bash
 lsof -ti :5173 | xargs kill -9
 lsof -ti :8000 | xargs kill -9
@@ -235,6 +237,64 @@ Windows-Deployment folgt dem gleichen Konzept:
 
 ---
 
+## Version Management
+
+### Format
+
+```
+YYMMDD-NNN
+251212-001  → 12. Dezember 2025, Build 1
+251212-002  → 12. Dezember 2025, Build 2
+251213-001  → 13. Dezember 2025, Build 1 (Reset bei neuem Tag)
+```
+
+### Dateien
+
+| Datei | Zweck |
+|-------|-------|
+| `trailing_stop_web/version.py` | Enthält `__version__` |
+| `scripts/mac/build.sh` | Bumpt Version, committed, pusht |
+| `trailing_stop_web/tray.py` | Zeigt Version im Tray Tooltip |
+
+### Ablauf bei Build
+
+```
+./scripts/mac/build.sh
+  ↓
+1. Version in version.py hochzählen
+2. git add + commit "251212-002" + push
+3. Nuitka Build (version.py wird mit kompiliert)
+4. ...
+```
+
+---
+
+## Entrypoints
+
+| Datei | Zweck | Ports | Tray |
+|-------|-------|-------|------|
+| `main.py` | Development mit Reflex | 3000, 8000 | ✓ |
+| `main_desktop.py` | Nuitka Bundle | 5173, 8000 | ✓ |
+| `start.sh` | Wrapper für main.py | 3000, 8000 | ✓ |
+
+### Startup-Cleanup (alle Entrypoints)
+
+Beim Start werden automatisch:
+1. PIDs aus vorherigem Lauf gekillt (PID-Datei)
+2. Prozesse nach Name-Pattern gekillt (reflex, bun, trailing_stop_web)
+3. Ports aufgeräumt (3000-3005 oder 5173-5178, plus 8000-8005)
+4. Vite Cache gelöscht (nur main.py)
+
+### Argumente
+
+```bash
+python main.py --no-tray      # Ohne System Tray
+python main.py --no-browser   # Browser nicht auto-öffnen
+./start.sh --no-tray          # Wird durchgereicht an main.py
+```
+
+---
+
 ## Legacy: Development Mode
 
 Für Entwicklung ohne Nuitka:
@@ -243,13 +303,29 @@ Für Entwicklung ohne Nuitka:
 # Standard Reflex development (hot reload)
 reflex run
 
-# Oder mit System Tray
+# Oder mit System Tray + Cleanup
 python main.py
+
+# Oder via start.sh (setzt auch REFLEX_HOT_RELOAD_EXCLUDE_PATHS)
+./start.sh
 ```
 
 ---
 
 ## Changelog
+
+### 2025-12-12
+
+- **Neu**: Version Management mit Format `YYMMDD-NNN`
+  - `trailing_stop_web/version.py` enthält `__version__`
+  - `build.sh` bumpt Version automatisch, committed und pusht
+  - Tray Icon zeigt Version beim Hover
+- **Neu**: Aggressives Startup-Cleanup in `main.py` und `main_desktop.py`
+  - Killt Prozesse nach Name-Patterns (reflex, bun, trailing_stop_web)
+  - Räumt Ports 3000-3005/5173-5178 und 8000-8005 auf
+  - Löscht Vite Cache (nur main.py)
+- **Refactored**: `start.sh` delegiert jetzt an `main.py` (10 Zeilen statt 140)
+- **Fix**: `version.py` Import mit try/except für Nuitka-Kompatibilität
 
 ### 2024-12-12
 
