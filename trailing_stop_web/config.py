@@ -41,6 +41,11 @@ BAR_INTERVAL_TICKS = 360
 # Chart-Rendering: Alle N Ticks rendern (2 = jede Sekunde bei 500ms interval)
 CHART_RENDER_INTERVAL = 2
 
+# UI Position Table Throttle: Alle N Ticks die position_rows aktualisieren
+# Bei 500ms UI_UPDATE_INTERVAL: 3 ticks = 1.5 Sekunden
+# Reduziert CPU-Last für UI-Rendering, Trading-Logik läuft weiterhin jeden Tick!
+UI_POSITION_THROTTLE_INTERVAL = 3
+
 
 # =============================================================================
 # TRAILING STOP DEFAULTS

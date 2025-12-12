@@ -14,6 +14,7 @@ from .config import (
     UI_UPDATE_INTERVAL,
     DEFAULT_TRAIL_PERCENT, DEFAULT_STOP_TYPE, DEFAULT_LIMIT_OFFSET,
     BAR_INTERVAL_TICKS, CHART_RENDER_INTERVAL,
+    UI_POSITION_THROTTLE_INTERVAL,
     TWS_PORT, TWS_CLIENT_ID
 )
 from .logger import logger
@@ -139,6 +140,12 @@ class AppState(rx.State):
     is_monitoring: bool = False
     status_message: str = "Ready"
     refresh_tick: int = 0  # Force UI refresh
+
+    # === UI Performance Optimization ===
+    # Throttle UI updates to reduce CPU load while keeping trading logic in real-time
+    _ui_tick_counter: int = 0  # Counter for UI update throttling
+    _ui_dirty: bool = False  # Flag to indicate UI needs update (from event handlers)
+    _groups_count_cache: int = 0  # Cache groups count to detect changes
 
     # === NEW: Unified Chart State (12h window, 240 x 3-min slots) ===
     # chart_data: group_id -> {
@@ -338,7 +345,11 @@ class AppState(rx.State):
         self._compute_position_rows()
 
     def toggle_position(self, con_id):
-        """Toggle position selection (selects with default qty=1 or deselects)."""
+        """Toggle position selection (selects with default qty=1 or deselects).
+
+        UI OPTIMIZATION: Updates state immediately for fast feedback, but defers
+        _compute_position_rows() to next tick_update() via _ui_dirty flag.
+        """
         # Ensure con_id is string for dict key
         con_id_str = str(con_id)
         logger.debug(f"toggle_position called with con_id={con_id_str}, current selected={self.selected_quantities}")
@@ -353,8 +364,14 @@ class AppState(rx.State):
             logger.debug(f"Added {con_id_str} with qty=1, now selected={new_selected}")
         self.selected_quantities = new_selected
 
+        # Mark UI as dirty so next tick_update() refreshes position_rows
+        self._ui_dirty = True
+
     def set_position_quantity(self, con_id, qty):
         """Set the quantity for a selected position.
+
+        UI OPTIMIZATION: Updates state immediately for fast feedback, but defers
+        _compute_position_rows() to next tick_update() via _ui_dirty flag.
 
         Args:
             con_id: Position contract ID (can be int or str)
@@ -376,6 +393,9 @@ class AppState(rx.State):
 
         self.selected_quantities = new_selected
         logger.debug(f"set_position_quantity: {con_id_str}={qty_int}, now selected={new_selected}")
+
+        # Mark UI as dirty so next tick_update() refreshes position_rows
+        self._ui_dirty = True
 
     def set_new_group_name(self, value: str):
         self.new_group_name = value
@@ -598,7 +618,9 @@ class AppState(rx.State):
                 # Statistics
                 "modification_count": g.modification_count,
             })
-        # Update sorted groups for monitor tab (replaces @rx.var)
+
+        # Always update groups_sorted - it's needed for Monitor tab display
+        # The sorting itself is cheap, the expensive part was metrics computation (now cached)
         self._compute_groups_sorted()
 
     def _calc_group_value(self, con_ids: list[int]) -> float:
@@ -1221,7 +1243,17 @@ class AppState(rx.State):
         # 2. Refresh positions (necessary for price data)
         t0 = time.perf_counter()
         self._refresh_positions()
-        self._compute_position_rows()
+
+        # UI OPTIMIZATION: Throttle position_rows computation
+        # Only update UI every UI_POSITION_THROTTLE_INTERVAL ticks OR when dirty flag set
+        # Trading logic in _refresh_positions() still runs every tick!
+        self._ui_tick_counter += 1
+        should_update_position_ui = (self._ui_tick_counter % UI_POSITION_THROTTLE_INTERVAL == 0) or self._ui_dirty
+        if should_update_position_ui:
+            self._compute_position_rows()
+            if self._ui_dirty:
+                self._ui_dirty = False  # Clear dirty flag after update
+
         self.refresh_tick += 1
         timings["2_refresh_pos"] = (time.perf_counter() - t0) * 1000
 
