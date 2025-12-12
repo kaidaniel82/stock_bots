@@ -1,6 +1,7 @@
 """UI Components for Trailing Stop Manager."""
 import reflex as rx
 
+from .config import MAX_GROUPS
 from .state import AppState
 from .ui_config.theme import (
     COLORS, TAB_STYLES, CARD_STYLES, TOPBAR_STYLES, LAYOUT,
@@ -567,32 +568,395 @@ def _group_hwm_stop_row(group: dict, show_trail: bool = False) -> rx.Component:
     )
 
 
-def _group_action_buttons(group_id: str, is_active: bool) -> rx.Component:
-    """Action buttons (Activate/Deactivate, Cancel, Delete).
+def _make_slot_action_buttons(slot_idx: int):
+    """Factory: Create action buttons for a specific slot index.
 
-    Note: Uses set_pending_* methods instead of direct calls for Nuitka compatibility.
-    Partial application in rx.foreach doesn't work in Nuitka bundles.
+    Called at module load time with Python int literals (0, 1, 2, ...).
+    This avoids rx.foreach partial application issues in Nuitka.
     """
-    return rx.hstack(
-        rx.button(
-            rx.cond(is_active, "Deactivate", "Activate"),
-            on_click=AppState.set_pending_toggle(group_id),
-            color_scheme=rx.cond(is_active, "orange", "blue"),
-            size="1",
-        ),
-        rx.button(
-            "Cancel",
-            on_click=AppState.set_pending_cancel(group_id),
-            color_scheme="yellow",
-            size="1",
-        ),
-        rx.button(
-            "Delete",
-            on_click=AppState.set_pending_delete(group_id),
-            color_scheme="red",
-            size="1",
-        ),
-        spacing="1",
+    def buttons(is_active) -> rx.Component:
+        return rx.hstack(
+            rx.button(
+                rx.cond(is_active, "Deactivate", "Activate"),
+                on_click=AppState.toggle_slot(slot_idx),  # Static int, not Var!
+                color_scheme=rx.cond(is_active, "orange", "blue"),
+                size="1",
+            ),
+            rx.button(
+                "Cancel",
+                on_click=AppState.cancel_slot(slot_idx),  # Static int
+                color_scheme="yellow",
+                size="1",
+            ),
+            rx.button(
+                "Delete",
+                on_click=AppState.delete_slot(slot_idx),  # Static int
+                color_scheme="red",
+                size="1",
+            ),
+            spacing="1",
+            width="100%",
+        )
+    return buttons
+
+
+# Generate static button factories at module load time
+# Each SLOT_BUTTONS[i] is a function that takes is_active and returns buttons
+SLOT_BUTTONS = [_make_slot_action_buttons(i) for i in range(MAX_GROUPS)]
+
+
+def _group_action_buttons_for_slot(slot_idx: int, is_active) -> rx.Component:
+    """Get action buttons for a slot index. Uses pre-generated static buttons."""
+    return SLOT_BUTTONS[slot_idx](is_active)
+
+
+def _make_slot_trailing_config(slot_idx: int):
+    """Factory: Create trailing config section for a specific slot index."""
+    def config(group: dict) -> rx.Component:
+        return rx.vstack(
+            rx.divider(color=COLORS["border"]),
+            rx.text("Trailing Stop", size="1", weight="bold", color=COLORS["text_muted"]),
+            rx.hstack(
+                rx.vstack(
+                    rx.text("Mode", size="1", color=COLORS["text_muted"]),
+                    rx.select(
+                        ["percent", "absolute"],
+                        value=group["trail_mode"],
+                        on_change=AppState.update_trail_mode_slot(slot_idx),
+                        size="1",
+                    ),
+                    align="center", spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Trail", size="1", color=COLORS["text_muted"]),
+                    rx.input(
+                        value=group["trail_value"].to(str),
+                        on_change=AppState.update_trail_slot(slot_idx),
+                        width="50px",
+                        size="1",
+                    ),
+                    align="center", spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Trigger", size="1", color=COLORS["text_muted"]),
+                    rx.select(
+                        ["mark", "mid", "bid", "ask", "last"],
+                        value=group["trigger_price_type"],
+                        on_change=AppState.update_trigger_price_type_slot(slot_idx),
+                        size="1",
+                    ),
+                    align="center", spacing="0",
+                ),
+                rx.vstack(
+                    rx.text("Type", size="1", color=COLORS["text_muted"]),
+                    rx.select(
+                        ["market", "limit"],
+                        value=group["stop_type"],
+                        on_change=AppState.update_stop_type_slot(slot_idx),
+                        size="1",
+                    ),
+                    align="center", spacing="0",
+                ),
+                rx.cond(
+                    group["stop_type"] == "limit",
+                    rx.vstack(
+                        rx.text("Offset", size="1", color=COLORS["text_muted"]),
+                        rx.input(
+                            value=group["limit_offset"].to(str),
+                            on_change=AppState.update_limit_offset_slot(slot_idx),
+                            width="50px",
+                            size="1",
+                        ),
+                        align="center", spacing="0",
+                    ),
+                    rx.box(),
+                ),
+                spacing="3",
+                width="100%",
+            ),
+            width="100%",
+            spacing="2",
+        )
+    return config
+
+
+def _make_slot_time_exit_config(slot_idx: int):
+    """Factory: Create time exit config section for a specific slot index."""
+    def config(group: dict) -> rx.Component:
+        return rx.vstack(
+            rx.divider(color=COLORS["border"]),
+            rx.hstack(
+                rx.checkbox(
+                    checked=group["time_exit_enabled"],
+                    on_change=AppState.update_time_exit_enabled_slot(slot_idx),
+                    size="1",
+                ),
+                rx.text("Time Exit", size="1", color=COLORS["text_secondary"]),
+                rx.cond(
+                    group["time_exit_enabled"],
+                    rx.hstack(
+                        rx.text("at", size="1", color=COLORS["text_muted"]),
+                        rx.input(
+                            value=group["time_exit_time"],
+                            on_change=AppState.update_time_exit_time_slot(slot_idx),
+                            width="60px",
+                            size="1",
+                        ),
+                        rx.text("ET", size="1", color=COLORS["text_muted"]),
+                        spacing="1",
+                        align="center",
+                    ),
+                    rx.box(),
+                ),
+                spacing="2",
+                align="center",
+            ),
+            width="100%",
+        )
+    return config
+
+
+def _make_slot_collapsed_view(slot_idx: int):
+    """Factory: Create collapsed view for a specific slot index."""
+    def view(group: dict) -> rx.Component:
+        is_active = group["is_active"]
+        return rx.vstack(
+            # Row 1: Expand button + Name + Badges
+            rx.hstack(
+                rx.box(
+                    rx.icon_button(
+                        rx.icon("chevron-right", size=16),
+                        on_click=AppState.toggle_collapsed_slot(slot_idx),
+                        variant="ghost",
+                        size="1",
+                        color=COLORS["text_muted"],
+                    ),
+                    on_click=rx.stop_propagation,
+                    display="flex",
+                    align_items="center",
+                ),
+                rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
+                       font_family=TYPOGRAPHY["font_family"]),
+                rx.hstack(
+                    rx.badge(
+                        rx.cond(is_active, "ACTIVE", "IDLE"),
+                        color_scheme=rx.cond(is_active, "green", "gray"),
+                        size="1",
+                    ),
+                    rx.badge(group["strategy_tag"], color_scheme="gold", size="1"),
+                    spacing="1",
+                    align="center",
+                ),
+                width="100%",
+                align="center",
+                justify="start",
+                spacing="2",
+            ),
+            # Row 2: KPIs - Mid, Stop, P&L
+            rx.hstack(
+                rx.hstack(
+                    rx.text("Mid:", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["mid_value_str"], size="1", weight="bold", color=COLORS["text_primary"]),
+                    spacing="1",
+                ),
+                rx.hstack(
+                    rx.text("Stop:", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["stop_str"], size="1", weight="bold", color=COLORS["stop"]),
+                    spacing="1",
+                ),
+                rx.hstack(
+                    rx.text("P&L:", size="1", color=COLORS["text_muted"]),
+                    rx.text(group["pnl_mark_str"], size="1", weight="bold", color=group["pnl_color"]),
+                    spacing="1",
+                ),
+                spacing="4",
+                width="100%",
+                justify="start",
+                padding_left="6",
+            ),
+            width="100%",
+            spacing="1",
+            padding="1",
+        )
+    return view
+
+
+def _make_slot_expanded_view(slot_idx: int):
+    """Factory: Create expanded view for a specific slot index."""
+    def view(group: dict) -> rx.Component:
+        is_active = group["is_active"]
+        return rx.vstack(
+            # Header with collapse button
+            rx.hstack(
+                rx.box(
+                    rx.icon_button(
+                        rx.icon("chevron-down", size=16),
+                        on_click=AppState.toggle_collapsed_slot(slot_idx),
+                        variant="ghost",
+                        size="1",
+                        color=COLORS["text_muted"],
+                    ),
+                    on_click=rx.stop_propagation,
+                    display="flex",
+                    align_items="center",
+                ),
+                rx.text(group["name"], size="2", weight="bold", color=COLORS["primary"],
+                       font_family=TYPOGRAPHY["font_family"]),
+                rx.hstack(
+                    rx.badge(
+                        rx.cond(is_active, "ACTIVE", "IDLE"),
+                        color_scheme=rx.cond(is_active, "green", "gray"),
+                        size="1",
+                    ),
+                    rx.badge(group["strategy_tag"], color_scheme="gold", size="1"),
+                    spacing="1",
+                    align="center",
+                ),
+                width="100%",
+                align="center",
+                justify="start",
+                spacing="2",
+            ),
+            # Legs table
+            _group_legs_display(group),
+            # Prices row
+            _group_prices_row(group, size="1"),
+            # Greeks row
+            _group_greeks_row(group),
+            # HWM/Stop row with trail
+            _group_hwm_stop_row(group, show_trail=True),
+            # Action buttons with slot handler
+            SLOT_BUTTONS[slot_idx](is_active),
+            width="100%",
+            spacing="1",
+            padding="1",
+        )
+    return view
+
+
+# Generate static config factories at module load time
+SLOT_TRAILING_CONFIG = [_make_slot_trailing_config(i) for i in range(MAX_GROUPS)]
+SLOT_TIME_EXIT_CONFIG = [_make_slot_time_exit_config(i) for i in range(MAX_GROUPS)]
+SLOT_COLLAPSED_VIEW = [_make_slot_collapsed_view(i) for i in range(MAX_GROUPS)]
+SLOT_EXPANDED_VIEW = [_make_slot_expanded_view(i) for i in range(MAX_GROUPS)]
+
+
+def _make_slot_setup_card(slot_idx: int):
+    """Factory: Create setup card for a specific slot index."""
+    def card(group: dict) -> rx.Component:
+        is_active = group["is_active"]
+        return rx.box(
+            rx.vstack(
+                _group_header(group, is_selected=False),
+                _group_legs_display(group),
+                _group_prices_row(group, size="2"),
+                _group_greeks_row(group),
+                SLOT_TRAILING_CONFIG[slot_idx](group),
+                _group_hwm_stop_row(group, show_trail=False),
+                SLOT_TIME_EXIT_CONFIG[slot_idx](group),
+                SLOT_BUTTONS[slot_idx](is_active),
+                width="100%",
+                spacing="2",
+            ),
+            background=COLORS["bg_panel"],
+            border=PANEL_STYLES["border"],
+            border_left=PANEL_STYLES["border_left"],
+            border_radius=PANEL_STYLES["border_radius"],
+            padding=PANEL_STYLES["padding"],
+            width="100%",
+        )
+    return card
+
+
+def _make_slot_monitor_card(slot_idx: int):
+    """Factory: Create monitor card for a specific slot index."""
+    collapsed_view = SLOT_COLLAPSED_VIEW[slot_idx]
+    expanded_view = SLOT_EXPANDED_VIEW[slot_idx]
+
+    def card(group: dict) -> rx.Component:
+        group_id = group["id"]
+        is_selected = AppState.selected_group_id == group_id
+        is_collapsed = AppState.collapsed_groups.contains(group_id)
+
+        border = rx.cond(
+            is_selected,
+            f"2px solid {COLORS['accent']}",
+            PANEL_STYLES["border"],
+        )
+        border_left = rx.cond(
+            is_selected,
+            f"4px solid {COLORS['accent']}",
+            PANEL_STYLES["border_left"],
+        )
+        background = rx.cond(
+            is_selected,
+            "rgba(255, 165, 0, 0.08)",
+            COLORS["bg_panel"],
+        )
+        box_shadow = rx.cond(
+            is_selected,
+            "0 0 12px rgba(255, 165, 0, 0.25)",
+            "none",
+        )
+
+        return rx.box(
+            rx.cond(
+                is_collapsed,
+                collapsed_view(group),
+                expanded_view(group),
+            ),
+            background=background,
+            border=border,
+            border_left=border_left,
+            border_radius=PANEL_STYLES["border_radius"],
+            padding="0.5rem",
+            width="100%",
+            box_shadow=box_shadow,
+            cursor="pointer",
+            on_click=AppState.select_group_slot(slot_idx),
+            _hover={"background": COLORS["bg_elevated"]},
+        )
+    return card
+
+
+# Generate static card factories at module load time
+SLOT_SETUP_CARDS = [_make_slot_setup_card(i) for i in range(MAX_GROUPS)]
+SLOT_MONITOR_CARDS = [_make_slot_monitor_card(i) for i in range(MAX_GROUPS)]
+
+
+def _render_setup_slot(slot_idx: int) -> rx.Component:
+    """Render a single setup slot (shown only if group exists at this index)."""
+    return rx.cond(
+        slot_idx < AppState.groups.length(),
+        SLOT_SETUP_CARDS[slot_idx](AppState.groups[slot_idx]),
+        rx.box(),
+    )
+
+
+def _render_monitor_slot(slot_idx: int) -> rx.Component:
+    """Render a single monitor slot (shown only if group exists at this index)."""
+    return rx.cond(
+        slot_idx < AppState.groups_sorted.length(),
+        SLOT_MONITOR_CARDS[slot_idx](AppState.groups_sorted[slot_idx]),
+        rx.box(),
+    )
+
+
+def static_setup_groups() -> rx.Component:
+    """Static rendering of setup groups (replaces rx.foreach)."""
+    return rx.grid(
+        *[_render_setup_slot(i) for i in range(MAX_GROUPS)],
+        columns="3",
+        spacing="3",
+        width="100%",
+    )
+
+
+def static_monitor_groups() -> rx.Component:
+    """Static rendering of monitor groups (replaces rx.foreach)."""
+    return rx.vstack(
+        *[_render_monitor_slot(i) for i in range(MAX_GROUPS)],
+        spacing="2",
         width="100%",
     )
 
@@ -932,12 +1296,8 @@ def setup_tab() -> rx.Component:
         rx.heading("Groups", size="4", color=COLORS["text_primary"]),
         rx.cond(
             AppState.groups.length() > 0,
-            rx.grid(
-                rx.foreach(AppState.groups, group_config_card),
-                columns="3",
-                spacing="3",
-                width="100%",
-            ),
+            # Static slots for Nuitka compatibility (avoids rx.foreach partial application)
+            static_setup_groups(),
             rx.text("No groups yet. Select positions and create a group.", color=COLORS["text_muted"]),
         ),
         width="100%",
@@ -1119,14 +1479,11 @@ def _groups_sidebar() -> rx.Component:
                 align="center",
                 padding_bottom="2",
             ),
-            # Groups list (sorted alphabetically)
+            # Groups list (sorted alphabetically) - Static slots for Nuitka compatibility
             rx.cond(
                 AppState.groups_sorted.length() > 0,
-                rx.vstack(
-                    rx.foreach(AppState.groups_sorted, monitor_group_card),
-                    spacing="2",
-                    width="100%",
-                ),
+                # Static slots (avoids rx.foreach partial application)
+                static_monitor_groups(),
                 rx.text("No groups yet.", color=COLORS["text_muted"], size="1"),
             ),
             width="100%",
@@ -1230,11 +1587,11 @@ def groups_panel() -> rx.Component:
         AppState.active_tab == "setup",
         rx.vstack(
             rx.heading("Groups", size="4", color=COLORS["text_primary"]),
-            rx.foreach(AppState.groups, group_config_card),
+            static_setup_groups(),
             width="100%",
         ),
         rx.vstack(
-            rx.foreach(AppState.groups, compact_group_card),
+            static_monitor_groups(),
             width="100%",
         ),
     )

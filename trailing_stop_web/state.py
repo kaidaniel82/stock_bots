@@ -833,31 +833,90 @@ class AppState(rx.State):
             self.chart_data = new_data
         self.status_message = "Group deleted"
 
-    # === Nuitka Workaround: Two-step actions for rx.foreach compatibility ===
-    # Partial application doesn't work in Nuitka bundles, so we store group_id first,
-    # then trigger the actual action in a chained event.
+    # === Nuitka Workaround: Slot-based handlers for static button rendering ===
+    # Partial application with Vars doesn't work in Nuitka bundles.
+    # Instead, we use slot indices (Python ints) which are bound at compile time.
 
-    def set_pending_toggle(self, group_id: str):
-        """Store group_id and execute toggle directly. Workaround for Nuitka partial application bug."""
-        self.pending_toggle_group_id = group_id
-        # Execute directly instead of chaining - simpler and works in Nuitka
-        if self.pending_toggle_group_id:
-            self.toggle_group_active(self.pending_toggle_group_id)
-            self.pending_toggle_group_id = ""
+    def _get_group_id_for_slot(self, slot_idx: int) -> str | None:
+        """Get the group_id for a slot index, or None if slot is empty."""
+        if 0 <= slot_idx < len(self.groups):
+            return self.groups[slot_idx].get("id")
+        return None
 
-    def set_pending_cancel(self, group_id: str):
-        """Store group_id and execute cancel directly. Workaround for Nuitka partial application bug."""
-        self.pending_cancel_group_id = group_id
-        if self.pending_cancel_group_id:
-            self.cancel_group_order(self.pending_cancel_group_id)
-            self.pending_cancel_group_id = ""
+    def toggle_slot(self, slot_idx: int):
+        """Toggle group at slot index. Called from static slot buttons."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            logger.info(f"toggle_slot({slot_idx}) -> group_id={group_id}")
+            self.toggle_group_active(group_id)
 
-    def set_pending_delete(self, group_id: str):
-        """Store group_id and execute delete dialog directly. Workaround for Nuitka partial application bug."""
-        self.pending_delete_group_id = group_id
-        if self.pending_delete_group_id:
-            self.request_delete_group(self.pending_delete_group_id)
-            self.pending_delete_group_id = ""
+    def cancel_slot(self, slot_idx: int):
+        """Cancel order for group at slot index."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            logger.info(f"cancel_slot({slot_idx}) -> group_id={group_id}")
+            self.cancel_group_order(group_id)
+
+    def delete_slot(self, slot_idx: int):
+        """Delete group at slot index (shows confirmation dialog)."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            logger.info(f"delete_slot({slot_idx}) -> group_id={group_id}")
+            self.request_delete_group(group_id)
+
+    def update_trail_slot(self, slot_idx: int, value):
+        """Update trail value for group at slot index."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            self.update_group_trail(group_id, value)
+
+    def update_trail_mode_slot(self, slot_idx: int, value):
+        """Update trail mode for group at slot index."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            self.update_group_trail_mode(group_id, value)
+
+    def update_trigger_price_type_slot(self, slot_idx: int, value):
+        """Update trigger price type for group at slot index."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            self.update_group_trigger_price_type(group_id, value)
+
+    def update_stop_type_slot(self, slot_idx: int, value):
+        """Update stop type for group at slot index."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            self.update_group_stop_type(group_id, value)
+
+    def update_limit_offset_slot(self, slot_idx: int, value):
+        """Update limit offset for group at slot index."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            self.update_group_limit_offset(group_id, value)
+
+    def update_time_exit_enabled_slot(self, slot_idx: int, checked):
+        """Update time exit enabled for group at slot index."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            self.update_group_time_exit_enabled(group_id, checked)
+
+    def update_time_exit_time_slot(self, slot_idx: int, value):
+        """Update time exit time for group at slot index."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            self.update_group_time_exit_time(group_id, value)
+
+    def toggle_collapsed_slot(self, slot_idx: int):
+        """Toggle collapsed state for group at slot index."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            self.toggle_group_collapsed(group_id)
+
+    def select_group_slot(self, slot_idx: int):
+        """Select group at slot index for chart display."""
+        group_id = self._get_group_id_for_slot(slot_idx)
+        if group_id:
+            self.select_group(group_id)
 
     def toggle_group_active(self, group_id: str):
         """Toggle group monitoring on/off - places/cancels orders at TWS."""
