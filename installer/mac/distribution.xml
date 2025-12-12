@@ -2,8 +2,8 @@
 <installer-gui-script minSpecVersion="2">
     <title>Trailing Stop Manager</title>
     <organization>com.edgeseeker.trailingstop</organization>
-    <domains enable_localSystem="true"/>
-    <options customize="never" require-scripts="true" rootVolumeOnly="true"/>
+    <domains enable_localSystem="true" enable_anywhere="false"/>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true" hostArchitectures="arm64,x86_64"/>
 
     <choices-outline>
         <line choice="default">

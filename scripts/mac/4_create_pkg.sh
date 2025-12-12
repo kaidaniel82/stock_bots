@@ -33,8 +33,17 @@ cp -R "$FINAL_APP" "$PKG_ROOT/Applications/$APP_NAME.app"
 cat > "$SCRIPTS_DIR/postinstall" << 'POSTINSTALL'
 #!/bin/bash
 APP_PATH="/Applications/Trailing Stop Manager.app"
-BUN_PATH="$APP_PATH/Contents/MacOS/bun"
-chmod +x "$BUN_PATH" 2>/dev/null || true
+MACOS_PATH="$APP_PATH/Contents/MacOS"
+
+# Make entire app readable/executable by all users
+chmod -R 755 "$APP_PATH"
+
+# Make bun executable
+chmod +x "$MACOS_PATH/bun" 2>/dev/null || true
+
+# Make .web writable for node_modules
+chmod -R 777 "$MACOS_PATH/.web" 2>/dev/null || true
+
 echo "Trailing Stop Manager installed successfully!"
 exit 0
 POSTINSTALL
@@ -58,8 +67,8 @@ cat > "$INSTALLER_DIR/distribution.xml" << EOF
 <installer-gui-script minSpecVersion="2">
     <title>$APP_NAME</title>
     <organization>$APP_IDENTIFIER</organization>
-    <domains enable_localSystem="true"/>
-    <options customize="never" require-scripts="true" rootVolumeOnly="true"/>
+    <domains enable_localSystem="true" enable_anywhere="false"/>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true" hostArchitectures="arm64,x86_64"/>
 
     <choices-outline>
         <line choice="default">
