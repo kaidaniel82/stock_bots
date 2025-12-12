@@ -12,7 +12,7 @@ echo ""
 # PHASE 1: Kill processes from PID file
 # ============================================
 if [ -f "$PID_FILE" ]; then
-    echo "[1/4] Killing processes from PID file..."
+    echo "[1/5] Killing processes from PID file..."
     while read pid; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             echo "  → Killing PID $pid"
@@ -21,13 +21,13 @@ if [ -f "$PID_FILE" ]; then
     done < "$PID_FILE"
     rm -f "$PID_FILE"
 else
-    echo "[1/4] No PID file found"
+    echo "[1/5] No PID file found"
 fi
 
 # ============================================
 # PHASE 2: Kill all related processes by name
 # ============================================
-echo "[2/4] Killing all Reflex/Bun/Node processes..."
+echo "[2/5] Killing all Reflex/Bun/Node processes..."
 
 # Kill by process name patterns (aggressive)
 for pattern in \
@@ -50,7 +50,7 @@ sleep 0.5
 # ============================================
 # PHASE 3: Free all potential ports
 # ============================================
-echo "[3/4] Freeing ports 3000-3010 and 8000-8010..."
+echo "[3/5] Freeing ports 3000-3010 and 8000-8010..."
 
 for port in $(seq 3000 3010) $(seq 8000 8010); do
     pids=$(lsof -t -i :$port 2>/dev/null)
@@ -65,7 +65,7 @@ sleep 0.5
 # ============================================
 # PHASE 4: Verify clean state
 # ============================================
-echo "[4/4] Verifying clean state..."
+echo "[4/5] Verifying clean state..."
 
 # Check if any ports are still in use
 still_used=""
@@ -87,6 +87,17 @@ fi
 
 echo "  ✓ All ports free"
 echo ""
+
+# ============================================
+# PHASE 5: Clear Vite cache (prevents module import errors)
+# ============================================
+echo "[5/5] Clearing Vite cache..."
+if [ -d ".web/node_modules/.vite" ]; then
+    rm -rf .web/node_modules/.vite
+    echo "  ✓ Vite cache cleared"
+else
+    echo "  ✓ No Vite cache found"
+fi
 
 # ============================================
 # START APP
