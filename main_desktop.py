@@ -256,7 +256,8 @@ class DesktopApp:
         """Start system tray icon."""
         try:
             from trailing_stop_web.tray import SystemTray
-            self.tray = SystemTray(on_quit=self._on_quit)
+            # Use port 5173 in Nuitka bundle (Bun/Vite frontend)
+            self.tray = SystemTray(on_quit=self._on_quit, app_url="http://localhost:5173")
             logger.info("System tray started")
             self.tray.run()  # Blocks
         except ImportError as e:
