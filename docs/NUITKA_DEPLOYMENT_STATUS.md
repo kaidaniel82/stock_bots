@@ -1,14 +1,14 @@
 # Nuitka Desktop Deployment - Aktueller Stand
 
-**Datum:** 2025-12-11
-**Status:** TEILWEISE FUNKTIONAL
+**Datum:** 2025-12-12
+**Status:** ✅ VOLL FUNKTIONAL
 
 ---
 
 ## Zusammenfassung
 
-Das macOS App Bundle wird erfolgreich gebaut und startet. Der Server läuft auf Port 8000.
-Die IB-Verbindung funktioniert. **Einige App-Aspekte funktionieren noch nicht vollständig.**
+Das macOS App Bundle wird erfolgreich gebaut und **alle Features funktionieren**.
+Server, IB-Verbindung, UI-Buttons und Order-Management sind voll einsatzbereit.
 
 ---
 
@@ -16,15 +16,42 @@ Die IB-Verbindung funktioniert. **Einige App-Aspekte funktionieren noch nicht vo
 
 | Feature | Status | Details |
 |---------|--------|---------|
-| Nuitka Build | ✅ | Kompiliert in ~7 Minuten |
+| Nuitka Build | ✅ | Kompiliert in ~7 Minuten (cached: ~2 min) |
 | App Bundle Struktur | ✅ | `TrailingStopManager.app/Contents/MacOS/` |
 | Pfad-Erkennung | ✅ | `sys.executable.parent` für macOS Bundle |
 | Server Start | ✅ | uvicorn auf Port 8000 |
-| Static Frontend | ✅ | `.web/build/client/` wird gefunden |
+| Static Frontend | ✅ | Bun + Vite Dev Server auf Port 5173 |
 | System Tray | ✅ | Icon erscheint, Menü funktioniert |
 | IB Verbindung | ✅ | Positionen und Account-Daten werden geladen |
 | Browser öffnet | ✅ | Automatisch bei Start |
 | Monkey-Patches | ✅ | `get_app()`, `_compile()`, `install_frontend_packages()` |
+| **Group Buttons** | ✅ | Activate/Cancel/Delete funktionieren |
+| **Order Placement** | ✅ | Stop Orders werden bei TWS platziert |
+| **rx.foreach** | ✅ | Funktioniert mit Partial Application |
+
+---
+
+## Gelöste Probleme (2025-12-12)
+
+### Event Loop Threading (GELÖST)
+
+**Problem:** Buttons funktionierten nicht im Nuitka Bundle
+- Symptom: Klick auf Activate → keine Reaktion
+- Log: `There is no current event loop in thread 'Thread-1'`
+
+**Ursache:** IB-Operationen wurden vom Reflex Backend-Thread aufgerufen, der keinen Event Loop hat.
+
+**Lösung:** Alle IB-Operationen mit `asyncio.run_coroutine_threadsafe()` zum Broker-Thread delegieren.
+
+**Siehe:** `docs/reflex/REFLEX_GOTCHAS.md` - Problem 8
+
+### rx.foreach Fehlschluss (WIDERLEGT)
+
+**Falsche Annahme:** `rx.foreach` mit Partial Application funktioniert nicht in Nuitka.
+
+**Realität:** `rx.foreach` funktioniert PERFEKT. Das Problem war immer der Event Loop (siehe oben).
+
+**Lehre:** IMMER Logs prüfen bevor Workarounds implementiert werden!
 
 ---
 
@@ -32,7 +59,7 @@ Die IB-Verbindung funktioniert. **Einige App-Aspekte funktionieren noch nicht vo
 
 | Feature | Status | Details |
 |---------|--------|---------|
-| ??? | ❓ | Bitte spezifizieren was nicht klappt |
+| - | - | Aktuell keine bekannten Probleme |
 
 ---
 

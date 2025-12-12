@@ -337,6 +337,143 @@ class AppState(rx.State):
 
 ---
 
+## Problem 8: Threading & Event Loop bei ib_insync Integration
+
+### Symptom
+- Buttons funktionieren in Dev-Mode (`reflex run`)
+- Im Nuitka Bundle: Klick auf Button → keine Reaktion
+- Logs zeigen: **`There is no current event loop in thread 'Thread-1 (start_backend)'`**
+- Handler wird aufgerufen (Logs zeigen z.B. `toggle_group_active called`), aber IB-Operation schlägt fehl
+
+### Ursache
+
+**WICHTIG: Das Problem ist NICHT rx.foreach oder Partial Application!**
+
+Das Problem ist Thread-Isolation bei asyncio Event Loops:
+
+```
+┌─────────────────────────┐     ┌─────────────────────────┐
+│  Broker Thread          │     │  Reflex Backend Thread  │
+│  (hat self._loop)       │     │  (KEIN Event Loop!)     │
+│                         │     │                         │
+│  self.ib.placeOrder()   │ ←── │  place_stop_order()     │
+│  funktioniert hier!     │     │  CRASH! ❌               │
+└─────────────────────────┘     └─────────────────────────┘
+```
+
+- **Dev-Mode:** Reflex/Uvicorn verwaltet Threads flexibler, Event Loops können geteilt werden
+- **Nuitka Bundle:** Strikte Thread-Isolation, Backend-Thread hat keinen Zugriff auf Broker's Event Loop
+
+### FALSCH (funktioniert nur in Dev)
+```python
+class TWSBroker:
+    def __init__(self):
+        self.ib = IB()
+        self._loop = None  # Broker's event loop
+
+    def place_stop_order(self, contract, quantity, stop_price, ...):
+        # FALSCH: Direkter Aufruf - funktioniert NUR wenn
+        # der aufrufende Thread einen Event Loop hat
+        order = Order(...)
+        trade = self.ib.placeOrder(contract, order)  # ❌ Crash in Nuitka!
+        return trade
+```
+
+### RICHTIG (funktioniert in Dev UND Nuitka)
+```python
+class TWSBroker:
+    def __init__(self):
+        self.ib = IB()
+        self._loop = None  # Broker's event loop, wird in connect() gesetzt
+
+    def place_stop_order(self, contract, quantity, stop_price, ...):
+        if not self._loop:
+            logger.error("Cannot place order: no event loop available")
+            return None
+
+        # RICHTIG: Async-Funktion im Broker's Event Loop ausführen
+        async def _place_async():
+            try:
+                trade = self.ib.placeOrder(contract, order)
+                await asyncio.sleep(0.2)  # Warten auf Order-Status
+                return trade
+            except Exception as e:
+                logger.error(f"Async place order error: {e}")
+                return None
+
+        try:
+            # Thread-safe: Coroutine im richtigen Thread ausführen
+            future = asyncio.run_coroutine_threadsafe(_place_async(), self._loop)
+            trade = future.result(timeout=10)
+            return trade
+        except Exception as e:
+            logger.error(f"Place order failed: {e}")
+            return None
+```
+
+### Betroffene Methoden (müssen alle gefixt werden)
+- `place_stop_order()`
+- `modify_stop_order()`
+- `place_time_exit_order()`
+- `place_trailing_stop_order()`
+- `modify_trailing_stop()`
+- `cancel_order()`
+- `cancel_oca_group()`
+
+### Debugging
+1. Suche nach `There is no current event loop` in Logs
+2. Prüfe ob `self._loop` gesetzt ist beim Broker
+3. Alle IB-Operationen die von Reflex-Handlern aufgerufen werden müssen `asyncio.run_coroutine_threadsafe()` verwenden
+
+---
+
+## ⚠️ WARNUNG: rx.foreach funktioniert in Nuitka!
+
+### KEINE Static Slots implementieren!
+
+Es gab einen Fehlschluss, dass `rx.foreach` mit Partial Application in Nuitka nicht funktioniert.
+**Das war FALSCH.** Das eigentliche Problem war immer der Event Loop (siehe oben).
+
+### RICHTIG (verwenden!)
+```python
+# rx.foreach mit partial application funktioniert PERFEKT in Nuitka
+rx.foreach(AppState.groups, group_config_card)
+
+def group_config_card(group: dict) -> rx.Component:
+    group_id = group["id"]
+    return rx.box(
+        rx.button(
+            "Activate",
+            on_click=AppState.toggle_group_active(group_id),  # ✅ Funktioniert!
+        ),
+    )
+```
+
+### FALSCH (unnötige Komplexität!)
+```python
+# NICHT MACHEN - Static Slots sind unnötig und verkomplizieren den Code!
+MAX_GROUPS = 10
+SLOT_BUTTONS = [_make_slot_buttons(i) for i in range(MAX_GROUPS)]
+
+def static_setup_groups():
+    return rx.grid(
+        *[_render_slot(i) for i in range(MAX_GROUPS)],  # ❌ Unnötig!
+    )
+```
+
+### Warum der Fehlschluss entstand
+1. Button-Klick → Handler wird aufgerufen (funktioniert!)
+2. Handler ruft Broker-Methode auf → Event Loop Crash
+3. **Falsche Annahme:** "Button funktioniert nicht" → "rx.foreach ist kaputt"
+4. **Richtige Analyse:** Logs zeigen Handler wurde aufgerufen, Problem ist downstream
+
+### Lehre
+**IMMER die Logs prüfen bevor Workarounds implementiert werden!**
+- Wenn Handler aufgerufen wird → Problem ist NICHT im UI/Component
+- Wenn Handler NICHT aufgerufen wird → Dann UI/Component prüfen
+
+---
+
 ## Zusammenfassung
 
 | Problem | Symptom | Lösung |
@@ -347,4 +484,5 @@ class AppState(rx.State):
 | Type Annotations | Handler-Fehler | Annotations weglassen |
 | Checkbox mit Label | Checkbox nicht klickbar | Label separat als rx.text() |
 | Partial Application | Argumente vertauscht | `handler(partial_arg, event_value)` |
-| **@rx.var in Nuitka** | **Computed vars fehlen im Bundle** | **Reguläre State-Vars + manuelle Berechnung** |
+| @rx.var in Nuitka | Computed vars fehlen im Bundle | Reguläre State-Vars + manuelle Berechnung |
+| **ib_insync Threading** | **"No current event loop" in Nuitka** | **`asyncio.run_coroutine_threadsafe()`** |
